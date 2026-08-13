@@ -21,12 +21,14 @@ class ForeignKey:
 
 
 class UniqueKey:
-    def __init__(self, name: str, column: str):
+    def __init__(self, name: str, column: str, is_primary_key: bool = False):
         self.name = name
         self.column = column
+        self.is_primary_key = is_primary_key
 
     def __str__(self):
-        return f'[UNIQUE KEY] Name: {self.name} - Column: {self.column}'
+        type_str = "PRIMARY KEY" if self.is_primary_key else "UNIQUE KEY"
+        return f'[{type_str}] Name: {self.name} - Column: {self.column}'
 
 
 class Index:
@@ -150,25 +152,27 @@ class Table:
 
     def get_unique_keys_query(self):
         if len(self.unique_keys) > 0:
-            unique_keys_grouped_by_name: dict[str, list[str]] = {}
+            unique_keys_grouped_by_name: dict[str, tuple[bool, list[str]]] = {}
 
             for unique_key in self.unique_keys:
                 if unique_key.name not in unique_keys_grouped_by_name:
-                    unique_keys_grouped_by_name[unique_key.name] = [unique_key.column]
+                    unique_keys_grouped_by_name[unique_key.name] = (unique_key.is_primary_key, [unique_key.column])
                 else:
-                    unique_keys_grouped_by_name[unique_key.name].append(unique_key.column)
+                    unique_keys_grouped_by_name[unique_key.name][1].append(unique_key.column)
 
             query = f'ALTER TABLE "{self.name}" ADD '
 
             for unique_key_index, unique_key_name in enumerate(unique_keys_grouped_by_name):
 
-                ordered_column_names = list(unique_keys_grouped_by_name[unique_key_name])
+                is_primary_key, column_names = unique_keys_grouped_by_name[unique_key_name]
+                ordered_column_names = list(column_names)
                 ordered_column_names.sort()
 
                 columns_constraint = ', '.join(
                     [f'"{column_name}"' for column_name in ordered_column_names])
 
-                query += f'CONSTRAINT "{unique_key_name}" UNIQUE ({columns_constraint})'
+                constraint_type = "PRIMARY KEY" if is_primary_key else "UNIQUE"
+                query += f'CONSTRAINT "{unique_key_name}" {constraint_type} ({columns_constraint})'
 
                 if unique_key_index < len(unique_keys_grouped_by_name) - 1:
                     query += ', ADD '

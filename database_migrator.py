@@ -135,7 +135,8 @@ class DatabaseMigrator:
             unique_keys_query = f"""
                  SELECT 
                         rc.RDB$CONSTRAINT_NAME AS constraint_name,
-                        si.RDB$FIELD_NAME AS column_name
+                        si.RDB$FIELD_NAME AS column_name,
+                        rc.RDB$CONSTRAINT_TYPE AS constraint_type
                     FROM RDB$RELATION_CONSTRAINTS rc
                     JOIN RDB$INDEX_SEGMENTS si ON rc.RDB$INDEX_NAME = si.RDB$INDEX_NAME
                     WHERE rc.RDB$CONSTRAINT_TYPE IN ('UNIQUE', 'PRIMARY KEY')
@@ -149,7 +150,8 @@ class DatabaseMigrator:
             if unique_keys:
                 for unique_key in unique_keys:
                     unique_key_column_name = unique_key[1].strip()
-                    unique_key_obj = UniqueKey(unique_key[0].strip(), unique_key_column_name)
+                    is_pk = unique_key[2].strip() == 'PRIMARY KEY'
+                    unique_key_obj = UniqueKey(unique_key[0].strip(), unique_key_column_name, is_primary_key=is_pk)
                     table_obj.unique_keys.append(unique_key_obj)
 
             indexes_query = f"""
@@ -224,19 +226,19 @@ class DatabaseMigrator:
             for seq_query in seq_queries:
                 if print_queries:
                     print(seq_query)
-                cursor.execute(seq_query)
+                # cursor.execute(seq_query)
 
         for table in self.table_objs:
             if print_queries:
                 print(table.get_create_query())
-            cursor.execute(table.get_create_query())
+            # cursor.execute(table.get_create_query())
 
         for table in self.table_objs:
             uniq_query = table.get_unique_keys_query()
             if uniq_query:
                 if print_queries:
                     print(uniq_query)
-                cursor.execute(uniq_query)
+                # cursor.execute(uniq_query)
 
         for table in self.table_objs:
             indexes_query = table.get_indexes_query()
@@ -244,14 +246,14 @@ class DatabaseMigrator:
                 for idx_query in indexes_query:
                     if print_queries:
                         print(idx_query)
-                    cursor.execute(idx_query)
+#                     cursor.execute(idx_query)
 
         for table in self.table_objs:
             fk_query = table.get_foreign_keys_query()
             if fk_query:
                 if print_queries:
                     print(fk_query)
-                cursor.execute(fk_query)
+                # cursor.execute(fk_query)
 
         print('Saving schema transactions...')
         self.pg_con.commit()
