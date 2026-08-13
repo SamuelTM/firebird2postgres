@@ -345,10 +345,33 @@ class DatabaseMigrator:
 
         print('Data migration complete!')
 
+    @staticmethod
+    def _decode_trigger_type(trigger_type: int) -> str:
+        """
+        Decodes Firebird's RDB$TRIGGER_TYPE into a human-readable timing + events string.
+
+        Firebird encodes trigger types as:
+            stored_type = (phase | (slot1 << 1) | (slot2 << 3) | (slot3 << 5)) - 1
+        Where phase: 0=BEFORE, 1=AFTER; slots: 1=INSERT, 2=UPDATE, 3=DELETE.
+        """
+        event_names = {1: 'INSERT', 2: 'UPDATE', 3: 'DELETE'}
+
+        raw = trigger_type + 1
+        phase = 'BEFORE' if (raw & 1) == 0 else 'AFTER'
+        events = []
+        for shift in (1, 3, 5):
+            slot = (raw >> shift) & 0b11
+            if slot > 0:
+                events.append(event_names.get(slot, f'UNKNOWN({slot})'))
+
+        if not events:
+            return f'/* UNKNOWN TYPE {trigger_type} */'
+
+        return f'{phase} {" OR ".join(events)}'
+
     def export_firebird_triggers(self, output_file: str = 'firebird_triggers_dump.sql'):
         """
         Extracts all user-defined triggers from Firebird and saves their source code to a file
-        for manual translation to PostgreSQL.
         """
         fb_cursor = self.fb_con.cursor()
 
@@ -365,7 +388,6 @@ class DatabaseMigrator:
         with open(output_file, 'w', encoding='utf-8') as f:
             f.write("-- ==========================================\n")
             f.write("-- FIREBIRD TRIGGERS DUMP\n")
-            f.write("-- This file contains the raw PSQL source for manual translation to PL/pgSQL\n")
             f.write("-- ==========================================\n\n")
 
             for trigger in triggers:
@@ -374,11 +396,9 @@ class DatabaseMigrator:
                 trigger_type = trigger[2]
                 source = trigger[3]
 
-                f.write(f"-- ----------------------------------------\n")
-                f.write(f"-- Trigger: {trigger_name}\n")
-                f.write(f"-- Table: {relation_name}\n")
-                f.write(f"-- Firebird Type Code: {trigger_type}\n")
-                f.write(f"-- ----------------------------------------\n")
+                timing_events = self._decode_trigger_type(trigger_type)
+
+                f.write(f"CREATE TRIGGER {trigger_name} FOR {relation_name} {timing_events}\n")
                 f.write(f"{source}\n\n")
 
         print(f"Exported {len(triggers)} triggers to '{output_file}'")
@@ -386,7 +406,6 @@ class DatabaseMigrator:
     def export_firebird_procedures(self, output_file: str = 'firebird_procedures_dump.sql'):
         """
         Extracts all user-defined stored procedures from Firebird and saves their source code to a file
-        for manual translation to PostgreSQL.
         """
         fb_cursor = self.fb_con.cursor()
 
@@ -403,24 +422,76 @@ class DatabaseMigrator:
         with open(output_file, 'w', encoding='utf-8') as f:
             f.write("-- ==========================================\n")
             f.write("-- FIREBIRD PROCEDURES DUMP\n")
-            f.write("-- This file contains the raw PSQL source for manual translation to PL/pgSQL\n")
             f.write("-- ==========================================\n\n")
 
             for proc in procedures:
                 proc_name = proc[0].strip() if proc[0] else 'UNKNOWN'
                 source = proc[1]
 
-                f.write(f"-- ----------------------------------------\n")
-                f.write(f"-- Procedure: {proc_name}\n")
-                f.write(f"-- ----------------------------------------\n")
-                f.write(f"{source}\n\n")
+                # Query input and output parameters for this procedure
+                params_query = f"""
+                    SELECT
+                        pp.RDB$PARAMETER_NAME,
+                        pp.RDB$PARAMETER_TYPE,
+                        pp.RDB$PARAMETER_NUMBER,
+                        f.RDB$FIELD_TYPE,
+                        f.RDB$FIELD_SUB_TYPE,
+                        f.RDB$FIELD_LENGTH,
+                        f.RDB$FIELD_PRECISION,
+                        f.RDB$FIELD_SCALE
+                    FROM RDB$PROCEDURE_PARAMETERS pp
+                    JOIN RDB$FIELDS f ON pp.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
+                    WHERE pp.RDB$PROCEDURE_NAME = '{proc_name}'
+                    ORDER BY pp.RDB$PARAMETER_TYPE, pp.RDB$PARAMETER_NUMBER;
+                """
+                fb_cursor.execute(params_query)
+                params = fb_cursor.fetchall()
+
+                input_params = []
+                output_params = []
+                for param in params:
+                    param_name = param[0].strip() if param[0] else 'UNKNOWN'
+                    param_type_flag = param[1]  # 0=input, 1=output
+                    field_type = param[3]
+                    field_subtype = param[4]
+                    field_length = param[5]
+                    field_precision = param[6]
+                    field_scale = abs(param[7]) if param[7] else 0
+
+                    type_name = self._get_firebird_data_type_name(field_type, field_subtype)
+                    if type_name is None:
+                        type_name = 'VARCHAR(255)'
+
+                    # Handle NUMERIC/DECIMAL subtypes
+                    if (field_type in (7, 8, 16) and field_subtype is not None
+                            and field_subtype > 0 and field_precision):
+                        type_name = f'NUMERIC({field_precision}, {field_scale})'
+                    # Append length for CHAR/VARCHAR
+                    elif field_type in (14, 37) and field_length:
+                        type_name = f'{type_name}({field_length})'
+
+                    if param_type_flag == 0:
+                        input_params.append(f'    {param_name} {type_name}')
+                    else:
+                        output_params.append(f'    {param_name} {type_name}')
+
+                # Build header
+                f.write(f'CREATE OR ALTER PROCEDURE {proc_name}')
+                if input_params:
+                    params_str = ",\n".join(input_params)
+                    f.write(f' (\n{params_str}\n)')
+                f.write('\n')
+                if output_params:
+                    params_str = ",\n".join(output_params)
+                    f.write(f'RETURNS (\n{params_str}\n)\n')
+                f.write('AS\n')
+                f.write(f'{source};\n\n')
 
         print(f"Exported {len(procedures)} procedures to '{output_file}'")
 
     def export_firebird_views(self, output_file: str = 'firebird_views_dump.sql'):
         """
         Extracts all user-defined views from Firebird and saves their source code to a file
-        for manual translation to PostgreSQL.
         """
         fb_cursor = self.fb_con.cursor()
 
@@ -444,10 +515,29 @@ class DatabaseMigrator:
                 view_name = view[0].strip() if view[0] else 'UNKNOWN'
                 source = view[1]
 
+                # Fetch view columns in order
+                columns_query = f"""
+                    SELECT RDB$FIELD_NAME 
+                    FROM RDB$RELATION_FIELDS 
+                    WHERE RDB$RELATION_NAME = '{view_name}' 
+                    ORDER BY RDB$FIELD_POSITION;
+                """
+                fb_cursor.execute(columns_query)
+                columns = fb_cursor.fetchall()
+                
+                col_names = []
+                for col in columns:
+                    col_name = col[0].strip()
+                    col_names.append(f'"{col_name}"')
+
+                col_list = ""
+                if col_names:
+                    col_list = f" ({', '.join(col_names)})"
+
                 f.write(f"-- ----------------------------------------\n")
                 f.write(f"-- View: {view_name}\n")
                 f.write(f"-- ----------------------------------------\n")
-                f.write(f"CREATE OR REPLACE VIEW \"{view_name}\" AS\n")
-                f.write(f"{source};\n\n")
+                f.write(f'CREATE OR ALTER VIEW "{view_name}"{col_list} AS\n')
+                f.write(f"{source}\n\n")
 
         print(f"Exported {len(views)} views to '{output_file}'")
