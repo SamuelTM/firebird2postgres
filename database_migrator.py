@@ -3,7 +3,7 @@ import psycopg2.extras
 from enum import IntEnum
 from concurrent.futures import ProcessPoolExecutor
 
-from database_objects import Table, Column, ForeignKey, UniqueKey, Index
+from database_objects import Table, Column, ForeignKey, UniqueKey, Index, get_postgres_type
 from antlr4 import InputStream, CommonTokenStream
 
 
@@ -665,3 +665,84 @@ class DatabaseMigrator:
                     conv_f.write(fb_sql)
 
         print(f"Exported {len(views)} views to '{output_file}' and '{converted_file}'")
+
+    def export_firebird_domains(self, output_file: str = 'firebird_domains_dump.sql',
+                                converted_file: str = 'postgres_domains_dump.sql'):
+        """
+        Extracts all user-defined domains from Firebird and saves their source code to a file
+        and the PostgreSQL converted CREATE DOMAIN definitions.
+        """
+        fb_cursor = self.fb_con.cursor()
+
+        query = """
+            SELECT 
+                RDB$FIELD_NAME, 
+                RDB$FIELD_TYPE, 
+                RDB$FIELD_SUB_TYPE, 
+                RDB$FIELD_LENGTH, 
+                RDB$FIELD_PRECISION, 
+                RDB$FIELD_SCALE,
+                RDB$DEFAULT_SOURCE,
+                RDB$NULL_FLAG
+            FROM RDB$FIELDS
+            WHERE RDB$SYSTEM_FLAG = 0
+              AND RDB$FIELD_NAME NOT STARTING WITH 'RDB$'
+            ORDER BY RDB$FIELD_NAME;
+        """
+        fb_cursor.execute(query)
+        domains = fb_cursor.fetchall()
+
+        with open(output_file, 'w', encoding='utf-8') as f, open(converted_file, 'w', encoding='utf-8') as conv_f:
+            f.write("-- ==========================================\n")
+            f.write("-- FIREBIRD DOMAINS DUMP\n")
+            f.write("-- ==========================================\n\n")
+
+            conv_f.write("-- ==========================================\n")
+            conv_f.write("-- POSTGRESQL DOMAINS DUMP (CONVERTED)\n")
+            conv_f.write("-- ==========================================\n\n")
+
+            for d in domains:
+                domain_name = d[0].strip() if d[0] else 'UNKNOWN'
+                field_type = d[1]
+                field_subtype = d[2]
+                field_length = d[3]
+                field_precision = d[4]
+                field_scale = abs(d[5]) if d[5] else 0
+                default_source = d[6].strip() if d[6] else None
+                not_null = (d[7] == 1)
+
+                fb_type_name = self._get_firebird_data_type_name(field_type, field_subtype)
+                if fb_type_name is None:
+                    fb_type_name = 'VARCHAR'
+
+                if (field_type in (FirebirdDataType.SMALLINT, FirebirdDataType.INTEGER,
+                                   FirebirdDataType.BIGINT) and field_subtype is not None
+                        and field_subtype > 0 and field_precision):
+                    fb_full_type = f'NUMERIC({field_precision}, {field_scale})'
+                    pg_type = fb_full_type
+                elif field_type in (FirebirdDataType.CHAR, FirebirdDataType.VARCHAR) and field_length:
+                    fb_full_type = f'{fb_type_name}({field_length})'
+                    pg_type = fb_full_type
+                else:
+                    fb_full_type = fb_type_name
+                    pg_type = get_postgres_type(fb_type_name)
+
+                # Firebird DDL
+                fb_ddl = f'CREATE DOMAIN "{domain_name}" AS {fb_full_type}'
+                if default_source:
+                    fb_ddl += f' {default_source}'
+                if not_null:
+                    fb_ddl += ' NOT NULL'
+                fb_ddl += ';\n'
+                f.write(fb_ddl)
+
+                # PostgreSQL DDL
+                pg_ddl = f'CREATE DOMAIN "{domain_name}" AS {pg_type}'
+                if default_source:
+                    pg_ddl += f' {default_source}'
+                if not_null:
+                    pg_ddl += ' NOT NULL'
+                pg_ddl += ';\n'
+                conv_f.write(pg_ddl)
+
+        print(f"Exported {len(domains)} domains to '{output_file}' and '{converted_file}'")
