@@ -728,7 +728,9 @@ procedure_body
     ;
 
 create_procedure_body
-    : CREATE (OR ALTER)? PROCEDURE procedure_name ('(' parameter (',' parameter)* ')')? invoker_rights_clause? (PARALLEL_ENABLE | DETERMINISTIC)* (
+    : (CREATE (OR ALTER)? | RECREATE | ALTER) PROCEDURE procedure_name ('(' parameter (',' parameter)* ')')? 
+      (RETURNS '(' parameter (',' parameter)* ')')?
+      invoker_rights_clause? (PARALLEL_ENABLE | DETERMINISTIC)* (
         IS
         | AS
     ) (DECLARE? seq_of_declare_specs? body | call_spec | EXTERNAL)
@@ -804,11 +806,11 @@ alter_trigger
     ;
 
 create_trigger
-    : CREATE (OR REPLACE)? TRIGGER trigger_name (
+    : (CREATE (OR ALTER)? | RECREATE | ALTER) TRIGGER trigger_name (FOR tableview_name)? (ACTIVE | INACTIVE)? (
         simple_dml_trigger
         | compound_dml_trigger
         | non_dml_trigger
-    ) trigger_follows_clause? (ENABLE | DISABLE)? trigger_when_clause? trigger_body
+    ) trigger_follows_clause? (ENABLE | DISABLE)? trigger_when_clause? (AS | IS)? trigger_body
     ;
 
 trigger_follows_clause
@@ -882,7 +884,7 @@ non_dml_event
     ;
 
 dml_event_clause
-    : dml_event_element (OR dml_event_element)* ON dml_event_nested_clause? tableview_name
+    : dml_event_element (OR dml_event_element)* (ON dml_event_nested_clause? tableview_name)?
     ;
 
 dml_event_element
@@ -1550,7 +1552,7 @@ cluster_name
     ;
 
 table_index_clause
-    : tableview_name table_alias? '(' index_expr (ASC | DESC)? (',' index_expr (ASC | DESC)?)* ')' index_properties?
+    : tableview_name table_alias? '(' index_expr (ASC | DESC)? (',' index_expr (ASC | DESC)?)* ')' index_properties
     ;
 
 bitmap_join_index_clause
@@ -2651,7 +2653,7 @@ alter_view_editionable
     ;
 
 create_view
-    : CREATE (OR REPLACE)? (NO? FORCE)? editioning_clause? VIEW (schema_name '.')? v = id_expression (
+    : (CREATE (OR ALTER)? | RECREATE | ALTER) (NO? FORCE)? editioning_clause? VIEW (schema_name '.')? v = id_expression (
         IF NOT EXISTS
     )? (SHARING '=' (METADATA | EXTENDED? DATA | NONE))? view_options? (
         DEFAULT COLLATION cn = id_expression
@@ -6072,7 +6074,7 @@ subquery_operation_part
     ;
 
 query_block
-    : SELECT (FIRST numeric)? (SKIP numeric)? (DISTINCT | UNIQUE | ALL)? selected_list into_clause? from_clause? where_clause? (
+    : SELECT (FIRST numeric)? (SKIP_ numeric)? (DISTINCT | UNIQUE | ALL)? selected_list into_clause? from_clause? where_clause? (
         hierarchical_query_clause
         | group_by_clause
     )* model_clause?
@@ -7445,7 +7447,7 @@ native_datatype_element
     | YMINTERVAL_UNCONSTRAINED
     | DSINTERVAL_UNCONSTRAINED
     | BFILE
-    | BLOB
+    | BLOB (SUBTYPE (numeric | numeric_negative | id_expression))?
     | CLOB
     | NCLOB
     | MLSLABEL

@@ -1549,6 +1549,7 @@ RENAME                         : 'RENAME';
 REPAIR                         : 'REPAIR';
 REPEAT                         : 'REPEAT';
 REPLACE                        : 'REPLACE';
+RECREATE                       : 'RECREATE';
 REPLICATION                    : 'REPLICATION';
 REQUIRED                       : 'REQUIRED';
 RESETLOGS                      : 'RESETLOGS';
@@ -1573,6 +1574,7 @@ RETENTION                      : 'RETENTION';
 RETRY_ON_ROW_CHANGE            : 'RETRY_ON_ROW_CHANGE';
 RETURNING                      : 'RETURNING';
 RETURN                         : 'RETURN';
+RETURNS                        : 'RETURNS';
 REUSE                          : 'REUSE';
 REVERSE                        : 'REVERSE';
 REVOKE                         : 'REVOKE';
@@ -2553,7 +2555,7 @@ REMARK_COMMENT:
 
 PROMPT_MESSAGE: 'PRO'  'MPT'? (' ' ~('\r' | '\n')*)? NEWLINE_EOF;
 
-REGULAR_ID: SIMPLE_LETTER (SIMPLE_LETTER | '$' | '_' | '#' | [0-9])*;
+REGULAR_ID: (SIMPLE_LETTER | '_') (SIMPLE_LETTER | '$' | '_' | '#' | [0-9])*;
 
 INQUIRY_DIRECTIVE: '$$' (SIMPLE_LETTER | '_')+;
 

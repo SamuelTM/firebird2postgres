@@ -226,19 +226,19 @@ class DatabaseMigrator:
             for seq_query in seq_queries:
                 if print_queries:
                     print(seq_query)
-                # cursor.execute(seq_query)
+                cursor.execute(seq_query)
 
         for table in self.table_objs:
             if print_queries:
                 print(table.get_create_query())
-            # cursor.execute(table.get_create_query())
+            cursor.execute(table.get_create_query())
 
         for table in self.table_objs:
             uniq_query = table.get_unique_keys_query()
             if uniq_query:
                 if print_queries:
                     print(uniq_query)
-                # cursor.execute(uniq_query)
+                cursor.execute(uniq_query)
 
         for table in self.table_objs:
             indexes_query = table.get_indexes_query()
@@ -246,14 +246,14 @@ class DatabaseMigrator:
                 for idx_query in indexes_query:
                     if print_queries:
                         print(idx_query)
-#                     cursor.execute(idx_query)
+                    cursor.execute(idx_query)
 
         for table in self.table_objs:
             fk_query = table.get_foreign_keys_query()
             if fk_query:
                 if print_queries:
                     print(fk_query)
-                # cursor.execute(fk_query)
+                cursor.execute(fk_query)
 
         print('Saving schema transactions...')
         self.pg_con.commit()
