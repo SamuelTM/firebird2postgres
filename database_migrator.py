@@ -61,7 +61,6 @@ class DatabaseMigrator:
         stream = CommonTokenStream(lexer)
         parser = FirebirdParser(stream)
 
-        # Fast SLL mode with BailErrorStrategy (Two-Stage Parsing)
         # noinspection PyProtectedMember
         parser._interp.predictionMode = PredictionMode.SLL
         # noinspection PyProtectedMember
@@ -329,19 +328,16 @@ class DatabaseMigrator:
         fb_cur = self.fb_con.cursor()
         pg_cur = self.pg_con.cursor()
 
-        # Disable constraints and clean data
         print('Disabling constraints and clearing existing data for a clean import...')
         for table in self.table_objs:
             pg_cur.execute(f'ALTER TABLE "{table.name}" DISABLE TRIGGER ALL;')
             pg_cur.execute(f'TRUNCATE TABLE "{table.name}" CASCADE;')
         self.pg_con.commit()
 
-        # Extract and insert data
         for table in self.table_objs:
             print(f'Importing data for {table.name}...')
 
             try:
-                # Determine batch size dynamically
                 blob_count = sum(1 for col in table.columns if 'BLOB' in col.column_type)
                 batch_size = 10000
                 if blob_count > 0:
@@ -385,13 +381,11 @@ class DatabaseMigrator:
                 print('  Ignoring and carrying on with the next table...')
                 continue
 
-        # Re-enable constraints
         print('Re-enabling constraints in PostgreSQL...')
         for table in self.table_objs:
             pg_cur.execute(f'ALTER TABLE "{table.name}" ENABLE TRIGGER ALL;')
         self.pg_con.commit()
 
-        # Sync sequences
         print('Synchronizing sequences...')
         for table in self.table_objs:
             for col in table.columns:
