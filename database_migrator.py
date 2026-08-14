@@ -52,11 +52,27 @@ class DatabaseMigrator:
         from firebird_grammar.FirebirdLexer import FirebirdLexer
         from firebird_grammar.FirebirdParser import FirebirdParser
         from firebird_visitor import FirebirdToPostgresVisitor
+        from antlr4.atn.PredictionMode import PredictionMode
+        from antlr4.error.ErrorStrategy import BailErrorStrategy, DefaultErrorStrategy
+        from antlr4.error.Errors import ParseCancellationException, RecognitionException
 
         lexer = FirebirdLexer(InputStream(firebird_sql_string))
         stream = CommonTokenStream(lexer)
         parser = FirebirdParser(stream)
-        tree = parser.sql_script()
+
+        # Fast SLL mode with BailErrorStrategy (Two-Stage Parsing)
+        parser._interp.predictionMode = PredictionMode.SLL  # noqa: SLF001
+        parser._errHandler = BailErrorStrategy()  # noqa: SLF001
+
+        try:
+            tree = parser.sql_script()
+        except (ParseCancellationException, RecognitionException):
+            # Fallback to standard LL mode if SLL encounters ambiguity
+            stream.seek(0)
+            parser.reset()
+            parser._errHandler = DefaultErrorStrategy()  # noqa: SLF001
+            parser._interp.predictionMode = PredictionMode.LL  # noqa: SLF001
+            tree = parser.sql_script()
 
         visitor = FirebirdToPostgresVisitor()
         pg_sql = visitor.visit(tree)
@@ -408,7 +424,8 @@ class DatabaseMigrator:
 
         return f'{phase} {" OR ".join(events)}'
 
-    def export_firebird_triggers(self, output_file: str = 'firebird_triggers_dump.sql', converted_file: str = 'postgres_triggers_dump.sql'):
+    def export_firebird_triggers(self, output_file: str = 'firebird_triggers_dump.sql',
+                                 converted_file: str = 'postgres_triggers_dump.sql'):
         """
         Extracts all user-defined triggers from Firebird and saves their source code to a file
         """
@@ -460,7 +477,8 @@ class DatabaseMigrator:
 
         print(f"Exported {len(triggers)} triggers to '{output_file}' and '{converted_file}'")
 
-    def export_firebird_procedures(self, output_file: str = 'firebird_procedures_dump.sql', converted_file: str = 'postgres_procedures_dump.sql'):
+    def export_firebird_procedures(self, output_file: str = 'firebird_procedures_dump.sql',
+                                   converted_file: str = 'postgres_procedures_dump.sql'):
         """
         Extracts all user-defined stored procedures from Firebird and saves their source code to a file
         """
@@ -567,7 +585,8 @@ class DatabaseMigrator:
 
         print(f"Exported {len(procedures)} procedures to '{output_file}' and '{converted_file}'")
 
-    def export_firebird_views(self, output_file: str = 'firebird_views_dump.sql', converted_file: str = 'postgres_views_dump.sql'):
+    def export_firebird_views(self, output_file: str = 'firebird_views_dump.sql',
+                              converted_file: str = 'postgres_views_dump.sql'):
         """
         Extracts all user-defined views from Firebird and saves their source code to a file
         """
