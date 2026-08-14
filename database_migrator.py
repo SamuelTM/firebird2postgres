@@ -50,6 +50,7 @@ class DatabaseMigrator:
         import re
         sys.path.append(os.path.join(os.path.dirname(__file__), 'firebird_grammar'))
         from firebird_grammar.FirebirdLexer import FirebirdLexer
+        # noinspection PyUnresolvedReferences
         from firebird_grammar.FirebirdParser import FirebirdParser
         from firebird_visitor import FirebirdToPostgresVisitor
         from antlr4.atn.PredictionMode import PredictionMode
@@ -61,8 +62,10 @@ class DatabaseMigrator:
         parser = FirebirdParser(stream)
 
         # Fast SLL mode with BailErrorStrategy (Two-Stage Parsing)
-        parser._interp.predictionMode = PredictionMode.SLL  # noqa: SLF001
-        parser._errHandler = BailErrorStrategy()  # noqa: SLF001
+        # noinspection PyProtectedMember
+        parser._interp.predictionMode = PredictionMode.SLL
+        # noinspection PyProtectedMember
+        parser._errHandler = BailErrorStrategy()
 
         try:
             tree = parser.sql_script()
@@ -70,8 +73,10 @@ class DatabaseMigrator:
             # Fallback to standard LL mode if SLL encounters ambiguity
             stream.seek(0)
             parser.reset()
-            parser._errHandler = DefaultErrorStrategy()  # noqa: SLF001
-            parser._interp.predictionMode = PredictionMode.LL  # noqa: SLF001
+            # noinspection PyProtectedMember
+            parser._errHandler = DefaultErrorStrategy()
+            # noinspection PyProtectedMember
+            parser._interp.predictionMode = PredictionMode.LL
             tree = parser.sql_script()
 
         visitor = FirebirdToPostgresVisitor()
