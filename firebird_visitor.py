@@ -145,8 +145,22 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
 
     def visitCreate_view(self, ctx: FirebirdParser.Create_viewContext):
         view_name = ctx.id_expression(0).getText().strip('"')
-        # We can extract the select statement raw
+        # Extract the select statement raw
         select_stmt = self.get_raw_text(ctx.select_only_statement())
+
+        # Quote table.column references in uppercase
+        select_stmt = re.sub(
+            r'\b([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\b',
+            lambda m: f'"{m.group(1).upper()}"."{m.group(2).upper()}"',
+            select_stmt
+        )
+
+        # Quote FROM and JOIN table references in uppercase
+        select_stmt = re.sub(
+            r'(?i)\b(FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_]*)\b',
+            lambda m: f'{m.group(1)} "{m.group(2).upper()}"' if not m.group(2).startswith('"') else m.group(0),
+            select_stmt
+        )
 
         view_opts = ""
         if ctx.view_options():
