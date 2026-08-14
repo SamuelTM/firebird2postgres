@@ -130,8 +130,12 @@ class DatabaseMigrator:
                 flags=re.IGNORECASE | re.DOTALL
             )
 
-            # 7. Replace residual Firebird suspend; with Postgres RETURN NEXT;
-            pg_sql = re.sub(r'(?i)\bsuspend\s*;', 'RETURN NEXT;', pg_sql)
+            # 7. Replace residual Firebird suspend; with Postgres RETURN NEXT; or RETURN;
+            if re.search(r'RETURNS\s+void\b', pg_sql, re.IGNORECASE):
+                pg_sql = re.sub(r'(?i)\bsuspend\s*;', 'RETURN;', pg_sql)
+                pg_sql = re.sub(r'\bRETURN\s+NEXT\s*;', 'RETURN;', pg_sql)
+            else:
+                pg_sql = re.sub(r'(?i)\bsuspend\s*;', 'RETURN NEXT;', pg_sql)
 
         return pg_sql
 

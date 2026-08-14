@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 
 # Ensure the firebird_grammar directory is in the path
@@ -62,6 +63,8 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         has_return_next = "RETURN NEXT" in body_str or "suspend" in body_str.lower()
         if not out_params:
             return_type = "RETURNS void"
+            # In void functions, SUSPEND / RETURN NEXT must be a plain RETURN;
+            body_str = re.sub(r'\bRETURN\s+NEXT\b\s*;?', 'RETURN;', body_str)
         elif len(out_params) == 1:
             return_type = f"RETURNS SETOF {out_types[0]}" if has_return_next else f"RETURNS {out_types[0]}"
         else:
