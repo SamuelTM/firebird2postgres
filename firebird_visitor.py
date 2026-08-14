@@ -23,6 +23,15 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
                 statements.append(result)
         return "\n\n".join(statements)
 
+    @staticmethod
+    def _convert_type(raw_type: str) -> str:
+        if not raw_type:
+            return ""
+        cleaned = re.sub(r'(?i)\bBLOB\s+SUBTYPE\s+(?:1|TEXT)\b', 'TEXT', raw_type)
+        cleaned = re.sub(r'(?i)\bBLOB\s+SUBTYPE\s+(?:0|BINARY)\b', 'BYTEA', cleaned)
+        cleaned = re.sub(r'(?i)\bBLOB\b', 'BYTEA', cleaned)
+        return cleaned
+
     def visitUnit_statement(self, ctx: FirebirdParser.Unit_statementContext):
         return self.visitChildren(ctx)
 
@@ -39,7 +48,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
                 has_returns = True
             elif isinstance(child, FirebirdParser.ParameterContext):
                 param_str = self.visit(child)
-                type_spec = self.get_raw_text(child.type_spec()) if child.type_spec() else "TEXT"
+                type_spec = self._convert_type(self.get_raw_text(child.type_spec())) if child.type_spec() else "TEXT"
                 if has_returns:
                     out_params.append(f"OUT {param_str}")
                     out_types.append(type_spec)
@@ -79,7 +88,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         # Extract the raw tokens for the type to preserve spaces (e.g. VARCHAR(255))
         type_spec = ""
         if ctx.type_spec():
-            type_spec = self.get_raw_text(ctx.type_spec())
+            type_spec = self._convert_type(self.get_raw_text(ctx.type_spec()))
         return f"{param_name} {type_spec}".strip()
 
     def visitCreate_trigger(self, ctx: FirebirdParser.Create_triggerContext):
@@ -224,7 +233,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
 
     def visitVariable_declaration(self, ctx: FirebirdParser.Variable_declarationContext):
         var_name = ctx.identifier().getText()
-        type_spec = self.get_raw_text(ctx.type_spec())
+        type_spec = self._convert_type(self.get_raw_text(ctx.type_spec()))
         return f"    {var_name} {type_spec};"
 
     def visitAssignment_statement(self, ctx: FirebirdParser.Assignment_statementContext):
