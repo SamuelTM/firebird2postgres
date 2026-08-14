@@ -84,6 +84,10 @@ class DatabaseMigrator:
         if pg_sql:
             pg_sql = re.sub(r'(?i)GEN_ID\s*\(\s*([a-zA-Z0-9_]+)\s*,\s*1\s*\)', r"nextval('\1')", pg_sql)
             pg_sql = re.sub(r'(?i)GEN_ID\s*\(\s*([a-zA-Z0-9_]+)\s*,\s*0\s*\)', r"currval('\1')", pg_sql)
+            # Remove Firebird bind variable colon prefix (:var -> var), preserving :: type casts
+            pg_sql = re.sub(r'(?<!:):([a-zA-Z_][a-zA-Z0-9_]*)(?!:)', r'\1', pg_sql)
+            # Replace Firebird EXECUTE PROCEDURE with Postgres PERFORM
+            pg_sql = re.sub(r'(?i)\bEXECUTE\s+PROCEDURE\s+', 'PERFORM ', pg_sql)
 
         return pg_sql
 

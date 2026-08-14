@@ -5,6 +5,7 @@ import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), 'firebird_grammar'))
 
 from firebird_grammar.FirebirdParserVisitor import FirebirdParserVisitor
+# noinspection PyUnresolvedReferences
 from firebird_grammar.FirebirdParser import FirebirdParser
 
 
@@ -27,16 +28,20 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
     def visitCreate_procedure_body(self, ctx: FirebirdParser.Create_procedure_bodyContext):
         proc_name = ctx.procedure_name().getText().strip('"')
 
+        # In PostgreSQL, we translate procedures to functions
         has_returns = False
         in_params = []
         out_params = []
+        out_types = []
         for child in ctx.children:
             if hasattr(child, 'getText') and child.getText().upper() == 'RETURNS':
                 has_returns = True
             elif isinstance(child, FirebirdParser.ParameterContext):
                 param_str = self.visit(child)
+                type_spec = self.get_raw_text(child.type_spec()) if child.type_spec() else "TEXT"
                 if has_returns:
                     out_params.append(f"OUT {param_str}")
+                    out_types.append(type_spec)
                 else:
                     in_params.append(param_str)
 
@@ -53,7 +58,16 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         # Translate the body
         body_str = self.visit(ctx.body()) if ctx.body() else ""
 
-        return (f'CREATE OR REPLACE FUNCTION "{proc_name}"({params_str}) RETURNS void AS $$\n{decl_str}{body_str}\n'
+        # Determine correct return type for PostgreSQL
+        has_return_next = "RETURN NEXT" in body_str or "suspend" in body_str.lower()
+        if not out_params:
+            return_type = "RETURNS void"
+        elif len(out_params) == 1:
+            return_type = f"RETURNS SETOF {out_types[0]}" if has_return_next else f"RETURNS {out_types[0]}"
+        else:
+            return_type = "RETURNS SETOF record" if has_return_next else "RETURNS record"
+
+        return (f'CREATE OR REPLACE FUNCTION "{proc_name}"({params_str}) {return_type} AS $$\n{decl_str}{body_str}\n'
                 f'$$ LANGUAGE plpgsql;')
 
     def visitParameter(self, ctx: FirebirdParser.ParameterContext):
@@ -81,6 +95,24 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
 
         body_str = self.visit(ctx.trigger_body()) if ctx.trigger_body() else ""
 
+        # Determine the return statement for Postgres trigger function
+        timing_upper = timing.upper()
+        events_upper = events.upper()
+        if "BEFORE" in timing_upper:
+            if "DELETE" in events_upper and "INSERT" not in events_upper and "UPDATE" not in events_upper:
+                return_stmt = "RETURN OLD;"
+            else:
+                return_stmt = "RETURN NEW;"
+        else:
+            return_stmt = "RETURN NULL;"
+
+        if body_str:
+            if body_str.rstrip().endswith("END;"):
+                idx = body_str.rstrip().rfind("END;")
+                body_str = f"{body_str[:idx]}    {return_stmt}\nEND;"
+            else:
+                body_str = f"{body_str}\n    {return_stmt}"
+
         # Postgres uses a function for the trigger body, and then CREATE TRIGGER
         func_name = f"{trigger_name}_func"
 
@@ -89,6 +121,15 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
                        f'FOR EACH ROW EXECUTE FUNCTION "{func_name}"();')
 
         return f"{func_sql}\n{trigger_sql}"
+
+    def visitTrigger_block(self, ctx: FirebirdParser.Trigger_blockContext):
+        decl_str = ""
+        if ctx.declare_spec():
+            decls = [self.visit(d) for d in ctx.declare_spec() if self.visit(d)]
+            if decls:
+                decl_str = "DECLARE\n" + "\n".join(decls) + "\n"
+        body_str = self.visit(ctx.body()) if ctx.body() else ""
+        return f"{decl_str}{body_str}"
 
     def visitCreate_view(self, ctx: FirebirdParser.Create_viewContext):
         view_name = ctx.id_expression(0).getText().strip('"')
@@ -121,11 +162,9 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
     def visitStatement(self, ctx: FirebirdParser.StatementContext):
         child = ctx.getChild(0)
 
-        # If it's a SUSPEND terminal
         if hasattr(ctx, 'SUSPEND') and ctx.SUSPEND():
             return "RETURN NEXT"
 
-        # For known control structures, we visit them
         if isinstance(child, (
                 FirebirdParser.BodyContext,
                 FirebirdParser.BlockContext,
@@ -140,9 +179,13 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         return self.get_raw_text(ctx)
 
     def visitBlock(self, ctx: FirebirdParser.BlockContext):
-        # block : label_declaration? (DECLARE ...)* body ;
-        # For now just return the body
-        return self.visit(ctx.body()) if ctx.body() else ""
+        decl_str = ""
+        if ctx.declare_spec():
+            decls = [self.visit(d) for d in ctx.declare_spec() if self.visit(d)]
+            if decls:
+                decl_str = "DECLARE\n" + "\n".join(decls) + "\n"
+        body_str = self.visit(ctx.body()) if ctx.body() else ""
+        return f"{decl_str}{body_str}"
 
     def visitIf_statement(self, ctx: FirebirdParser.If_statementContext):
         cond = self.get_raw_text(ctx.condition())
