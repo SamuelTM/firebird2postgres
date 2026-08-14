@@ -85,7 +85,8 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         func_name = f"{trigger_name}_func"
 
         func_sql = f'CREATE OR REPLACE FUNCTION "{func_name}"() RETURNS TRIGGER AS $$\n{body_str}\n$$ LANGUAGE plpgsql;'
-        trigger_sql = f'CREATE TRIGGER "{trigger_name}" {timing} {events} ON "{table_name}" FOR EACH ROW EXECUTE FUNCTION "{func_name}"();'
+        trigger_sql = (f'CREATE TRIGGER "{trigger_name}" {timing} {events} ON "{table_name}" '
+                       f'FOR EACH ROW EXECUTE FUNCTION "{func_name}"();')
 
         return f"{func_sql}\n{trigger_sql}"
 
@@ -93,12 +94,12 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         view_name = ctx.id_expression(0).getText().strip('"')
         # We can extract the select statement raw
         select_stmt = self.get_raw_text(ctx.select_only_statement())
-        
+
         view_opts = ""
         if ctx.view_options():
             view_opts = self.get_raw_text(ctx.view_options())
             view_opts = f" {view_opts}"
-            
+
         return f'CREATE OR REPLACE VIEW "{view_name}"{view_opts} AS {select_stmt};'
 
     def visitBody(self, ctx: FirebirdParser.BodyContext):
@@ -113,27 +114,27 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
                         if not stmt_str.endswith(';'):
                             stmt_str += ';'
                         statements.append(stmt_str)
-        
+
         inner_code = "\n".join(f"    {s}" for s in statements)
         return f"BEGIN\n{inner_code}\nEND;"
 
     def visitStatement(self, ctx: FirebirdParser.StatementContext):
         child = ctx.getChild(0)
-        
+
         # If it's a SUSPEND terminal
         if hasattr(ctx, 'SUSPEND') and ctx.SUSPEND():
             return "RETURN NEXT"
-            
+
         # For known control structures, we visit them
         if isinstance(child, (
-            FirebirdParser.BodyContext,
-            FirebirdParser.BlockContext,
-            FirebirdParser.Assignment_statementContext,
-            FirebirdParser.If_statementContext,
-            FirebirdParser.Loop_statementContext
+                FirebirdParser.BodyContext,
+                FirebirdParser.BlockContext,
+                FirebirdParser.Assignment_statementContext,
+                FirebirdParser.If_statementContext,
+                FirebirdParser.Loop_statementContext
         )):
             return self.visit(child)
-            
+
         # For all other SQL statements (SELECT, UPDATE, DELETE, EXECUTE, etc.)
         # we just return their raw Firebird text for now.
         return self.get_raw_text(ctx)
@@ -146,13 +147,13 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
     def visitIf_statement(self, ctx: FirebirdParser.If_statementContext):
         cond = self.get_raw_text(ctx.condition())
         then_stmt = self.visit(ctx.statement(0))
-        
+
         sql = f"IF {cond} THEN\n    {then_stmt}\n"
-        
+
         if len(ctx.statement()) > 1:
             else_stmt = self.visit(ctx.statement(1))
             sql += f"ELSE\n    {else_stmt}\n"
-            
+
         sql += "END IF"
         return sql
 
@@ -188,26 +189,26 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
     def visitLoop_statement(self, ctx: FirebirdParser.Loop_statementContext):
         if ctx.select_statement():
             into_ctx = self.find_node(ctx.select_statement(), FirebirdParser.Into_clauseContext)
-            
+
             into_vars = []
             if into_ctx:
                 for child in into_ctx.children:
                     if isinstance(child, (FirebirdParser.General_elementContext, FirebirdParser.Bind_variableContext)):
                         into_vars.append(self.get_raw_text(child).lstrip(':'))
-            
+
             select_sql = self.get_text_without_node(ctx.select_statement(), into_ctx).strip()
-            
+
             target = ", ".join(into_vars) if into_vars else "_rec"
-            
+
             body_sql = self.visit(ctx.statement())
-            
+
             # Indent body_sql properly
             body_lines = body_sql.split('\n')
             indented_body = "\n".join(f"    {line}" if line.strip() else line for line in body_lines)
-            
+
             return f"FOR {target} IN {select_sql} LOOP\n{indented_body}\nEND LOOP;"
-            
-        return self.get_raw_text(ctx) # Fallback for other loops
+
+        return self.get_raw_text(ctx)  # Fallback for other loops
 
     def visitTerminal(self, node):
         if node.getText().upper() == 'SUSPEND':
