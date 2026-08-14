@@ -1,5 +1,5 @@
-import sys
 import os
+import sys
 
 # Ensure the firebird_grammar directory is in the path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'firebird_grammar'))
@@ -93,18 +93,68 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         view_name = ctx.id_expression(0).getText()
         # We can extract the select statement raw
         select_stmt = self.get_raw_text(ctx.select_only_statement())
-        return f"CREATE OR REPLACE VIEW {view_name} AS {select_stmt};"
+        
+        view_opts = ""
+        if ctx.view_options():
+            view_opts = self.get_raw_text(ctx.view_options())
+            view_opts = f" {view_opts}"
+            
+        return f"CREATE OR REPLACE VIEW {view_name}{view_opts} AS {select_stmt};"
 
     def visitBody(self, ctx: FirebirdParser.BodyContext):
+        # A body is usually BEGIN ... END
         statements = []
-        if ctx.seq_of_statements():
-            for stmt in ctx.seq_of_statements().statement():
-                stmt_str = self.visit(stmt)
-                if stmt_str:
-                    statements.append(stmt_str)
-
+        if ctx.seq_of_statements() and ctx.seq_of_statements().children:
+            for child in ctx.seq_of_statements().children:
+                if isinstance(child, FirebirdParser.StatementContext):
+                    stmt_str = self.visit(child)
+                    if stmt_str:
+                        stmt_str = stmt_str.strip()
+                        if not stmt_str.endswith(';'):
+                            stmt_str += ';'
+                        statements.append(stmt_str)
+        
         inner_code = "\n".join(f"    {s}" for s in statements)
         return f"BEGIN\n{inner_code}\nEND;"
+
+    def visitStatement(self, ctx: FirebirdParser.StatementContext):
+        child = ctx.getChild(0)
+        
+        # If it's a SUSPEND terminal
+        if hasattr(ctx, 'SUSPEND') and ctx.SUSPEND():
+            return "RETURN NEXT"
+            
+        # For known control structures, we visit them
+        if isinstance(child, (
+            FirebirdParser.BodyContext,
+            FirebirdParser.BlockContext,
+            FirebirdParser.Assignment_statementContext,
+            FirebirdParser.If_statementContext,
+            FirebirdParser.Loop_statementContext
+        )):
+            return self.visit(child)
+            
+        # For all other SQL statements (SELECT, UPDATE, DELETE, EXECUTE, etc.)
+        # we just return their raw Firebird text for now.
+        return self.get_raw_text(ctx)
+
+    def visitBlock(self, ctx: FirebirdParser.BlockContext):
+        # block : label_declaration? (DECLARE ...)* body ;
+        # For now just return the body
+        return self.visit(ctx.body()) if ctx.body() else ""
+
+    def visitIf_statement(self, ctx: FirebirdParser.If_statementContext):
+        cond = self.get_raw_text(ctx.condition())
+        then_stmt = self.visit(ctx.statement(0))
+        
+        sql = f"IF {cond} THEN\n    {then_stmt}\n"
+        
+        if len(ctx.statement()) > 1:
+            else_stmt = self.visit(ctx.statement(1))
+            sql += f"ELSE\n    {else_stmt}\n"
+            
+        sql += "END IF"
+        return sql
 
     @staticmethod
     def get_raw_text(ctx):
@@ -131,9 +181,53 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         return f"    {var_name} {type_spec};"
 
     def visitAssignment_statement(self, ctx: FirebirdParser.Assignment_statementContext):
-        left = self.get_raw_text(ctx.getChild(0))
+        left = self.get_raw_text(ctx.getChild(0)).lstrip(':')
         right = self.get_raw_text(ctx.expression())
         return f"{left} := {right};"
 
+    def visitLoop_statement(self, ctx: FirebirdParser.Loop_statementContext):
+        if ctx.select_statement():
+            into_ctx = self.find_node(ctx.select_statement(), FirebirdParser.Into_clauseContext)
+            
+            into_vars = []
+            if into_ctx:
+                for child in into_ctx.children:
+                    if isinstance(child, (FirebirdParser.General_elementContext, FirebirdParser.Bind_variableContext)):
+                        into_vars.append(self.get_raw_text(child).lstrip(':'))
+            
+            select_sql = self.get_text_without_node(ctx.select_statement(), into_ctx).strip()
+            
+            target = ", ".join(into_vars) if into_vars else "_rec"
+            
+            body_sql = self.visit(ctx.statement())
+            
+            # Indent body_sql properly
+            body_lines = body_sql.split('\n')
+            indented_body = "\n".join(f"    {line}" if line.strip() else line for line in body_lines)
+            
+            return f"FOR {target} IN {select_sql} LOOP\n{indented_body}\nEND LOOP;"
+            
+        return self.get_raw_text(ctx) # Fallback for other loops
+
     def visitTerminal(self, node):
+        if node.getText().upper() == 'SUSPEND':
+            return "RETURN NEXT;"
         return None
+
+    def find_node(self, ctx, node_type):
+        if isinstance(ctx, node_type):
+            return ctx
+        if hasattr(ctx, 'children') and ctx.children:
+            for child in ctx.children:
+                res = self.find_node(child, node_type)
+                if res:
+                    return res
+        return None
+
+    def get_text_without_node(self, parent_ctx, exclude_ctx):
+        if exclude_ctx is None:
+            return self.get_raw_text(parent_ctx)
+        stream = parent_ctx.start.getInputStream()
+        before = stream.getText(parent_ctx.start.start, exclude_ctx.start.start - 1)
+        after = stream.getText(exclude_ctx.stop.stop + 1, parent_ctx.stop.stop)
+        return before + after

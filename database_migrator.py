@@ -3,6 +3,7 @@ import psycopg2.extras
 from enum import IntEnum
 
 from database_objects import Table, Column, ForeignKey, UniqueKey, Index
+from antlr4 import InputStream, CommonTokenStream
 
 
 class FirebirdDataType(IntEnum):
@@ -27,6 +28,30 @@ class DatabaseMigrator:
         self.fb_con = fb_con
         self.pg_con = pg_con
         self.table_objs: list[Table] = []
+
+    @staticmethod
+    def transpile_firebird_sql(firebird_sql_string: str) -> str:
+        import sys
+        import os
+        import re
+        sys.path.append(os.path.join(os.path.dirname(__file__), 'firebird_grammar'))
+        from firebird_grammar.FirebirdLexer import FirebirdLexer
+        from firebird_grammar.FirebirdParser import FirebirdParser
+        from firebird_visitor import FirebirdToPostgresVisitor
+
+        lexer = FirebirdLexer(InputStream(firebird_sql_string))
+        stream = CommonTokenStream(lexer)
+        parser = FirebirdParser(stream)
+        tree = parser.sql_script()
+
+        visitor = FirebirdToPostgresVisitor()
+        pg_sql = visitor.visit(tree)
+
+        if pg_sql:
+            pg_sql = re.sub(r'(?i)GEN_ID\s*\(\s*([a-zA-Z0-9_]+)\s*,\s*1\s*\)', r"nextval('\1')", pg_sql)
+            pg_sql = re.sub(r'(?i)GEN_ID\s*\(\s*([a-zA-Z0-9_]+)\s*,\s*0\s*\)', r"currval('\1')", pg_sql)
+
+        return pg_sql
 
     @staticmethod
     def _get_firebird_data_type_name(data_type_value: int, subtype: int = None) -> str | None:
@@ -369,7 +394,7 @@ class DatabaseMigrator:
 
         return f'{phase} {" OR ".join(events)}'
 
-    def export_firebird_triggers(self, output_file: str = 'firebird_triggers_dump.sql'):
+    def export_firebird_triggers(self, output_file: str = 'firebird_triggers_dump.sql', converted_file: str = 'postgres_triggers_dump.sql'):
         """
         Extracts all user-defined triggers from Firebird and saves their source code to a file
         """
@@ -385,10 +410,14 @@ class DatabaseMigrator:
         fb_cursor.execute(query)
         triggers = fb_cursor.fetchall()
 
-        with open(output_file, 'w', encoding='utf-8') as f:
+        with open(output_file, 'w', encoding='utf-8') as f, open(converted_file, 'w', encoding='utf-8') as conv_f:
             f.write("-- ==========================================\n")
             f.write("-- FIREBIRD TRIGGERS DUMP\n")
             f.write("-- ==========================================\n\n")
+
+            conv_f.write("-- ==========================================\n")
+            conv_f.write("-- POSTGRESQL TRIGGERS DUMP (CONVERTED)\n")
+            conv_f.write("-- ==========================================\n\n")
 
             for trigger in triggers:
                 trigger_name = trigger[0].strip() if trigger[0] else 'UNKNOWN'
@@ -398,12 +427,23 @@ class DatabaseMigrator:
 
                 timing_events = self._decode_trigger_type(trigger_type)
 
-                f.write(f"CREATE TRIGGER {trigger_name} FOR {relation_name} {timing_events}\n")
-                f.write(f"{source}\n\n")
+                fb_sql = f"CREATE TRIGGER {trigger_name} FOR {relation_name} {timing_events}\n"
+                fb_sql += f"{source}\n\n"
 
-        print(f"Exported {len(triggers)} triggers to '{output_file}'")
+                f.write(fb_sql)
 
-    def export_firebird_procedures(self, output_file: str = 'firebird_procedures_dump.sql'):
+                try:
+                    pg_sql = self.transpile_firebird_sql(fb_sql)
+                    conv_f.write(pg_sql)
+                    conv_f.write("\n\n")
+                except Exception as e:
+                    print(f"Failed to transpile trigger {trigger_name}: {e}")
+                    conv_f.write(f"-- [TRANSPILER FAILED] TRIGGER {trigger_name}\n")
+                    conv_f.write(fb_sql)
+
+        print(f"Exported {len(triggers)} triggers to '{output_file}' and '{converted_file}'")
+
+    def export_firebird_procedures(self, output_file: str = 'firebird_procedures_dump.sql', converted_file: str = 'postgres_procedures_dump.sql'):
         """
         Extracts all user-defined stored procedures from Firebird and saves their source code to a file
         """
@@ -419,10 +459,14 @@ class DatabaseMigrator:
         fb_cursor.execute(query)
         procedures = fb_cursor.fetchall()
 
-        with open(output_file, 'w', encoding='utf-8') as f:
+        with open(output_file, 'w', encoding='utf-8') as f, open(converted_file, 'w', encoding='utf-8') as conv_f:
             f.write("-- ==========================================\n")
             f.write("-- FIREBIRD PROCEDURES DUMP\n")
             f.write("-- ==========================================\n\n")
+
+            conv_f.write("-- ==========================================\n")
+            conv_f.write("-- POSTGRESQL PROCEDURES DUMP (CONVERTED)\n")
+            conv_f.write("-- ==========================================\n\n")
 
             for proc in procedures:
                 proc_name = proc[0].strip() if proc[0] else 'UNKNOWN'
@@ -476,20 +520,31 @@ class DatabaseMigrator:
                         output_params.append(f'    {param_name} {type_name}')
 
                 # Build header
-                f.write(f'CREATE OR ALTER PROCEDURE {proc_name}')
+                fb_sql = f'CREATE OR ALTER PROCEDURE {proc_name}'
                 if input_params:
                     params_str = ",\n".join(input_params)
-                    f.write(f' (\n{params_str}\n)')
-                f.write('\n')
+                    fb_sql += f' (\n{params_str}\n)'
+                fb_sql += '\n'
                 if output_params:
                     params_str = ",\n".join(output_params)
-                    f.write(f'RETURNS (\n{params_str}\n)\n')
-                f.write('AS\n')
-                f.write(f'{source};\n\n')
+                    fb_sql += f'RETURNS (\n{params_str}\n)\n'
+                fb_sql += 'AS\n'
+                fb_sql += f'{source};\n\n'
 
-        print(f"Exported {len(procedures)} procedures to '{output_file}'")
+                f.write(fb_sql)
 
-    def export_firebird_views(self, output_file: str = 'firebird_views_dump.sql'):
+                try:
+                    pg_sql = self.transpile_firebird_sql(fb_sql)
+                    conv_f.write(pg_sql)
+                    conv_f.write('\n\n')
+                except Exception as e:
+                    print(f"Failed to transpile procedure {proc_name}: {e}")
+                    conv_f.write(f"-- [TRANSPILER FAILED] PROCEDURE {proc_name}\n")
+                    conv_f.write(fb_sql)
+
+        print(f"Exported {len(procedures)} procedures to '{output_file}' and '{converted_file}'")
+
+    def export_firebird_views(self, output_file: str = 'firebird_views_dump.sql', converted_file: str = 'postgres_views_dump.sql'):
         """
         Extracts all user-defined views from Firebird and saves their source code to a file
         """
@@ -505,11 +560,15 @@ class DatabaseMigrator:
         fb_cursor.execute(query)
         views = fb_cursor.fetchall()
 
-        with open(output_file, 'w', encoding='utf-8') as f:
+        with open(output_file, 'w', encoding='utf-8') as f, open(converted_file, 'w', encoding='utf-8') as conv_f:
             f.write("-- ==========================================\n")
             f.write("-- FIREBIRD VIEWS DUMP\n")
             f.write("-- This file contains the raw SELECT source for manual translation to PostgreSQL views\n")
             f.write("-- ==========================================\n\n")
+
+            conv_f.write("-- ==========================================\n")
+            conv_f.write("-- POSTGRESQL VIEWS DUMP (CONVERTED)\n")
+            conv_f.write("-- ==========================================\n\n")
 
             for view in views:
                 view_name = view[0].strip() if view[0] else 'UNKNOWN'
@@ -537,7 +596,22 @@ class DatabaseMigrator:
                 f.write(f"-- ----------------------------------------\n")
                 f.write(f"-- View: {view_name}\n")
                 f.write(f"-- ----------------------------------------\n")
-                f.write(f'CREATE OR ALTER VIEW "{view_name}"{col_list} AS\n')
-                f.write(f"{source}\n\n")
+                
+                conv_f.write(f"-- ----------------------------------------\n")
+                conv_f.write(f"-- View: {view_name}\n")
+                conv_f.write(f"-- ----------------------------------------\n")
+                
+                fb_sql = f'CREATE OR ALTER VIEW "{view_name}"{col_list} AS\n{source}\n\n'
+                
+                f.write(fb_sql)
+                
+                try:
+                    pg_sql = self.transpile_firebird_sql(fb_sql)
+                    conv_f.write(pg_sql)
+                    conv_f.write("\n\n")
+                except Exception as e:
+                    print(f"Failed to transpile view {view_name}: {e}")
+                    conv_f.write(f"-- [TRANSPILER FAILED] VIEW {view_name}\n")
+                    conv_f.write(fb_sql)
 
-        print(f"Exported {len(views)} views to '{output_file}'")
+        print(f"Exported {len(views)} views to '{output_file}' and '{converted_file}'")
