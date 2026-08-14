@@ -25,7 +25,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         return self.visitChildren(ctx)
 
     def visitCreate_procedure_body(self, ctx: FirebirdParser.Create_procedure_bodyContext):
-        proc_name = ctx.procedure_name().getText()
+        proc_name = ctx.procedure_name().getText().strip('"')
 
         has_returns = False
         in_params = []
@@ -53,8 +53,8 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         # Translate the body
         body_str = self.visit(ctx.body()) if ctx.body() else ""
 
-        return (f"CREATE OR REPLACE FUNCTION {proc_name}({params_str}) RETURNS void AS $$\n{decl_str}{body_str}\n"
-                f"$$ LANGUAGE plpgsql;")
+        return (f'CREATE OR REPLACE FUNCTION "{proc_name}"({params_str}) RETURNS void AS $$\n{decl_str}{body_str}\n'
+                f'$$ LANGUAGE plpgsql;')
 
     def visitParameter(self, ctx: FirebirdParser.ParameterContext):
         param_name = ctx.parameter_name().getText()
@@ -66,9 +66,9 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         return f"{param_name} {type_spec}".strip()
 
     def visitCreate_trigger(self, ctx: FirebirdParser.Create_triggerContext):
-        trigger_name = ctx.trigger_name().getText()
+        trigger_name = ctx.trigger_name().getText().strip('"')
         # Extract table name and events
-        table_name = ctx.tableview_name().getText() if ctx.tableview_name() else "UNKNOWN_TABLE"
+        table_name = ctx.tableview_name().getText().strip('"') if ctx.tableview_name() else "UNKNOWN_TABLE"
 
         # Simple extraction of timing and events
         simple_dml = ctx.simple_dml_trigger()
@@ -84,13 +84,13 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         # Postgres uses a function for the trigger body, and then CREATE TRIGGER
         func_name = f"{trigger_name}_func"
 
-        func_sql = f"CREATE OR REPLACE FUNCTION {func_name}() RETURNS TRIGGER AS $$\n{body_str}\n$$ LANGUAGE plpgsql;"
-        trigger_sql = f"CREATE TRIGGER {trigger_name} {timing} {events} ON {table_name} FOR EACH ROW EXECUTE FUNCTION {func_name}();"
+        func_sql = f'CREATE OR REPLACE FUNCTION "{func_name}"() RETURNS TRIGGER AS $$\n{body_str}\n$$ LANGUAGE plpgsql;'
+        trigger_sql = f'CREATE TRIGGER "{trigger_name}" {timing} {events} ON "{table_name}" FOR EACH ROW EXECUTE FUNCTION "{func_name}"();'
 
         return f"{func_sql}\n{trigger_sql}"
 
     def visitCreate_view(self, ctx: FirebirdParser.Create_viewContext):
-        view_name = ctx.id_expression(0).getText()
+        view_name = ctx.id_expression(0).getText().strip('"')
         # We can extract the select statement raw
         select_stmt = self.get_raw_text(ctx.select_only_statement())
         
@@ -99,7 +99,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
             view_opts = self.get_raw_text(ctx.view_options())
             view_opts = f" {view_opts}"
             
-        return f"CREATE OR REPLACE VIEW {view_name}{view_opts} AS {select_stmt};"
+        return f'CREATE OR REPLACE VIEW "{view_name}"{view_opts} AS {select_stmt};'
 
     def visitBody(self, ctx: FirebirdParser.BodyContext):
         # A body is usually BEGIN ... END
