@@ -87,15 +87,20 @@ class DatabaseMigrator:
             pg_sql = re.sub(r'(?i)GEN_ID\s*\(\s*([a-zA-Z0-9_]+)\s*,\s*0\s*\)', r"currval('\1')", pg_sql)
 
             # 2. Remove Firebird bind variable colon prefix (:var -> var), preserving :: type casts
+            pg_sql = re.sub(r'([a-zA-Z0-9_])(?<!:):([a-zA-Z_][a-zA-Z0-9_]*)', r'\1 \2', pg_sql)
             pg_sql = re.sub(r'(?<!:):([a-zA-Z_][a-zA-Z0-9_]*)(?!:)', r'\1', pg_sql)
 
             # 3. Replace Firebird EXECUTE PROCEDURE with Postgres PERFORM
             pg_sql = re.sub(r'(?i)\bEXECUTE\s+PROCEDURE\s+', 'PERFORM ', pg_sql)
 
-            # 4. Fix split identifiers from parser error recovery (e.g. old.; \n id_marcacao; -> old.id_marcacao;)
-            pg_sql = re.sub(r'\b(old|new)\.;\s*\n\s*([a-zA-Z0-9_]+);', r'\1.\2;', pg_sql, flags=re.IGNORECASE)
+            # 4. Translate Firebird EXCEPTION <name> -> Postgres RAISE EXCEPTION '<name>'
+            pg_sql = re.sub(r'(?i)\bexception\s*;\s*\n\s*([a-zA-Z0-9_]+)\s*;?', r"RAISE EXCEPTION '\1';", pg_sql)
+            pg_sql = re.sub(r'(?i)\bexception\s+([a-zA-Z0-9_]+)\s*;', r"RAISE EXCEPTION '\1';", pg_sql)
 
-            # 5. Translate SELECT FIRST n [SKIP m] to LIMIT n [OFFSET m]
+            # 5. Fix split identifiers from parser error recovery (e.g. old.; \n id_marcacao -> old.id_marcacao)
+            pg_sql = re.sub(r'\b(old|new)\.;?\s*\n\s*([a-zA-Z0-9_]+)', r'\1.\2', pg_sql, flags=re.IGNORECASE)
+
+            # 6. Translate SELECT FIRST n [SKIP m] to LIMIT n [OFFSET m]
             def _repl_subquery(m):
                 prefix = m.group(1)
                 first_n = m.group(2)
@@ -125,7 +130,7 @@ class DatabaseMigrator:
                 flags=re.IGNORECASE | re.DOTALL
             )
 
-            # 6. Replace residual Firebird suspend; with Postgres RETURN NEXT;
+            # 7. Replace residual Firebird suspend; with Postgres RETURN NEXT;
             pg_sql = re.sub(r'(?i)\bsuspend\s*;', 'RETURN NEXT;', pg_sql)
 
         return pg_sql
