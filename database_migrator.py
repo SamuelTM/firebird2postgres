@@ -137,6 +137,12 @@ class DatabaseMigrator:
             else:
                 pg_sql = re.sub(r'(?i)\bsuspend\s*;', 'RETURN NEXT;', pg_sql)
 
+            # 8. Replace Firebird NEXT VALUE FOR sequences -> nextval('seq')
+            pg_sql = re.sub(r'(?i)\bnext\s+value\s+for\s+([a-zA-Z0-9_]+)(?:\s+from\s+RDB\$DATABASE)?', r"nextval('\1')", pg_sql)
+
+            # 9. Replace Firebird LEAVE; -> Postgres EXIT;
+            pg_sql = re.sub(r'(?i)\bleave\s*;', 'EXIT;', pg_sql)
+
         return pg_sql
 
     @staticmethod

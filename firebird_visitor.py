@@ -216,14 +216,22 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
     def visitIf_statement(self, ctx: FirebirdParser.If_statementContext):
         cond = self.get_raw_text(ctx.condition())
         then_stmt = self.visit(ctx.statement(0))
+        if then_stmt:
+            then_stmt = then_stmt.strip()
+            if not then_stmt.endswith(';'):
+                then_stmt += ';'
 
         sql = f"IF {cond} THEN\n    {then_stmt}\n"
 
         if len(ctx.statement()) > 1:
             else_stmt = self.visit(ctx.statement(1))
+            if else_stmt:
+                else_stmt = else_stmt.strip()
+                if not else_stmt.endswith(';'):
+                    else_stmt += ';'
             sql += f"ELSE\n    {else_stmt}\n"
 
-        sql += "END IF"
+        sql += "END IF;"
         return sql
 
     @staticmethod
@@ -256,6 +264,22 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         return f"{left} := {right};"
 
     def visitLoop_statement(self, ctx: FirebirdParser.Loop_statementContext):
+        # Case 1: FOR EXECUTE STATEMENT expression into_clause? DO statement
+        if hasattr(ctx, 'EXECUTE') and ctx.EXECUTE():
+            expr = self.get_raw_text(ctx.expression())
+            into_vars = []
+            if ctx.into_clause():
+                for child in ctx.into_clause().children:
+                    if isinstance(child, (FirebirdParser.General_elementContext, FirebirdParser.Bind_variableContext)):
+                        into_vars.append(self.get_raw_text(child).lstrip(':'))
+
+            target = ", ".join(into_vars) if into_vars else "_rec"
+            body_sql = self.visit(ctx.statement())
+            body_lines = body_sql.split('\n')
+            indented_body = "\n".join(f"    {line}" if line.strip() else line for line in body_lines)
+            return f"FOR {target} IN EXECUTE {expr} LOOP\n{indented_body}\nEND LOOP;"
+
+        # Case 2: FOR select_statement DO statement
         if ctx.select_statement():
             into_ctx = self.find_node(ctx.select_statement(), FirebirdParser.Into_clauseContext)
 
@@ -277,7 +301,15 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
 
             return f"FOR {target} IN {select_sql} LOOP\n{indented_body}\nEND LOOP;"
 
-        return self.get_raw_text(ctx)  # Fallback for other loops
+        # Case 3: WHILE condition DO statement
+        if ctx.condition():
+            cond = self.get_raw_text(ctx.condition())
+            body_sql = self.visit(ctx.statement())
+            body_lines = body_sql.split('\n')
+            indented_body = "\n".join(f"    {line}" if line.strip() else line for line in body_lines)
+            return f"WHILE {cond} LOOP\n{indented_body}\nEND LOOP;"
+
+        return self.get_raw_text(ctx)
 
     def visitTerminal(self, node):
         if node.getText().upper() == 'SUSPEND':
