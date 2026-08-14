@@ -318,7 +318,7 @@ class DatabaseMigrator:
 
                 self.pg_con.commit()
                 print(f'  -> Imported {total_rows} rows.')
-                
+
             except Exception as e:
                 self.pg_con.rollback()
                 print(f'  [CRITICAL ERROR] Failed to import the following table: {table.name}: {e}')
@@ -462,12 +462,12 @@ class DatabaseMigrator:
                     if type_name is None:
                         type_name = 'VARCHAR(255)'
 
-                    # Handle NUMERIC/DECIMAL subtypes
-                    if (field_type in (7, 8, 16) and field_subtype is not None
+                    if (field_type in (FirebirdDataType.SMALLINT, FirebirdDataType.INTEGER,
+                                       FirebirdDataType.BIGINT) and field_subtype is not None
                             and field_subtype > 0 and field_precision):
                         type_name = f'NUMERIC({field_precision}, {field_scale})'
-                    # Append length for CHAR/VARCHAR
-                    elif field_type in (14, 37) and field_length:
+
+                    elif field_type in (FirebirdDataType.CHAR, FirebirdDataType.VARCHAR) and field_length:
                         type_name = f'{type_name}({field_length})'
 
                     if param_type_flag == 0:
@@ -524,7 +524,7 @@ class DatabaseMigrator:
                 """
                 fb_cursor.execute(columns_query)
                 columns = fb_cursor.fetchall()
-                
+
                 col_names = []
                 for col in columns:
                     col_name = col[0].strip()
