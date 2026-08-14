@@ -82,12 +82,51 @@ class DatabaseMigrator:
         pg_sql = visitor.visit(tree)
 
         if pg_sql:
+            # 1. Translate GEN_ID(seq, 1) -> nextval('seq') and GEN_ID(seq, 0) -> currval('seq')
             pg_sql = re.sub(r'(?i)GEN_ID\s*\(\s*([a-zA-Z0-9_]+)\s*,\s*1\s*\)', r"nextval('\1')", pg_sql)
             pg_sql = re.sub(r'(?i)GEN_ID\s*\(\s*([a-zA-Z0-9_]+)\s*,\s*0\s*\)', r"currval('\1')", pg_sql)
-            # Remove Firebird bind variable colon prefix (:var -> var), preserving :: type casts
+
+            # 2. Remove Firebird bind variable colon prefix (:var -> var), preserving :: type casts
             pg_sql = re.sub(r'(?<!:):([a-zA-Z_][a-zA-Z0-9_]*)(?!:)', r'\1', pg_sql)
-            # Replace Firebird EXECUTE PROCEDURE with Postgres PERFORM
+
+            # 3. Replace Firebird EXECUTE PROCEDURE with Postgres PERFORM
             pg_sql = re.sub(r'(?i)\bEXECUTE\s+PROCEDURE\s+', 'PERFORM ', pg_sql)
+
+            # 4. Fix split identifiers from parser error recovery (e.g. old.; \n id_marcacao; -> old.id_marcacao;)
+            pg_sql = re.sub(r'\b(old|new)\.;\s*\n\s*([a-zA-Z0-9_]+);', r'\1.\2;', pg_sql, flags=re.IGNORECASE)
+
+            # 5. Translate SELECT FIRST n [SKIP m] to LIMIT n [OFFSET m]
+            def _repl_subquery(m):
+                prefix = m.group(1)
+                first_n = m.group(2)
+                skip_m = m.group(3)
+                rest = m.group(4)
+                limit_clause = f' LIMIT {first_n}' + (f' OFFSET {skip_m}' if skip_m else '')
+                return f'({prefix}{rest}{limit_clause})'
+
+            def _repl_stmt(m):
+                prefix = m.group(1)
+                first_n = m.group(2)
+                skip_m = m.group(3)
+                rest = m.group(4)
+                limit_clause = f' LIMIT {first_n}' + (f' OFFSET {skip_m}' if skip_m else '')
+                return f'{prefix}{rest}{limit_clause};'
+
+            pg_sql = re.sub(
+                r'\(\s*(select\s+)first\s+(\d+)(?:\s+skip\s+(\d+))?\s+(.*?)\)',
+                _repl_subquery,
+                pg_sql,
+                flags=re.IGNORECASE | re.DOTALL
+            )
+            pg_sql = re.sub(
+                r'(?<!\()\b(select\s+)first\s+(\d+)(?:\s+skip\s+(\d+))?\s+(.*?);',
+                _repl_stmt,
+                pg_sql,
+                flags=re.IGNORECASE | re.DOTALL
+            )
+
+            # 6. Replace residual Firebird suspend; with Postgres RETURN NEXT;
+            pg_sql = re.sub(r'(?i)\bsuspend\s*;', 'RETURN NEXT;', pg_sql)
 
         return pg_sql
 
@@ -736,8 +775,9 @@ class DatabaseMigrator:
                 fb_ddl += ';\n'
                 f.write(fb_ddl)
 
-                # PostgreSQL DDL
-                pg_ddl = f'CREATE DOMAIN "{domain_name}" AS {pg_type}'
+                # PostgreSQL DDL (use unquoted identifier for case-insensitive matching in PL/pgSQL)
+                pg_domain_ident = domain_name if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', domain_name) else f'"{domain_name}"'
+                pg_ddl = f'CREATE DOMAIN {pg_domain_ident} AS {pg_type}'
                 if default_source:
                     pg_ddl += f' {default_source}'
                 if not_null:
