@@ -1,9 +1,23 @@
 import re
 import psycopg2.extras
 from enum import IntEnum
+from concurrent.futures import ProcessPoolExecutor
 
 from database_objects import Table, Column, ForeignKey, UniqueKey, Index
 from antlr4 import InputStream, CommonTokenStream
+
+
+def _transpile_worker(item: tuple[str, str]) -> tuple[str, str, str | None, str | None]:
+    """
+    Worker function for multiprocessing pool.
+    Takes (item_name, fb_sql) and returns (item_name, fb_sql, pg_sql, error_msg).
+    """
+    item_name, fb_sql = item
+    try:
+        pg_sql = DatabaseMigrator.transpile_firebird_sql(fb_sql)
+        return item_name, fb_sql, pg_sql, None
+    except Exception as e:
+        return item_name, fb_sql, None, str(e)
 
 
 class FirebirdDataType(IntEnum):
@@ -410,6 +424,21 @@ class DatabaseMigrator:
         fb_cursor.execute(query)
         triggers = fb_cursor.fetchall()
 
+        items = []
+        for trigger in triggers:
+            trigger_name = trigger[0].strip() if trigger[0] else 'UNKNOWN'
+            relation_name = trigger[1].strip() if trigger[1] else 'UNKNOWN'
+            trigger_type = trigger[2]
+            source = trigger[3]
+
+            timing_events = self._decode_trigger_type(trigger_type)
+            fb_sql = f"CREATE TRIGGER {trigger_name} FOR {relation_name} {timing_events}\n{source}\n\n"
+            items.append((trigger_name, fb_sql))
+
+        print(f"Transpiling {len(items)} triggers in parallel...")
+        with ProcessPoolExecutor() as executor:
+            results = list(executor.map(_transpile_worker, items))
+
         with open(output_file, 'w', encoding='utf-8') as f, open(converted_file, 'w', encoding='utf-8') as conv_f:
             f.write("-- ==========================================\n")
             f.write("-- FIREBIRD TRIGGERS DUMP\n")
@@ -419,25 +448,13 @@ class DatabaseMigrator:
             conv_f.write("-- POSTGRESQL TRIGGERS DUMP (CONVERTED)\n")
             conv_f.write("-- ==========================================\n\n")
 
-            for trigger in triggers:
-                trigger_name = trigger[0].strip() if trigger[0] else 'UNKNOWN'
-                relation_name = trigger[1].strip() if trigger[1] else 'UNKNOWN'
-                trigger_type = trigger[2]
-                source = trigger[3]
-
-                timing_events = self._decode_trigger_type(trigger_type)
-
-                fb_sql = f"CREATE TRIGGER {trigger_name} FOR {relation_name} {timing_events}\n"
-                fb_sql += f"{source}\n\n"
-
+            for trigger_name, fb_sql, pg_sql, err in results:
                 f.write(fb_sql)
-
-                try:
-                    pg_sql = self.transpile_firebird_sql(fb_sql)
+                if err is None and pg_sql:
                     conv_f.write(pg_sql)
                     conv_f.write("\n\n")
-                except Exception as e:
-                    print(f"Failed to transpile trigger {trigger_name}: {e}")
+                else:
+                    print(f"Failed to transpile trigger {trigger_name}: {err}")
                     conv_f.write(f"-- [TRANSPILER FAILED] TRIGGER {trigger_name}\n")
                     conv_f.write(fb_sql)
 
@@ -459,6 +476,76 @@ class DatabaseMigrator:
         fb_cursor.execute(query)
         procedures = fb_cursor.fetchall()
 
+        items = []
+        for proc in procedures:
+            proc_name = proc[0].strip() if proc[0] else 'UNKNOWN'
+            source = proc[1]
+
+            # Query input and output parameters for this procedure
+            params_query = f"""
+                SELECT
+                    pp.RDB$PARAMETER_NAME,
+                    pp.RDB$PARAMETER_TYPE,
+                    pp.RDB$PARAMETER_NUMBER,
+                    f.RDB$FIELD_TYPE,
+                    f.RDB$FIELD_SUB_TYPE,
+                    f.RDB$FIELD_LENGTH,
+                    f.RDB$FIELD_PRECISION,
+                    f.RDB$FIELD_SCALE
+                FROM RDB$PROCEDURE_PARAMETERS pp
+                JOIN RDB$FIELDS f ON pp.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
+                WHERE pp.RDB$PROCEDURE_NAME = '{proc_name}'
+                ORDER BY pp.RDB$PARAMETER_TYPE, pp.RDB$PARAMETER_NUMBER;
+            """
+            fb_cursor.execute(params_query)
+            params = fb_cursor.fetchall()
+
+            input_params = []
+            output_params = []
+            for param in params:
+                param_name = param[0].strip() if param[0] else 'UNKNOWN'
+                param_type_flag = param[1]  # 0=input, 1=output
+                field_type = param[3]
+                field_subtype = param[4]
+                field_length = param[5]
+                field_precision = param[6]
+                field_scale = abs(param[7]) if param[7] else 0
+
+                type_name = self._get_firebird_data_type_name(field_type, field_subtype)
+                if type_name is None:
+                    type_name = 'VARCHAR(255)'
+
+                if (field_type in (FirebirdDataType.SMALLINT, FirebirdDataType.INTEGER,
+                                   FirebirdDataType.BIGINT) and field_subtype is not None
+                        and field_subtype > 0 and field_precision):
+                    type_name = f'NUMERIC({field_precision}, {field_scale})'
+
+                elif field_type in (FirebirdDataType.CHAR, FirebirdDataType.VARCHAR) and field_length:
+                    type_name = f'{type_name}({field_length})'
+
+                if param_type_flag == 0:
+                    input_params.append(f'    {param_name} {type_name}')
+                else:
+                    output_params.append(f'    {param_name} {type_name}')
+
+            # Build header
+            fb_sql = f'CREATE OR ALTER PROCEDURE {proc_name}'
+            if input_params:
+                params_str = ",\n".join(input_params)
+                fb_sql += f' (\n{params_str}\n)'
+            fb_sql += '\n'
+            if output_params:
+                params_str = ",\n".join(output_params)
+                fb_sql += f'RETURNS (\n{params_str}\n)\n'
+            fb_sql += 'AS\n'
+            fb_sql += f'{source};\n\n'
+
+            items.append((proc_name, fb_sql))
+
+        print(f"Transpiling {len(items)} procedures in parallel...")
+        with ProcessPoolExecutor() as executor:
+            results = list(executor.map(_transpile_worker, items))
+
         with open(output_file, 'w', encoding='utf-8') as f, open(converted_file, 'w', encoding='utf-8') as conv_f:
             f.write("-- ==========================================\n")
             f.write("-- FIREBIRD PROCEDURES DUMP\n")
@@ -468,77 +555,13 @@ class DatabaseMigrator:
             conv_f.write("-- POSTGRESQL PROCEDURES DUMP (CONVERTED)\n")
             conv_f.write("-- ==========================================\n\n")
 
-            for proc in procedures:
-                proc_name = proc[0].strip() if proc[0] else 'UNKNOWN'
-                source = proc[1]
-
-                # Query input and output parameters for this procedure
-                params_query = f"""
-                    SELECT
-                        pp.RDB$PARAMETER_NAME,
-                        pp.RDB$PARAMETER_TYPE,
-                        pp.RDB$PARAMETER_NUMBER,
-                        f.RDB$FIELD_TYPE,
-                        f.RDB$FIELD_SUB_TYPE,
-                        f.RDB$FIELD_LENGTH,
-                        f.RDB$FIELD_PRECISION,
-                        f.RDB$FIELD_SCALE
-                    FROM RDB$PROCEDURE_PARAMETERS pp
-                    JOIN RDB$FIELDS f ON pp.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
-                    WHERE pp.RDB$PROCEDURE_NAME = '{proc_name}'
-                    ORDER BY pp.RDB$PARAMETER_TYPE, pp.RDB$PARAMETER_NUMBER;
-                """
-                fb_cursor.execute(params_query)
-                params = fb_cursor.fetchall()
-
-                input_params = []
-                output_params = []
-                for param in params:
-                    param_name = param[0].strip() if param[0] else 'UNKNOWN'
-                    param_type_flag = param[1]  # 0=input, 1=output
-                    field_type = param[3]
-                    field_subtype = param[4]
-                    field_length = param[5]
-                    field_precision = param[6]
-                    field_scale = abs(param[7]) if param[7] else 0
-
-                    type_name = self._get_firebird_data_type_name(field_type, field_subtype)
-                    if type_name is None:
-                        type_name = 'VARCHAR(255)'
-
-                    if (field_type in (FirebirdDataType.SMALLINT, FirebirdDataType.INTEGER,
-                                       FirebirdDataType.BIGINT) and field_subtype is not None
-                            and field_subtype > 0 and field_precision):
-                        type_name = f'NUMERIC({field_precision}, {field_scale})'
-
-                    elif field_type in (FirebirdDataType.CHAR, FirebirdDataType.VARCHAR) and field_length:
-                        type_name = f'{type_name}({field_length})'
-
-                    if param_type_flag == 0:
-                        input_params.append(f'    {param_name} {type_name}')
-                    else:
-                        output_params.append(f'    {param_name} {type_name}')
-
-                # Build header
-                fb_sql = f'CREATE OR ALTER PROCEDURE {proc_name}'
-                if input_params:
-                    params_str = ",\n".join(input_params)
-                    fb_sql += f' (\n{params_str}\n)'
-                fb_sql += '\n'
-                if output_params:
-                    params_str = ",\n".join(output_params)
-                    fb_sql += f'RETURNS (\n{params_str}\n)\n'
-                fb_sql += 'AS\n'
-                fb_sql += f'{source};\n\n'
-
+            for proc_name, fb_sql, pg_sql, err in results:
                 f.write(fb_sql)
-
-                try:
-                    pg_sql = self.transpile_firebird_sql(fb_sql)
+                if err is None and pg_sql:
                     conv_f.write(pg_sql)
                     conv_f.write('\n\n')
-                except Exception as e:
-                    print(f"Failed to transpile procedure {proc_name}: {e}")
+                else:
+                    print(f"Failed to transpile procedure {proc_name}: {err}")
                     conv_f.write(f"-- [TRANSPILER FAILED] PROCEDURE {proc_name}\n")
                     conv_f.write(fb_sql)
 
@@ -560,6 +583,37 @@ class DatabaseMigrator:
         fb_cursor.execute(query)
         views = fb_cursor.fetchall()
 
+        items = []
+        for view in views:
+            view_name = view[0].strip() if view[0] else 'UNKNOWN'
+            source = view[1]
+
+            # Fetch view columns in order
+            columns_query = f"""
+                SELECT RDB$FIELD_NAME 
+                FROM RDB$RELATION_FIELDS 
+                WHERE RDB$RELATION_NAME = '{view_name}' 
+                ORDER BY RDB$FIELD_POSITION;
+            """
+            fb_cursor.execute(columns_query)
+            columns = fb_cursor.fetchall()
+
+            col_names = []
+            for col in columns:
+                col_name = col[0].strip()
+                col_names.append(f'"{col_name}"')
+
+            col_list = ""
+            if col_names:
+                col_list = f" ({', '.join(col_names)})"
+
+            fb_sql = f'CREATE OR ALTER VIEW "{view_name}"{col_list} AS\n{source}\n\n'
+            items.append((view_name, fb_sql))
+
+        print(f"Transpiling {len(items)} views in parallel...")
+        with ProcessPoolExecutor() as executor:
+            results = list(executor.map(_transpile_worker, items))
+
         with open(output_file, 'w', encoding='utf-8') as f, open(converted_file, 'w', encoding='utf-8') as conv_f:
             f.write("-- ==========================================\n")
             f.write("-- FIREBIRD VIEWS DUMP\n")
@@ -570,47 +624,21 @@ class DatabaseMigrator:
             conv_f.write("-- POSTGRESQL VIEWS DUMP (CONVERTED)\n")
             conv_f.write("-- ==========================================\n\n")
 
-            for view in views:
-                view_name = view[0].strip() if view[0] else 'UNKNOWN'
-                source = view[1]
-
-                # Fetch view columns in order
-                columns_query = f"""
-                    SELECT RDB$FIELD_NAME 
-                    FROM RDB$RELATION_FIELDS 
-                    WHERE RDB$RELATION_NAME = '{view_name}' 
-                    ORDER BY RDB$FIELD_POSITION;
-                """
-                fb_cursor.execute(columns_query)
-                columns = fb_cursor.fetchall()
-
-                col_names = []
-                for col in columns:
-                    col_name = col[0].strip()
-                    col_names.append(f'"{col_name}"')
-
-                col_list = ""
-                if col_names:
-                    col_list = f" ({', '.join(col_names)})"
-
+            for view_name, fb_sql, pg_sql, err in results:
                 f.write(f"-- ----------------------------------------\n")
                 f.write(f"-- View: {view_name}\n")
                 f.write(f"-- ----------------------------------------\n")
-                
+                f.write(fb_sql)
+
                 conv_f.write(f"-- ----------------------------------------\n")
                 conv_f.write(f"-- View: {view_name}\n")
                 conv_f.write(f"-- ----------------------------------------\n")
-                
-                fb_sql = f'CREATE OR ALTER VIEW "{view_name}"{col_list} AS\n{source}\n\n'
-                
-                f.write(fb_sql)
-                
-                try:
-                    pg_sql = self.transpile_firebird_sql(fb_sql)
+
+                if err is None and pg_sql:
                     conv_f.write(pg_sql)
                     conv_f.write("\n\n")
-                except Exception as e:
-                    print(f"Failed to transpile view {view_name}: {e}")
+                else:
+                    print(f"Failed to transpile view {view_name}: {err}")
                     conv_f.write(f"-- [TRANSPILER FAILED] VIEW {view_name}\n")
                     conv_f.write(fb_sql)
 
