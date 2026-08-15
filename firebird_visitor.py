@@ -125,7 +125,11 @@ class ASTDialectRewriter(FirebirdParserVisitor):
             end_token = qb.numeric(1).stop if qb.SKIP_() else qb.numeric(0).stop
             self.rewriter.replaceRangeTokens(qb.FIRST().symbol, end_token, '')
             limit_clause = f' LIMIT {first_val}' + (f' OFFSET {skip_val}' if skip_val else '')
-            self.rewriter.insertAfterToken(ctx.stop, limit_clause)
+            target_token = ctx.stop
+            if target_token and target_token.text == ')':
+                self.rewriter.insertBeforeToken(target_token, limit_clause)
+            else:
+                self.rewriter.insertAfterToken(target_token, limit_clause)
 
     def visitSelect_statement(self, ctx: FirebirdParser.Select_statementContext):
         self._rewrite_first_skip(ctx)
@@ -415,7 +419,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
     def visitTrigger_block(self, ctx: FirebirdParser.Trigger_blockContext):
         decl_str = ""
         if ctx.declare_spec():
-            decls = [self.visit(d) for d in ctx.declare_spec() if self.visit(d)]
+            decls = [res for d in ctx.declare_spec() if (res := self.visit(d))]
             if decls:
                 decl_str = "DECLARE\n" + "\n".join(decls) + "\n"
         body_str = self.visit(ctx.body()) if ctx.body() else ""
@@ -467,7 +471,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
     def visitBlock(self, ctx: FirebirdParser.BlockContext):
         decl_str = ""
         if ctx.declare_spec():
-            decls = [self.visit(d) for d in ctx.declare_spec() if self.visit(d)]
+            decls = [res for d in ctx.declare_spec() if (res := self.visit(d))]
             if decls:
                 decl_str = "DECLARE\n" + "\n".join(decls) + "\n"
         body_str = self.visit(ctx.body()) if ctx.body() else ""
