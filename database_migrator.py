@@ -7,17 +7,18 @@ from database_objects import Table, Column, ForeignKey, UniqueKey, Index, get_po
 from firebird_visitor import FirebirdToPostgresVisitor
 
 
-def _transpile_worker(item: tuple[str, str]) -> tuple[str, str, str | None, str | None]:
+def _transpile_worker(item: tuple[str, str]) -> tuple[str | None, str | None]:
     """
     Worker function for multiprocessing pool.
-    Takes (item_name, fb_sql) and returns (item_name, fb_sql, pg_sql, error_msg).
+    Takes (item_name, fb_sql) and returns (pg_sql, error_msg).
+    Avoids returning fb_sql across IPC to minimize pickle overhead.
     """
-    item_name, fb_sql = item
+    _, fb_sql = item
     try:
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
-        return item_name, fb_sql, pg_sql, None
+        return pg_sql, None
     except Exception as e:
-        return item_name, fb_sql, None, str(e)
+        return None, str(e)
 
 
 class FirebirdDataType(IntEnum):
@@ -384,7 +385,9 @@ class DatabaseMigrator:
         return f'{phase} {" OR ".join(events)}'
 
     def export_firebird_triggers(self, output_file: str = 'firebird_triggers_dump.sql',
-                                 converted_file: str = 'postgres_triggers_dump.sql'):
+                                 converted_file: str = 'postgres_triggers_dump.sql',
+                                 executor: ProcessPoolExecutor = None,
+                                 chunksize: int = 4):
         """
         Extracts all user-defined triggers from Firebird and saves their source code to a file
         """
@@ -412,8 +415,11 @@ class DatabaseMigrator:
             items.append((trigger_name, fb_sql))
 
         print(f"Transpiling {len(items)} triggers in parallel...")
-        with ProcessPoolExecutor() as executor:
-            results = list(executor.map(_transpile_worker, items))
+        if executor is not None:
+            results = list(executor.map(_transpile_worker, items, chunksize=chunksize))
+        else:
+            with ProcessPoolExecutor() as local_executor:
+                results = list(local_executor.map(_transpile_worker, items, chunksize=chunksize))
 
         with open(output_file, 'w', encoding='utf-8') as f, open(converted_file, 'w', encoding='utf-8') as conv_f:
             f.write("-- ==========================================\n")
@@ -424,7 +430,7 @@ class DatabaseMigrator:
             conv_f.write("-- POSTGRESQL TRIGGERS DUMP (CONVERTED)\n")
             conv_f.write("-- ==========================================\n\n")
 
-            for trigger_name, fb_sql, pg_sql, err in results:
+            for (trigger_name, fb_sql), (pg_sql, err) in zip(items, results):
                 f.write(fb_sql)
                 if err is None and pg_sql:
                     conv_f.write(pg_sql)
@@ -437,7 +443,9 @@ class DatabaseMigrator:
         print(f"Exported {len(triggers)} triggers to '{output_file}' and '{converted_file}'")
 
     def export_firebird_procedures(self, output_file: str = 'firebird_procedures_dump.sql',
-                                   converted_file: str = 'postgres_procedures_dump.sql'):
+                                   converted_file: str = 'postgres_procedures_dump.sql',
+                                   executor: ProcessPoolExecutor = None,
+                                   chunksize: int = 4):
         """
         Extracts all user-defined stored procedures from Firebird and saves their source code to a file
         """
@@ -520,8 +528,11 @@ class DatabaseMigrator:
             items.append((proc_name, fb_sql))
 
         print(f"Transpiling {len(items)} procedures in parallel...")
-        with ProcessPoolExecutor() as executor:
-            results = list(executor.map(_transpile_worker, items))
+        if executor is not None:
+            results = list(executor.map(_transpile_worker, items, chunksize=chunksize))
+        else:
+            with ProcessPoolExecutor() as local_executor:
+                results = list(local_executor.map(_transpile_worker, items, chunksize=chunksize))
 
         with open(output_file, 'w', encoding='utf-8') as f, open(converted_file, 'w', encoding='utf-8') as conv_f:
             f.write("-- ==========================================\n")
@@ -532,7 +543,7 @@ class DatabaseMigrator:
             conv_f.write("-- POSTGRESQL PROCEDURES DUMP (CONVERTED)\n")
             conv_f.write("-- ==========================================\n\n")
 
-            for proc_name, fb_sql, pg_sql, err in results:
+            for (proc_name, fb_sql), (pg_sql, err) in zip(items, results):
                 f.write(fb_sql)
                 if err is None and pg_sql:
                     conv_f.write(pg_sql)
@@ -545,7 +556,9 @@ class DatabaseMigrator:
         print(f"Exported {len(procedures)} procedures to '{output_file}' and '{converted_file}'")
 
     def export_firebird_views(self, output_file: str = 'firebird_views_dump.sql',
-                              converted_file: str = 'postgres_views_dump.sql'):
+                              converted_file: str = 'postgres_views_dump.sql',
+                              executor: ProcessPoolExecutor = None,
+                              chunksize: int = 4):
         """
         Extracts all user-defined views from Firebird and saves their source code to a file
         """
@@ -589,8 +602,11 @@ class DatabaseMigrator:
             items.append((view_name, fb_sql))
 
         print(f"Transpiling {len(items)} views in parallel...")
-        with ProcessPoolExecutor() as executor:
-            results = list(executor.map(_transpile_worker, items))
+        if executor is not None:
+            results = list(executor.map(_transpile_worker, items, chunksize=chunksize))
+        else:
+            with ProcessPoolExecutor() as local_executor:
+                results = list(local_executor.map(_transpile_worker, items, chunksize=chunksize))
 
         with open(output_file, 'w', encoding='utf-8') as f, open(converted_file, 'w', encoding='utf-8') as conv_f:
             f.write("-- ==========================================\n")
@@ -602,7 +618,7 @@ class DatabaseMigrator:
             conv_f.write("-- POSTGRESQL VIEWS DUMP (CONVERTED)\n")
             conv_f.write("-- ==========================================\n\n")
 
-            for view_name, fb_sql, pg_sql, err in results:
+            for (view_name, fb_sql), (pg_sql, err) in zip(items, results):
                 f.write(f"-- ----------------------------------------\n")
                 f.write(f"-- View: {view_name}\n")
                 f.write(f"-- ----------------------------------------\n")
@@ -621,6 +637,17 @@ class DatabaseMigrator:
                     conv_f.write(fb_sql)
 
         print(f"Exported {len(views)} views to '{output_file}' and '{converted_file}'")
+
+    def export_all_firebird_ddl(self):
+        """
+        Exports all Firebird domains, triggers, procedures, and views using a single shared
+        ProcessPoolExecutor, avoiding the overhead of repeated process spawns and parser imports.
+        """
+        self.export_firebird_domains()
+        with ProcessPoolExecutor() as executor:
+            self.export_firebird_triggers(executor=executor)
+            self.export_firebird_procedures(executor=executor)
+            self.export_firebird_views(executor=executor)
 
     def export_firebird_domains(self, output_file: str = 'firebird_domains_dump.sql',
                                 converted_file: str = 'postgres_domains_dump.sql'):
