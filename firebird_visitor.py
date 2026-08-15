@@ -9,6 +9,7 @@ from antlr4 import InputStream, CommonTokenStream
 from antlr4.atn.PredictionMode import PredictionMode
 from antlr4.error.ErrorStrategy import BailErrorStrategy, DefaultErrorStrategy
 from antlr4.error.Errors import ParseCancellationException, RecognitionException
+from antlr4.TokenStreamRewriter import TokenStreamRewriter
 
 from firebird_grammar.FirebirdParserVisitor import FirebirdParserVisitor
 # noinspection PyUnresolvedReferences
@@ -16,18 +17,193 @@ from firebird_grammar.FirebirdParser import FirebirdParser
 from firebird_grammar.FirebirdLexer import FirebirdLexer
 
 
+class ASTDialectRewriter(FirebirdParserVisitor):
+    """
+    Pass 1 Visitor: Operates on AST nodes and rewrites tokens directly in the TokenStreamRewriter.
+    This guarantees that dialect transformations (bind variables, sequence functions, procedure calls,
+    exception statements, limit/offset clauses, leave statements, and RDB$DATABASE removals)
+    are performed in semantic context, leaving string literals and comments 100% untouched.
+    """
+
+    def __init__(self, rewriter: TokenStreamRewriter):
+        super().__init__()
+        self.rewriter = rewriter
+        self.handled_qbs = set()
+
+    def visitBind_variable(self, ctx: FirebirdParser.Bind_variableContext):
+        raw = ctx.getText()
+        if raw.startswith(':'):
+            self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f" {raw.lstrip(':')}")
+        return self.visitChildren(ctx)
+
+    def visitGeneral_element_part(self, ctx: FirebirdParser.General_element_partContext):
+        if ctx.id_expression() and ctx.id_expression().getText().upper() == 'GEN_ID':
+            if ctx.function_argument():
+                func_arg = ctx.function_argument(0)
+                if hasattr(func_arg, 'argument'):
+                    args = func_arg.argument()
+                    if len(args) >= 2:
+                        seq_name = args[0].getText()
+                        step = args[1].getText().strip()
+                        if step == '1':
+                            self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"nextval('{seq_name}')")
+                        elif step == '0':
+                            self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"currval('{seq_name}')")
+                        else:
+                            self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"nextval('{seq_name}')")
+        return self.visitChildren(ctx)
+
+    def visitUnary_expression(self, ctx: FirebirdParser.Unary_expressionContext):
+        raw = ctx.getText().upper()
+        if 'NEXTVALUEFOR' in raw and ctx.identifier():
+            seq_name = ctx.identifier().getText()
+            self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"nextval('{seq_name}')")
+        return self.visitChildren(ctx)
+
+    def visitCall_statement(self, ctx: FirebirdParser.Call_statementContext):
+        raw = ctx.getText().upper()
+        if raw.startswith('EXECUTEPROCEDURE') and ctx.routine_name():
+            routine = ctx.routine_name(0).getText()
+            self.rewriter.replaceRangeTokens(ctx.start, ctx.routine_name(0).stop, f"PERFORM {routine}")
+        return self.visitChildren(ctx)
+
+    def visitExit_statement(self, ctx: FirebirdParser.Exit_statementContext):
+        if ctx.getChild(0).getText().upper() == 'LEAVE':
+            self.rewriter.replaceRangeTokens(ctx.start, ctx.start, 'EXIT')
+        return self.visitChildren(ctx)
+
+    def visitFrom_clause(self, ctx: FirebirdParser.From_clauseContext):
+        if ctx.table_ref_list() and ctx.table_ref_list().getText().upper() == 'RDB$DATABASE':
+            self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, '')
+        return self.visitChildren(ctx)
+
+    def _rewrite_first_skip(self, ctx):
+        """
+        Extracts FIRST n [SKIP m] tokens from the query block and relocates them
+        as LIMIT n [OFFSET m] to the end of the enclosing select_statement or subquery.
+        """
+        qb = self.find_query_block(ctx)
+        if qb and qb.FIRST() and id(qb) not in self.handled_qbs:
+            self.handled_qbs.add(id(qb))
+            first_val = qb.numeric(0).getText()
+            skip_val = qb.numeric(1).getText() if qb.SKIP_() else None
+            end_token = qb.numeric(1).stop if qb.SKIP_() else qb.numeric(0).stop
+            self.rewriter.replaceRangeTokens(qb.FIRST().symbol, end_token, '')
+            limit_clause = f' LIMIT {first_val}' + (f' OFFSET {skip_val}' if skip_val else '')
+            self.rewriter.insertAfterToken(ctx.stop, limit_clause)
+
+    def visitSelect_statement(self, ctx: FirebirdParser.Select_statementContext):
+        self._rewrite_first_skip(ctx)
+        return self.visitChildren(ctx)
+
+    def visitSubquery(self, ctx: FirebirdParser.SubqueryContext):
+        self._rewrite_first_skip(ctx)
+        return self.visitChildren(ctx)
+
+    def find_query_block(self, ctx):
+        if isinstance(ctx, FirebirdParser.Query_blockContext):
+            return ctx
+        if hasattr(ctx, 'children') and ctx.children:
+            for child in ctx.children:
+                res = self.find_query_block(child)
+                if res:
+                    return res
+        return None
+
+    def visitSeq_of_statements(self, ctx: FirebirdParser.Seq_of_statementsContext):
+        if not ctx.children:
+            return self.visitChildren(ctx)
+        children = ctx.children
+        i = 0
+        while i < len(children):
+            child = children[i]
+            if isinstance(child, FirebirdParser.StatementContext):
+                text = child.getText().upper()
+                if text == 'EXCEPTION' and (i + 1) < len(children):
+                    next_child = children[i + 1]
+                    if isinstance(next_child, FirebirdParser.StatementContext):
+                        ex_name = next_child.getText().strip(';')
+                        stop_token = next_child.stop
+                        inc = 2
+                        custom_msg = None
+
+                        # Check if next statement is a custom message string literal (Firebird 2.0+)
+                        if (i + 2) < len(children) and isinstance(children[i + 2], FirebirdParser.StatementContext):
+                            cand = children[i + 2].getText().strip(';')
+                            if cand.startswith("'") and cand.endswith("'"):
+                                custom_msg = cand
+                                stop_token = children[i + 2].stop
+                                inc = 3
+
+                        if (i + inc) < len(children) and children[i + inc].getText() == ';':
+                            stop_token = children[i + inc].symbol
+                            inc += 1
+
+                        if custom_msg:
+                            self.rewriter.replaceRangeTokens(child.start, child.stop,
+                                                             f"RAISE EXCEPTION '{ex_name}: %', {custom_msg};")
+                        else:
+                            self.rewriter.replaceRangeTokens(child.start, child.stop, f"RAISE EXCEPTION '{ex_name}';")
+
+                        self.rewriter.replaceRangeTokens(next_child.start, stop_token, "")
+                        i += inc
+                        continue
+            i += 1
+        return self.visitChildren(ctx)
+
+    def visitTerminal(self, node):
+        if node.getText().upper() == 'SUSPEND':
+            self.rewriter.replaceRangeTokens(node.symbol, node.symbol, 'RETURN NEXT')
+        return None
+
+
 class FirebirdToPostgresVisitor(FirebirdParserVisitor):
     """
     Visitor that traverses the Firebird AST and translates it into PostgreSQL PL/pgSQL code.
     """
 
+    def __init__(self, rewriter: TokenStreamRewriter = None):
+        super().__init__()
+        self.rewriter = rewriter
+
+    @classmethod
+    def _normalize_trigger_records(cls, sql: str) -> str:
+        """
+        Pre-parse normalization:
+        In the Firebird grammar, 'old' and 'new' are reserved keywords in unquoted context.
+        When followed by a dot (e.g. 'old.field'), the lexer splits them unless quoted.
+        This function temporarily wraps record names in double quotes ("old".field),
+        while ensuring string literals ('...') and comments (-- ... / /* ... */) remain 100% untouched.
+        These temporary quotes are cleanly stripped in `_clean_sql` after parsing.
+        """
+        pattern = re.compile(
+            r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|"  # Group 1: string literals and comments (preserve untouched)
+            r"(\b(old|new)\.;?\s*\n\s*([a-zA-Z0-9_]+)\b)|"  # Group 2, 3, 4: split 'old.; \n col' recovery
+            r"(\b(old|new)\.([a-zA-Z0-9_]+)\b)",  # Group 5, 6, 7: unquoted 'old.col'
+            flags=re.IGNORECASE | re.DOTALL
+        )
+
+        def repl(match):
+            if match.group(1):
+                return match.group(1)
+            if match.group(2):
+                rec = re.split(r'[.;\s]', match.group(2))[0]
+                return f'"{rec}".{match.group(4)}'
+            if match.group(5):
+                return f'"{match.group(6)}".{match.group(7)}'
+            return match.group(0)
+
+        return pattern.sub(repl, sql)
+
     @classmethod
     def transpile(cls, firebird_sql_string: str) -> str:
         """
         Parses Firebird SQL using Two-Stage Parsing (SLL -> LL), traverses the AST with the visitor,
-        and applies dialect post-processing to produce clean PostgreSQL SQL.
+        and applies dialect token rewriting to produce clean PostgreSQL SQL.
         """
-        lexer = FirebirdLexer(InputStream(firebird_sql_string))
+        normalized_sql = cls._normalize_trigger_records(firebird_sql_string)
+
+        lexer = FirebirdLexer(InputStream(normalized_sql))
         stream = CommonTokenStream(lexer)
         parser = FirebirdParser(stream)
 
@@ -49,80 +225,30 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
             parser._interp.predictionMode = PredictionMode.LL
             tree = parser.sql_script()
 
-        visitor = cls()
+        rewriter = TokenStreamRewriter(stream)
+
+        # Pass 1: Semantic token rewriting on AST
+        dialect_rewriter = ASTDialectRewriter(rewriter)
+        dialect_rewriter.visit(tree)
+
+        # Pass 2: High-level PL/pgSQL structure visitor
+        visitor = cls(rewriter=rewriter)
         pg_sql = visitor.visit(tree)
 
         if pg_sql:
-            pg_sql = cls._apply_dialect_rules(pg_sql)
+            pg_sql = cls._clean_sql(pg_sql)
 
         return pg_sql
 
     @staticmethod
-    def _apply_dialect_rules(pg_sql: str) -> str:
+    def _clean_sql(pg_sql: str) -> str:
         """
-        Post-processes the generated SQL to translate terminal Firebird dialect constructs to PostgreSQL.
+        Post-transpilation cleanup:
+        Strips the temporary protective double-quotes on trigger pseudo-records
+        ("old".col / "new".col -> old.col / new.col) that were injected prior to parsing
+        to prevent Firebird lexer keyword collision. In PL/pgSQL, OLD/NEW are unquoted records.
         """
-        # 1. Translate GEN_ID(seq, 1) -> nextval('seq') and GEN_ID(seq, 0) -> currval('seq')
-        pg_sql = re.sub(r'(?i)GEN_ID\s*\(\s*([a-zA-Z0-9_]+)\s*,\s*1\s*\)', r"nextval('\1')", pg_sql)
-        pg_sql = re.sub(r'(?i)GEN_ID\s*\(\s*([a-zA-Z0-9_]+)\s*,\s*0\s*\)', r"currval('\1')", pg_sql)
-
-        # 2. Remove Firebird bind variable colon prefix (:var -> var), preserving :: type casts
-        pg_sql = re.sub(r'([a-zA-Z0-9_])(?<!:):([a-zA-Z_][a-zA-Z0-9_]*)', r'\1 \2', pg_sql)
-        pg_sql = re.sub(r'(?<!:):([a-zA-Z_][a-zA-Z0-9_]*)(?!:)', r'\1', pg_sql)
-
-        # 3. Replace Firebird EXECUTE PROCEDURE with Postgres PERFORM
-        pg_sql = re.sub(r'(?i)\bEXECUTE\s+PROCEDURE\s+', 'PERFORM ', pg_sql)
-
-        # 4. Translate Firebird EXCEPTION <name> -> Postgres RAISE EXCEPTION '<name>'
-        pg_sql = re.sub(r'(?i)\bexception\s*;\s*\n\s*([a-zA-Z0-9_]+)\s*;?', r"RAISE EXCEPTION '\1';", pg_sql)
-        pg_sql = re.sub(r'(?i)\bexception\s+([a-zA-Z0-9_]+)\s*;', r"RAISE EXCEPTION '\1';", pg_sql)
-
-        # 5. Fix split identifiers from parser error recovery (e.g. old.; \n id_marcacao -> old.id_marcacao)
-        pg_sql = re.sub(r'\b(old|new)\.;?\s*\n\s*([a-zA-Z0-9_]+)', r'\1.\2', pg_sql, flags=re.IGNORECASE)
-
-        # 6. Translate SELECT FIRST n [SKIP m] to LIMIT n [OFFSET m]
-        def _repl_subquery(m):
-            prefix = m.group(1)
-            first_n = m.group(2)
-            skip_m = m.group(3)
-            rest = m.group(4)
-            limit_clause = f' LIMIT {first_n}' + (f' OFFSET {skip_m}' if skip_m else '')
-            return f'({prefix}{rest}{limit_clause})'
-
-        def _repl_stmt(m):
-            prefix = m.group(1)
-            first_n = m.group(2)
-            skip_m = m.group(3)
-            rest = m.group(4)
-            limit_clause = f' LIMIT {first_n}' + (f' OFFSET {skip_m}' if skip_m else '')
-            return f'{prefix}{rest}{limit_clause};'
-
-        pg_sql = re.sub(
-            r'\(\s*(select\s+)first\s+(\d+)(?:\s+skip\s+(\d+))?\s+(.*?)\)',
-            _repl_subquery,
-            pg_sql,
-            flags=re.IGNORECASE | re.DOTALL
-        )
-        pg_sql = re.sub(
-            r'(?<!\()\b(select\s+)first\s+(\d+)(?:\s+skip\s+(\d+))?\s+(.*?);',
-            _repl_stmt,
-            pg_sql,
-            flags=re.IGNORECASE | re.DOTALL
-        )
-
-        # 7. Replace residual Firebird suspend; with Postgres RETURN NEXT; or RETURN;
-        if re.search(r'RETURNS\s+void\b', pg_sql, re.IGNORECASE):
-            pg_sql = re.sub(r'(?i)\bsuspend\s*;', 'RETURN;', pg_sql)
-            pg_sql = re.sub(r'\bRETURN\s+NEXT\s*;', 'RETURN;', pg_sql)
-        else:
-            pg_sql = re.sub(r'(?i)\bsuspend\s*;', 'RETURN NEXT;', pg_sql)
-
-        # 8. Replace Firebird NEXT VALUE FOR sequences -> nextval('seq')
-        pg_sql = re.sub(r'(?i)\bnext\s+value\s+for\s+([a-zA-Z0-9_]+)(?:\s+from\s+RDB\$DATABASE)?', r"nextval('\1')", pg_sql)
-
-        # 9. Replace Firebird LEAVE; -> Postgres EXIT;
-        pg_sql = re.sub(r'(?i)\bleave\s*;', 'EXIT;', pg_sql)
-
+        pg_sql = re.sub(r'"(old|new)"\.', r'\1.', pg_sql, flags=re.IGNORECASE)
         return pg_sql
 
     def visitSql_script(self, ctx: FirebirdParser.Sql_scriptContext):
@@ -298,9 +424,6 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
     def visitStatement(self, ctx: FirebirdParser.StatementContext):
         child = ctx.getChild(0)
 
-        if hasattr(ctx, 'SUSPEND') and ctx.SUSPEND():
-            return "RETURN NEXT"
-
         if isinstance(child, (
                 FirebirdParser.BodyContext,
                 FirebirdParser.BlockContext,
@@ -311,7 +434,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
             return self.visit(child)
 
         # For all other SQL statements (SELECT, UPDATE, DELETE, EXECUTE, etc.)
-        # we just return their raw Firebird text for now.
+        # we just return their rewritten text.
         return self.get_raw_text(ctx)
 
     def visitBlock(self, ctx: FirebirdParser.BlockContext):
@@ -344,11 +467,16 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         sql += "END IF;"
         return sql
 
-    @staticmethod
-    def get_raw_text(ctx):
+    def get_raw_text(self, ctx):
         if ctx is None:
             return ""
         if hasattr(ctx, 'start') and hasattr(ctx, 'stop') and ctx.start and ctx.stop:
+            if self.rewriter:
+                return self.rewriter.getText(
+                    TokenStreamRewriter.DEFAULT_PROGRAM_NAME,
+                    ctx.start.tokenIndex,
+                    ctx.stop.tokenIndex
+                )
             start_idx = ctx.start.start
             stop_idx = ctx.stop.stop
             stream = ctx.start.getInputStream()
@@ -421,11 +549,6 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
 
         return self.get_raw_text(ctx)
 
-    def visitTerminal(self, node):
-        if node.getText().upper() == 'SUSPEND':
-            return "RETURN NEXT;"
-        return None
-
     def find_node(self, ctx, node_type):
         if isinstance(ctx, node_type):
             return ctx
@@ -439,6 +562,18 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
     def get_text_without_node(self, parent_ctx, exclude_ctx):
         if exclude_ctx is None:
             return self.get_raw_text(parent_ctx)
+        if self.rewriter and hasattr(parent_ctx, 'start') and hasattr(parent_ctx, 'stop'):
+            before = self.rewriter.getText(
+                TokenStreamRewriter.DEFAULT_PROGRAM_NAME,
+                parent_ctx.start.tokenIndex,
+                exclude_ctx.start.tokenIndex - 1
+            )
+            after = self.rewriter.getText(
+                TokenStreamRewriter.DEFAULT_PROGRAM_NAME,
+                exclude_ctx.stop.tokenIndex + 1,
+                parent_ctx.stop.tokenIndex
+            )
+            return before + after
         stream = parent_ctx.start.getInputStream()
         before = stream.getText(parent_ctx.start.start, exclude_ctx.start.start - 1)
         after = stream.getText(exclude_ctx.stop.stop + 1, parent_ctx.stop.stop)
