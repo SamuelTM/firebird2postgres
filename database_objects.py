@@ -76,7 +76,7 @@ class Table:
         return queries
 
     def get_create_query(self):
-        query = f'CREATE TABLE "{self.name}" ('
+        query = f'CREATE TABLE IF NOT EXISTS "{self.name}" ('
 
         for i, col in enumerate(self.columns):
             converted_type = get_postgres_type(col.column_type)

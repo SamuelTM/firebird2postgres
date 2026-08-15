@@ -36,6 +36,23 @@ class ASTDialectRewriter(FirebirdParserVisitor):
             self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f" {raw.lstrip(':')}")
         return self.visitChildren(ctx)
 
+    def visitTableview_name(self, ctx: FirebirdParser.Tableview_nameContext):
+        # In CREATE VIEW context, quote table names in uppercase on the AST token stream
+        curr = ctx
+        is_in_view = False
+        while curr:
+            if isinstance(curr, FirebirdParser.Create_viewContext):
+                is_in_view = True
+                break
+            curr = getattr(curr, 'parentCtx', None)
+
+        if is_in_view:
+            text = ctx.getText()
+            if not (text.startswith('"') and text.endswith('"')):
+                self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f'"{text.upper()}"')
+
+        return self.visitChildren(ctx)
+
     def visitGeneral_element_part(self, ctx: FirebirdParser.General_element_partContext):
         if ctx.id_expression() and ctx.id_expression().getText().upper() == 'GEN_ID':
             if ctx.function_argument():
@@ -50,7 +67,25 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                         elif step == '0':
                             self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"currval('{seq_name}')")
                         else:
-                            self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"nextval('{seq_name}')")
+                            self.rewriter.replaceRangeTokens(
+                                ctx.start, ctx.stop, f"setval('{seq_name}', nextval('{seq_name}') + ({step}) - 1)"
+                            )
+            return self.visitChildren(ctx)
+
+        # In CREATE VIEW context, quote table.column references in uppercase on the AST token stream
+        curr = ctx
+        is_in_view = False
+        while curr:
+            if isinstance(curr, FirebirdParser.Create_viewContext):
+                is_in_view = True
+                break
+            curr = getattr(curr, 'parentCtx', None)
+
+        if is_in_view:
+            text = ctx.getText()
+            if not (text.startswith('"') and text.endswith('"')):
+                self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f'"{text.upper()}"')
+
         return self.visitChildren(ctx)
 
     def visitUnary_expression(self, ctx: FirebirdParser.Unary_expressionContext):
@@ -225,6 +260,13 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
             parser._interp.predictionMode = PredictionMode.LL
             tree = parser.sql_script()
 
+        # Ensure syntax errors in LL mode fail loudly rather than returning partial/corrupt AST
+        syntax_errors = parser.getNumberOfSyntaxErrors()
+        if syntax_errors > 0:
+            raise ParseCancellationException(
+                f"Syntax error during parsing: {syntax_errors} errors encountered in Firebird SQL script."
+            )
+
         rewriter = TokenStreamRewriter(stream)
 
         # Pass 1: Semantic token rewriting on AST
@@ -381,22 +423,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
 
     def visitCreate_view(self, ctx: FirebirdParser.Create_viewContext):
         view_name = ctx.id_expression(0).getText().strip('"')
-        # Extract the select statement raw
         select_stmt = self.get_raw_text(ctx.select_only_statement())
-
-        # Quote table.column references in uppercase
-        select_stmt = re.sub(
-            r'\b([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\b',
-            lambda m: f'"{m.group(1).upper()}"."{m.group(2).upper()}"',
-            select_stmt
-        )
-
-        # Quote FROM and JOIN table references in uppercase
-        select_stmt = re.sub(
-            r'(?i)\b(FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_]*)\b',
-            lambda m: f'{m.group(1)} "{m.group(2).upper()}"' if not m.group(2).startswith('"') else m.group(0),
-            select_stmt
-        )
 
         view_opts = ""
         if ctx.view_options():
