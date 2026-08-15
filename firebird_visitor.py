@@ -5,15 +5,125 @@ import sys
 # Ensure the firebird_grammar directory is in the path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'firebird_grammar'))
 
+from antlr4 import InputStream, CommonTokenStream
+from antlr4.atn.PredictionMode import PredictionMode
+from antlr4.error.ErrorStrategy import BailErrorStrategy, DefaultErrorStrategy
+from antlr4.error.Errors import ParseCancellationException, RecognitionException
+
 from firebird_grammar.FirebirdParserVisitor import FirebirdParserVisitor
 # noinspection PyUnresolvedReferences
 from firebird_grammar.FirebirdParser import FirebirdParser
+from firebird_grammar.FirebirdLexer import FirebirdLexer
 
 
 class FirebirdToPostgresVisitor(FirebirdParserVisitor):
     """
     Visitor that traverses the Firebird AST and translates it into PostgreSQL PL/pgSQL code.
     """
+
+    @classmethod
+    def transpile(cls, firebird_sql_string: str) -> str:
+        """
+        Parses Firebird SQL using Two-Stage Parsing (SLL -> LL), traverses the AST with the visitor,
+        and applies dialect post-processing to produce clean PostgreSQL SQL.
+        """
+        lexer = FirebirdLexer(InputStream(firebird_sql_string))
+        stream = CommonTokenStream(lexer)
+        parser = FirebirdParser(stream)
+
+        # Stage 1: Fast SLL mode
+        # noinspection PyProtectedMember
+        parser._interp.predictionMode = PredictionMode.SLL
+        # noinspection PyProtectedMember
+        parser._errHandler = BailErrorStrategy()
+
+        try:
+            tree = parser.sql_script()
+        except (ParseCancellationException, RecognitionException):
+            # Stage 2: Fallback to LL mode if SLL encounters ambiguity
+            stream.seek(0)
+            parser.reset()
+            # noinspection PyProtectedMember
+            parser._errHandler = DefaultErrorStrategy()
+            # noinspection PyProtectedMember
+            parser._interp.predictionMode = PredictionMode.LL
+            tree = parser.sql_script()
+
+        visitor = cls()
+        pg_sql = visitor.visit(tree)
+
+        if pg_sql:
+            pg_sql = cls._apply_dialect_rules(pg_sql)
+
+        return pg_sql
+
+    @staticmethod
+    def _apply_dialect_rules(pg_sql: str) -> str:
+        """
+        Post-processes the generated SQL to translate terminal Firebird dialect constructs to PostgreSQL.
+        """
+        # 1. Translate GEN_ID(seq, 1) -> nextval('seq') and GEN_ID(seq, 0) -> currval('seq')
+        pg_sql = re.sub(r'(?i)GEN_ID\s*\(\s*([a-zA-Z0-9_]+)\s*,\s*1\s*\)', r"nextval('\1')", pg_sql)
+        pg_sql = re.sub(r'(?i)GEN_ID\s*\(\s*([a-zA-Z0-9_]+)\s*,\s*0\s*\)', r"currval('\1')", pg_sql)
+
+        # 2. Remove Firebird bind variable colon prefix (:var -> var), preserving :: type casts
+        pg_sql = re.sub(r'([a-zA-Z0-9_])(?<!:):([a-zA-Z_][a-zA-Z0-9_]*)', r'\1 \2', pg_sql)
+        pg_sql = re.sub(r'(?<!:):([a-zA-Z_][a-zA-Z0-9_]*)(?!:)', r'\1', pg_sql)
+
+        # 3. Replace Firebird EXECUTE PROCEDURE with Postgres PERFORM
+        pg_sql = re.sub(r'(?i)\bEXECUTE\s+PROCEDURE\s+', 'PERFORM ', pg_sql)
+
+        # 4. Translate Firebird EXCEPTION <name> -> Postgres RAISE EXCEPTION '<name>'
+        pg_sql = re.sub(r'(?i)\bexception\s*;\s*\n\s*([a-zA-Z0-9_]+)\s*;?', r"RAISE EXCEPTION '\1';", pg_sql)
+        pg_sql = re.sub(r'(?i)\bexception\s+([a-zA-Z0-9_]+)\s*;', r"RAISE EXCEPTION '\1';", pg_sql)
+
+        # 5. Fix split identifiers from parser error recovery (e.g. old.; \n id_marcacao -> old.id_marcacao)
+        pg_sql = re.sub(r'\b(old|new)\.;?\s*\n\s*([a-zA-Z0-9_]+)', r'\1.\2', pg_sql, flags=re.IGNORECASE)
+
+        # 6. Translate SELECT FIRST n [SKIP m] to LIMIT n [OFFSET m]
+        def _repl_subquery(m):
+            prefix = m.group(1)
+            first_n = m.group(2)
+            skip_m = m.group(3)
+            rest = m.group(4)
+            limit_clause = f' LIMIT {first_n}' + (f' OFFSET {skip_m}' if skip_m else '')
+            return f'({prefix}{rest}{limit_clause})'
+
+        def _repl_stmt(m):
+            prefix = m.group(1)
+            first_n = m.group(2)
+            skip_m = m.group(3)
+            rest = m.group(4)
+            limit_clause = f' LIMIT {first_n}' + (f' OFFSET {skip_m}' if skip_m else '')
+            return f'{prefix}{rest}{limit_clause};'
+
+        pg_sql = re.sub(
+            r'\(\s*(select\s+)first\s+(\d+)(?:\s+skip\s+(\d+))?\s+(.*?)\)',
+            _repl_subquery,
+            pg_sql,
+            flags=re.IGNORECASE | re.DOTALL
+        )
+        pg_sql = re.sub(
+            r'(?<!\()\b(select\s+)first\s+(\d+)(?:\s+skip\s+(\d+))?\s+(.*?);',
+            _repl_stmt,
+            pg_sql,
+            flags=re.IGNORECASE | re.DOTALL
+        )
+
+        # 7. Replace residual Firebird suspend; with Postgres RETURN NEXT; or RETURN;
+        if re.search(r'RETURNS\s+void\b', pg_sql, re.IGNORECASE):
+            pg_sql = re.sub(r'(?i)\bsuspend\s*;', 'RETURN;', pg_sql)
+            pg_sql = re.sub(r'\bRETURN\s+NEXT\s*;', 'RETURN;', pg_sql)
+        else:
+            pg_sql = re.sub(r'(?i)\bsuspend\s*;', 'RETURN NEXT;', pg_sql)
+
+        # 8. Replace Firebird NEXT VALUE FOR sequences -> nextval('seq')
+        pg_sql = re.sub(r'(?i)\bnext\s+value\s+for\s+([a-zA-Z0-9_]+)(?:\s+from\s+RDB\$DATABASE)?', r"nextval('\1')", pg_sql)
+
+        # 9. Replace Firebird LEAVE; -> Postgres EXIT;
+        pg_sql = re.sub(r'(?i)\bleave\s*;', 'EXIT;', pg_sql)
+
+        return pg_sql
 
     def visitSql_script(self, ctx: FirebirdParser.Sql_scriptContext):
         statements = []
