@@ -416,12 +416,39 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
 
         return f"{func_sql}\n{trigger_sql}"
 
+    def _get_comments_in_range(self, start_idx: int, stop_idx: int) -> list[str]:
+        """
+        Extracts hidden channel comment tokens located between start_idx and stop_idx (inclusive).
+        """
+        comments = []
+        if not self.rewriter or not self.rewriter.tokens:
+            return comments
+        tokens = self.rewriter.tokens.tokens
+        for idx in range(max(0, start_idx), min(len(tokens), stop_idx + 1)):
+            t = tokens[idx]
+            if t.channel == 1 and ('--' in t.text or '/*' in t.text):
+                txt = t.text.strip()
+                if txt:
+                    comments.append(txt)
+        return comments
+
     def visitTrigger_block(self, ctx: FirebirdParser.Trigger_blockContext):
         decl_str = ""
         if ctx.declare_spec():
-            decls = [res for d in ctx.declare_spec() if (res := self.visit(d))]
-            if decls:
-                decl_str = "DECLARE\n" + "\n".join(decls) + "\n"
+            decl_items = []
+            curr_token_idx = ctx.declare_spec(0).start.tokenIndex if ctx.declare_spec(0).start else 0
+            for d in ctx.declare_spec():
+                if d.start:
+                    pre_comments = self._get_comments_in_range(curr_token_idx, d.start.tokenIndex - 1)
+                    for c in pre_comments:
+                        decl_items.append(f"    {c}")
+                res = self.visit(d)
+                if res:
+                    decl_items.append(res)
+                if d.stop:
+                    curr_token_idx = d.stop.tokenIndex + 1
+            if decl_items:
+                decl_str = "DECLARE\n" + "\n".join(decl_items) + "\n"
         body_str = self.visit(ctx.body()) if ctx.body() else ""
         return f"{decl_str}{body_str}"
 
@@ -438,18 +465,36 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
 
     def visitBody(self, ctx: FirebirdParser.BodyContext):
         # A body is usually BEGIN ... END
-        statements = []
+        items = []
+        stmt_contexts = []
         if ctx.seq_of_statements() and ctx.seq_of_statements().children:
             for child in ctx.seq_of_statements().children:
                 if isinstance(child, FirebirdParser.StatementContext):
-                    stmt_str = self.visit(child)
-                    if stmt_str:
-                        stmt_str = stmt_str.strip()
-                        if not stmt_str.endswith(';'):
-                            stmt_str += ';'
-                        statements.append(stmt_str)
+                    stmt_contexts.append(child)
 
-        inner_code = "\n".join(f"    {s}" for s in statements)
+        start_token_idx = ctx.start.tokenIndex + 1 if ctx.start else 0
+        stop_token_idx = ctx.stop.tokenIndex - 1 if ctx.stop else 0
+        curr_token_idx = start_token_idx
+
+        for stmt_ctx in stmt_contexts:
+            if stmt_ctx.start:
+                pre_comments = self._get_comments_in_range(curr_token_idx, stmt_ctx.start.tokenIndex - 1)
+                items.extend(pre_comments)
+
+            stmt_str = self.visit(stmt_ctx)
+            if stmt_str:
+                stmt_str = stmt_str.strip()
+                if not stmt_str.endswith(';'):
+                    stmt_str += ';'
+                items.append(stmt_str)
+
+            if stmt_ctx.stop:
+                curr_token_idx = stmt_ctx.stop.tokenIndex + 1
+
+        trailing_comments = self._get_comments_in_range(curr_token_idx, stop_token_idx)
+        items.extend(trailing_comments)
+
+        inner_code = "\n".join(f"    {s}" for s in items)
         return f"BEGIN\n{inner_code}\nEND;"
 
     def visitStatement(self, ctx: FirebirdParser.StatementContext):
@@ -471,9 +516,20 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
     def visitBlock(self, ctx: FirebirdParser.BlockContext):
         decl_str = ""
         if ctx.declare_spec():
-            decls = [res for d in ctx.declare_spec() if (res := self.visit(d))]
-            if decls:
-                decl_str = "DECLARE\n" + "\n".join(decls) + "\n"
+            decl_items = []
+            curr_token_idx = ctx.declare_spec(0).start.tokenIndex if ctx.declare_spec(0).start else 0
+            for d in ctx.declare_spec():
+                if d.start:
+                    pre_comments = self._get_comments_in_range(curr_token_idx, d.start.tokenIndex - 1)
+                    for c in pre_comments:
+                        decl_items.append(f"    {c}")
+                res = self.visit(d)
+                if res:
+                    decl_items.append(res)
+                if d.stop:
+                    curr_token_idx = d.stop.tokenIndex + 1
+            if decl_items:
+                decl_str = "DECLARE\n" + "\n".join(decl_items) + "\n"
         body_str = self.visit(ctx.body()) if ctx.body() else ""
         return f"{decl_str}{body_str}"
 
@@ -485,15 +541,20 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
             if not then_stmt.endswith(';'):
                 then_stmt += ';'
 
-        sql = f"IF {cond} THEN\n    {then_stmt}\n"
+        then_comments = self._get_comments_in_range(ctx.condition().stop.tokenIndex + 1, ctx.statement(0).start.tokenIndex - 1) if ctx.condition().stop and ctx.statement(0).start else []
+        then_comment_str = ('\n    ' + '\n    '.join(then_comments) + '\n') if then_comments else ''
+
+        sql = f"IF {cond} THEN{then_comment_str}\n    {then_stmt}\n"
 
         if len(ctx.statement()) > 1:
+            else_comments = self._get_comments_in_range(ctx.statement(0).stop.tokenIndex + 1, ctx.statement(1).start.tokenIndex - 1) if ctx.statement(0).stop and ctx.statement(1).start else []
+            else_comment_str = ('\n    ' + '\n    '.join(else_comments) + '\n') if else_comments else ''
             else_stmt = self.visit(ctx.statement(1))
             if else_stmt:
                 else_stmt = else_stmt.strip()
                 if not else_stmt.endswith(';'):
                     else_stmt += ';'
-            sql += f"ELSE\n    {else_stmt}\n"
+            sql += f"ELSE{else_comment_str}\n    {else_stmt}\n"
 
         sql += "END IF;"
         return sql
@@ -515,12 +576,31 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         return ctx.getText()
 
     def visitSeq_of_declare_specs(self, ctx: FirebirdParser.Seq_of_declare_specsContext):
-        declarations = []
-        for child in ctx.children:
-            decl = self.visit(child)
-            if decl:
-                declarations.append(decl)
-        return "\n".join(declarations)
+        items = []
+        decl_children = [c for c in ctx.children if hasattr(c, 'start') and hasattr(c, 'stop')] if ctx.children else []
+
+        start_token_idx = ctx.start.tokenIndex if ctx.start else 0
+        stop_token_idx = ctx.stop.tokenIndex if ctx.stop else 0
+        curr_token_idx = start_token_idx
+
+        for child in decl_children:
+            if child.start:
+                pre_comments = self._get_comments_in_range(curr_token_idx, child.start.tokenIndex - 1)
+                for c in pre_comments:
+                    items.append(f"    {c}")
+
+            decl_str = self.visit(child)
+            if decl_str:
+                items.append(decl_str)
+
+            if child.stop:
+                curr_token_idx = child.stop.tokenIndex + 1
+
+        trailing_comments = self._get_comments_in_range(curr_token_idx, stop_token_idx)
+        for c in trailing_comments:
+            items.append(f"    {c}")
+
+        return "\n".join(items)
 
     def visitVariable_declaration(self, ctx: FirebirdParser.Variable_declarationContext):
         var_name = ctx.identifier().getText()
@@ -537,16 +617,21 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         if hasattr(ctx, 'EXECUTE') and ctx.EXECUTE():
             expr = self.get_raw_text(ctx.expression())
             into_vars = []
+            end_header_token = ctx.expression().stop
             if ctx.into_clause():
+                end_header_token = ctx.into_clause().stop
                 for child in ctx.into_clause().children:
                     if isinstance(child, (FirebirdParser.General_elementContext, FirebirdParser.Bind_variableContext)):
                         into_vars.append(self.get_raw_text(child).lstrip(':'))
 
             target = ", ".join(into_vars) if into_vars else "_rec"
+            loop_comments = self._get_comments_in_range(end_header_token.tokenIndex + 1, ctx.statement().start.tokenIndex - 1) if end_header_token and ctx.statement().start else []
+            comment_str = ('\n    ' + '\n    '.join(loop_comments) + '\n') if loop_comments else ' '
+
             body_sql = self.visit(ctx.statement())
             body_lines = body_sql.split('\n')
             indented_body = "\n".join(f"    {line}" if line.strip() else line for line in body_lines)
-            return f"FOR {target} IN EXECUTE {expr} LOOP\n{indented_body}\nEND LOOP;"
+            return f"FOR {target} IN EXECUTE {expr}{comment_str}LOOP\n{indented_body}\nEND LOOP;"
 
         # Case 2: FOR select_statement DO statement
         if ctx.select_statement():
@@ -559,8 +644,11 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
                         into_vars.append(self.get_raw_text(child).lstrip(':'))
 
             select_sql = self.get_text_without_node(ctx.select_statement(), into_ctx).strip()
-
             target = ", ".join(into_vars) if into_vars else "_rec"
+
+            end_header_token = ctx.select_statement().stop
+            loop_comments = self._get_comments_in_range(end_header_token.tokenIndex + 1, ctx.statement().start.tokenIndex - 1) if end_header_token and ctx.statement().start else []
+            comment_str = ('\n    ' + '\n    '.join(loop_comments) + '\n') if loop_comments else ' '
 
             body_sql = self.visit(ctx.statement())
 
@@ -568,15 +656,19 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
             body_lines = body_sql.split('\n')
             indented_body = "\n".join(f"    {line}" if line.strip() else line for line in body_lines)
 
-            return f"FOR {target} IN {select_sql} LOOP\n{indented_body}\nEND LOOP;"
+            return f"FOR {target} IN {select_sql}{comment_str}LOOP\n{indented_body}\nEND LOOP;"
 
         # Case 3: WHILE condition DO statement
         if ctx.condition():
             cond = self.get_raw_text(ctx.condition())
+            end_header_token = ctx.condition().stop
+            loop_comments = self._get_comments_in_range(end_header_token.tokenIndex + 1, ctx.statement().start.tokenIndex - 1) if end_header_token and ctx.statement().start else []
+            comment_str = ('\n    ' + '\n    '.join(loop_comments) + '\n') if loop_comments else ' '
+
             body_sql = self.visit(ctx.statement())
             body_lines = body_sql.split('\n')
             indented_body = "\n".join(f"    {line}" if line.strip() else line for line in body_lines)
-            return f"WHILE {cond} LOOP\n{indented_body}\nEND LOOP;"
+            return f"WHILE {cond}{comment_str}LOOP\n{indented_body}\nEND LOOP;"
 
         return self.get_raw_text(ctx)
 
