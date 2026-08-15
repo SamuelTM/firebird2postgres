@@ -48,33 +48,24 @@ class DatabaseMigrator:
     def transpile_firebird_sql(firebird_sql_string: str) -> str:
         return FirebirdToPostgresVisitor.transpile(firebird_sql_string)
 
-    @staticmethod
-    def _get_firebird_data_type_name(data_type_value: int, subtype: int = None) -> str | None:
-        if data_type_value == FirebirdDataType.SMALLINT:
-            return 'SMALLINT'
-        elif data_type_value == FirebirdDataType.INTEGER:
-            return 'INTEGER'
-        elif data_type_value == FirebirdDataType.FLOAT:
-            return 'FLOAT'
-        elif data_type_value == FirebirdDataType.DATE:
-            return 'DATE'
-        elif data_type_value == FirebirdDataType.TIME:
-            return 'TIME'
-        elif data_type_value == FirebirdDataType.CHAR:
-            return 'CHAR'
-        elif data_type_value == FirebirdDataType.BIGINT:
-            return 'BIGINT'
-        elif data_type_value == FirebirdDataType.DOUBLE_PRECISION:
-            return 'DOUBLE PRECISION'
-        elif data_type_value == FirebirdDataType.TIMESTAMP:
-            return 'TIMESTAMP'
-        elif data_type_value == FirebirdDataType.VARCHAR:
-            return 'VARCHAR'
-        elif data_type_value == FirebirdDataType.BLOB:
-            if subtype == 1:
-                return 'BLOB SUBTYPE 1'
-            return 'BLOB SUBTYPE 0'
-        return None
+    _TYPE_MAP: dict[int, str] = {
+        FirebirdDataType.SMALLINT: 'SMALLINT',
+        FirebirdDataType.INTEGER: 'INTEGER',
+        FirebirdDataType.FLOAT: 'FLOAT',
+        FirebirdDataType.DATE: 'DATE',
+        FirebirdDataType.TIME: 'TIME',
+        FirebirdDataType.CHAR: 'CHAR',
+        FirebirdDataType.BIGINT: 'BIGINT',
+        FirebirdDataType.DOUBLE_PRECISION: 'DOUBLE PRECISION',
+        FirebirdDataType.TIMESTAMP: 'TIMESTAMP',
+        FirebirdDataType.VARCHAR: 'VARCHAR',
+    }
+
+    @classmethod
+    def _get_firebird_data_type_name(cls, data_type_value: int, subtype: int = None) -> str | None:
+        if data_type_value == FirebirdDataType.BLOB:
+            return 'BLOB SUBTYPE 1' if subtype == 1 else 'BLOB SUBTYPE 0'
+        return cls._TYPE_MAP.get(data_type_value)
 
     def _extract_schema(self):
         """
