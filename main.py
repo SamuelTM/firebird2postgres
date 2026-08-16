@@ -31,38 +31,46 @@ if __name__ == '__main__':
     # -------------------------------------------------------------
     # STEP 1: Export and transpile all Firebird DDLs
     # -------------------------------------------------------------
-    print("\n[STEP 1/6] Exporting and transpiling DDLs (Domains, Procedures, Views, Triggers)...")
+    print("\n[STEP 1/7] Exporting and transpiling DDLs (Domains, Procedures, Views, Triggers)...")
     migrator.export_all_firebird_ddl()
 
     # -------------------------------------------------------------
-    # STEP 2: Apply Domains in PostgreSQL
+    # STEP 2: Teardown - drop existing tables, sequences and domains
+    # (tables must go first: DROP DOMAIN CASCADE would otherwise drop
+    # the table columns that reference the domains)
     # -------------------------------------------------------------
-    print("\n[STEP 2/6] Applying Domains in PostgreSQL...")
+    print("\n[STEP 2/7] Dropping existing migrated objects in PostgreSQL...")
+    migrator.drop_schema()
+
+    # -------------------------------------------------------------
+    # STEP 3: Apply Domains in PostgreSQL
+    # -------------------------------------------------------------
+    print("\n[STEP 3/7] Applying Domains in PostgreSQL...")
     migrator.apply_sql_file('postgres_domains_dump.sql')
 
     # -------------------------------------------------------------
-    # STEP 3: Create Tables, Sequences, Foreign and Primary Keys schema
+    # STEP 4: Create Tables, Sequences, Foreign and Primary Keys schema
     # -------------------------------------------------------------
-    print("\n[STEP 3/6] Creating Tables, Sequences, Foreign and Primary Keys schema in PostgreSQL...")
+    print("\n[STEP 4/7] Creating Tables, Sequences, Foreign and Primary Keys schema in PostgreSQL...")
     migrator.migrate_schema(print_queries=False)
 
     # -------------------------------------------------------------
-    # STEP 4: Migrate Table Data and Synchronize Sequences
+    # STEP 5: Migrate Table Data and Synchronize Sequences
     # -------------------------------------------------------------
-    print("\n[STEP 4/6] Importing table data and synchronizing sequences...")
+    print("\n[STEP 5/7] Importing table data and synchronizing sequences...")
     migrator.import_data()
 
     # -------------------------------------------------------------
-    # STEP 5: Apply Procedures and Views in PostgreSQL
+    # STEP 6: Apply Procedures and Views in PostgreSQL
     # -------------------------------------------------------------
-    print("\n[STEP 5/6] Applying Procedures and Views in PostgreSQL...")
+    print("\n[STEP 6/7] Applying Procedures and Views in PostgreSQL...")
     migrator.apply_sql_file('postgres_procedures_dump.sql')
     migrator.apply_sql_file('postgres_views_dump.sql')
 
     # -------------------------------------------------------------
-    # STEP 6: Apply Triggers in PostgreSQL
+    # STEP 7: Apply Triggers in PostgreSQL
     # -------------------------------------------------------------
-    print("\n[STEP 6/6] Applying Triggers in PostgreSQL...")
+    print("\n[STEP 7/7] Applying Triggers in PostgreSQL...")
     migrator.apply_sql_file('postgres_triggers_dump.sql')
 
     print("\nFirebird to PostgreSQL migration completed successfully!")

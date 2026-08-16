@@ -68,6 +68,24 @@ class DatabaseMigrator:
             return 'BLOB SUBTYPE 1' if subtype == 1 else 'BLOB SUBTYPE 0'
         return cls._TYPE_MAP.get(data_type_value)
 
+    @staticmethod
+    def _resolve_pg_domain_name(domain_name: str, relation_names: set[str]) -> str:
+        """
+        Resolves the final PostgreSQL name for a Firebird domain.
+
+        Domains are created lowercase-quoted (e.g. public."varchar200") because transpiled
+        PL/pgSQL bodies reference domain names unquoted, and PostgreSQL folds unquoted
+        identifiers to lowercase. Quoting avoids keyword parse errors (e.g. REAL, TIME).
+
+        Every PostgreSQL table/view implicitly owns a composite type with the exact same
+        (case-sensitive) name, so in the unlikely case of an exact-case collision with a
+        relation, the domain is renamed with a '_dom' suffix.
+        """
+        pg_name = domain_name.lower()
+        while pg_name in relation_names:
+            pg_name = f'{pg_name}_dom'
+        return pg_name
+
     def _extract_schema(self):
         """
         Extracts the DDL schema from Firebird system tables into memory.
@@ -76,6 +94,10 @@ class DatabaseMigrator:
         fb_cursor.execute(
             'SELECT RDB$RELATION_NAME FROM RDB$RELATIONS WHERE RDB$SYSTEM_FLAG = 0 AND RDB$VIEW_BLR IS NULL;')
         tables = fb_cursor.fetchall()
+
+        # Needed to detect domain names that collide with tables/views (see _resolve_pg_domain_name)
+        fb_cursor.execute('SELECT RDB$RELATION_NAME FROM RDB$RELATIONS WHERE RDB$SYSTEM_FLAG = 0;')
+        relation_names = {r[0].strip() for r in fb_cursor.fetchall() if r[0]}
 
         self.table_objs = []
 
@@ -86,7 +108,8 @@ class DatabaseMigrator:
                    SELECT rf.RDB$FIELD_NAME, f.RDB$FIELD_TYPE, f.RDB$FIELD_SUB_TYPE, f.RDB$FIELD_LENGTH, 
                           COALESCE(rf.RDB$NULL_FLAG, f.RDB$NULL_FLAG),
                           f.RDB$FIELD_PRECISION, f.RDB$FIELD_SCALE,
-                          COALESCE(rf.RDB$DEFAULT_SOURCE, f.RDB$DEFAULT_SOURCE)
+                          rf.RDB$DEFAULT_SOURCE, f.RDB$DEFAULT_SOURCE,
+                          rf.RDB$FIELD_SOURCE
                    FROM RDB$RELATION_FIELDS rf
                    JOIN RDB$FIELDS f ON rf.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
                    WHERE rf.RDB$RELATION_NAME = '{table_name}'
@@ -104,7 +127,9 @@ class DatabaseMigrator:
                 nullable = column[4] is None
                 precision = column[5]
                 scale = abs(column[6]) if column[6] is not None else 0
-                default_value = column[7].strip() if column[7] else None
+                column_default = column[7].strip() if column[7] else None
+                domain_default = column[8].strip() if column[8] else None
+                field_source = column[9].strip() if column[9] else None
 
                 if (column_type in [FirebirdDataType.SMALLINT, FirebirdDataType.INTEGER, FirebirdDataType.BIGINT]
                         and column_subtype is not None and column_subtype > 0):
@@ -113,7 +138,20 @@ class DatabaseMigrator:
                     else:
                         column_data_type = 'NUMERIC'
 
-                table_obj.columns.append(Column(column_name, column_data_type, column_size, nullable, default_value))
+                # RDB$FIELD_SOURCE starting with 'RDB$' is an implicit system domain, meaning the
+                # column was declared with a raw type. Anything else is a user-defined domain,
+                # which the column must reference in PostgreSQL to preserve the original design.
+                domain_name = None
+                if field_source and not field_source.startswith('RDB$'):
+                    domain_name = self._resolve_pg_domain_name(field_source, relation_names)
+                    # Only column-level overrides go inline; the domain carries its own default
+                    default_value = column_default
+                else:
+                    default_value = column_default or domain_default
+
+                table_obj.columns.append(
+                    Column(column_name, column_data_type, column_size, nullable, default_value,
+                           domain_name=domain_name))
 
             foreign_keys_query = f"""
                      SELECT 
@@ -224,6 +262,58 @@ class DatabaseMigrator:
                     if column:
                         column.sequence_name = sequence_name
 
+    def _drop_tables_and_sequences(self, cursor, print_queries=False):
+        """
+        Drops migrated tables (CASCADE also removes their constraints, indexes, triggers
+        and dependent views) and sequences. Domains are NOT dropped here, because the
+        tables being (re)created reference them.
+        """
+        for table in self.table_objs:
+            drop_query = f'DROP TABLE IF EXISTS "{table.name}" CASCADE;'
+            if print_queries:
+                print(drop_query)
+            cursor.execute(drop_query)
+
+        for table in self.table_objs:
+            for col in table.columns:
+                if col.sequence_name:
+                    drop_seq_query = f'DROP SEQUENCE IF EXISTS "{col.sequence_name}" CASCADE;'
+                    if print_queries:
+                        print(drop_seq_query)
+                    cursor.execute(drop_seq_query)
+
+    def drop_schema(self, print_queries=False):
+        """
+        Drops all migrated objects (tables, sequences and domains) from PostgreSQL,
+        so that a re-run always rebuilds the current Firebird schema from scratch.
+
+        Tables MUST be dropped before domains: DROP DOMAIN ... CASCADE on a domain that
+        is still in use drops the table columns referencing it (and their data).
+        """
+        if not self.table_objs:
+            self._extract_schema()
+
+        cursor = self.pg_con.cursor()
+
+        self._drop_tables_and_sequences(cursor, print_queries=print_queries)
+
+        # Drop every domain in the current schema (covers orphaned variants left by earlier
+        # migration runs). Schema-qualify the DROP: unqualified names that match a pg_catalog
+        # type (e.g. "time") would resolve to the built-in type instead of our domain.
+        cursor.execute("""
+            SELECT n.nspname, t.typname
+            FROM pg_type t
+            JOIN pg_namespace n ON n.oid = t.typnamespace
+            WHERE t.typtype = 'd' AND n.nspname = current_schema();
+        """)
+        for schema_name, domain_name in cursor.fetchall():
+            drop_domain_query = f'DROP DOMAIN "{schema_name}"."{domain_name}" CASCADE;'
+            if print_queries:
+                print(drop_domain_query)
+            cursor.execute(drop_domain_query)
+
+        self.pg_con.commit()
+
     def migrate_schema(self, print_queries=False):
         """
         Executes the generated PostgreSQL DDL to create the schema.
@@ -232,6 +322,10 @@ class DatabaseMigrator:
             self._extract_schema()
 
         cursor = self.pg_con.cursor()
+
+        # Teardown of tables/sequences only - domains must already exist (STEP 3), since the
+        # tables created here reference them
+        self._drop_tables_and_sequences(cursor, print_queries=print_queries)
 
         for table in self.table_objs:
             seq_queries = table.get_sequences_query()
@@ -658,7 +752,8 @@ class DatabaseMigrator:
                 RDB$FIELD_PRECISION, 
                 RDB$FIELD_SCALE,
                 RDB$DEFAULT_SOURCE,
-                RDB$NULL_FLAG
+                RDB$NULL_FLAG,
+                RDB$VALIDATION_SOURCE
             FROM RDB$FIELDS
             WHERE RDB$SYSTEM_FLAG = 0
               AND RDB$FIELD_NAME NOT STARTING WITH 'RDB$'
@@ -666,6 +761,10 @@ class DatabaseMigrator:
         """
         fb_cursor.execute(query)
         domains = fb_cursor.fetchall()
+
+        # Needed to detect domain names that collide with tables/views (see _resolve_pg_domain_name)
+        fb_cursor.execute('SELECT RDB$RELATION_NAME FROM RDB$RELATIONS WHERE RDB$SYSTEM_FLAG = 0;')
+        relation_names = {r[0].strip() for r in fb_cursor.fetchall() if r[0]}
 
         with open(output_file, 'w', encoding='utf-8') as f, open(converted_file, 'w', encoding='utf-8') as conv_f:
             f.write("-- ==========================================\n")
@@ -685,6 +784,7 @@ class DatabaseMigrator:
                 field_scale = abs(d[5]) if d[5] else 0
                 default_source = d[6].strip() if d[6] else None
                 not_null = (d[7] == 1)
+                validation_source = d[8].strip() if d[8] else None
 
                 fb_type_name = self._get_firebird_data_type_name(field_type, field_subtype)
                 if fb_type_name is None:
@@ -708,17 +808,57 @@ class DatabaseMigrator:
                     fb_ddl += f' {default_source}'
                 if not_null:
                     fb_ddl += ' NOT NULL'
+                if validation_source:
+                    fb_ddl += f'\n{validation_source}'
                 fb_ddl += ';\n'
                 f.write(fb_ddl)
 
-                # PostgreSQL DDL (use unquoted identifier for case-insensitive matching in PL/pgSQL)
-                pg_domain_ident = domain_name if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', domain_name) else f'"{domain_name}"'
-                pg_ddl = f'CREATE DOMAIN {pg_domain_ident} AS {pg_type}'
+                # Rename domains whose final name collides with a table/view name
+                # (see _resolve_pg_domain_name). The same mapping is applied to the
+                # columns that reference this domain.
+                pg_domain_name = self._resolve_pg_domain_name(domain_name, relation_names)
+                if pg_domain_name != domain_name.lower():
+                    print(f'  [RENAMED] Domain "{domain_name}" collides with a table/view name; '
+                          f'exported as "{pg_domain_name}".')
+                    conv_f.write(f'-- [RENAMED] DOMAIN "{domain_name}" -> "{pg_domain_name}" '
+                                 f'(collides with a table/view name)\n')
+
+                # PostgreSQL DDL: schema-qualified, lowercase-quoted identifier. Lowercase makes
+                # unquoted references in transpiled PL/pgSQL bodies resolve correctly (PostgreSQL
+                # folds unquoted identifiers to lowercase); quoting avoids keyword parse errors
+                # (e.g. REAL, TIME); schema qualification prevents resolution to pg_catalog
+                # built-in types (e.g. "time").
+                #
+                # The domain is created only if missing (PostgreSQL has no CREATE OR REPLACE
+                # DOMAIN). Recreation with a fresh definition happens in the teardown phase
+                # (drop_schema, before tables are rebuilt), because DROP DOMAIN ... CASCADE on
+                # a domain still in use would drop the table columns referencing it.
+                pg_domain_ident = f'public."{pg_domain_name}"'
+                create_ddl = f'CREATE DOMAIN {pg_domain_ident} AS {pg_type}'
                 if default_source:
-                    pg_ddl += f' {default_source}'
+                    create_ddl += f' {default_source}'
                 if not_null:
-                    pg_ddl += ' NOT NULL'
-                pg_ddl += ';\n'
+                    create_ddl += ' NOT NULL'
+                if validation_source:
+                    check = validation_source
+                    if not check.upper().startswith('CHECK'):
+                        check = f'CHECK ({check})'
+                    create_ddl += f'\n{check}'
+                create_ddl += ';'
+
+                escaped_name = pg_domain_name.replace("'", "''")
+                escaped_ddl = create_ddl.replace("'", "''")
+                pg_ddl = (
+                    'DO $$\n'
+                    'BEGIN\n'
+                    '    IF NOT EXISTS (SELECT 1 FROM pg_type t\n'
+                    '                   JOIN pg_namespace n ON n.oid = t.typnamespace\n'
+                    "                   WHERE t.typtype = 'd' AND n.nspname = 'public'\n"
+                    f"                     AND t.typname = '{escaped_name}') THEN\n"
+                    f"        EXECUTE '{escaped_ddl}';\n"
+                    '    END IF;\n'
+                    'END $$;\n'
+                )
                 conv_f.write(pg_ddl)
 
         print(f"Exported {len(domains)} domains to '{output_file}' and '{converted_file}'")

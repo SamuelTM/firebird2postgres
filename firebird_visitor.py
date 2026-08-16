@@ -361,7 +361,10 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         else:
             return_type = "RETURNS SETOF record" if has_return_next else "RETURNS record"
 
-        return (f'CREATE OR REPLACE FUNCTION "{proc_name}"({params_str}) {return_type} AS $$\n{decl_str}{body_str}\n'
+        # DROP first to guarantee idempotency, since changing an existing function's
+        # signature (parameter types or return type) requires recreating it
+        return (f'DROP FUNCTION IF EXISTS "{proc_name}" CASCADE;\n'
+                f'CREATE FUNCTION "{proc_name}"({params_str}) {return_type} AS $$\n{decl_str}{body_str}\n'
                 f'$$ LANGUAGE plpgsql;')
 
     def visitParameter(self, ctx: FirebirdParser.ParameterContext):
@@ -411,7 +414,8 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         func_name = f"{trigger_name}_func"
 
         func_sql = f'CREATE OR REPLACE FUNCTION "{func_name}"() RETURNS TRIGGER AS $$\n{body_str}\n$$ LANGUAGE plpgsql;'
-        trigger_sql = (f'CREATE TRIGGER "{trigger_name}" {timing} {events} ON "{table_name}" '
+        trigger_sql = (f'DROP TRIGGER IF EXISTS "{trigger_name}" ON "{table_name}";\n'
+                       f'CREATE TRIGGER "{trigger_name}" {timing} {events} ON "{table_name}" '
                        f'FOR EACH ROW EXECUTE FUNCTION "{func_name}"();')
 
         return f"{func_sql}\n{trigger_sql}"
@@ -461,7 +465,9 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
             view_opts = self.get_raw_text(ctx.view_options())
             view_opts = f" {view_opts}"
 
-        return f'CREATE OR REPLACE VIEW "{view_name}"{view_opts} AS {select_stmt};'
+        # DROP first to guarantee idempotency, since changing the column list of an
+        # existing view (names, order or types) requires recreating it
+        return f'DROP VIEW IF EXISTS "{view_name}" CASCADE;\nCREATE VIEW "{view_name}"{view_opts} AS {select_stmt};'
 
     def visitBody(self, ctx: FirebirdParser.BodyContext):
         # A body is usually BEGIN ... END

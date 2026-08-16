@@ -1,12 +1,13 @@
 class Column:
     def __init__(self, name: str, column_type: str, size: int, nullable: bool, default_value: str = None,
-                 sequence_name: str = None):
+                 sequence_name: str = None, domain_name: str = None):
         self.name = name
         self.column_type = column_type
         self.size = size
         self.nullable = nullable
         self.default_value = default_value
         self.sequence_name = sequence_name
+        self.domain_name = domain_name
 
 
 class ForeignKey:
@@ -72,17 +73,21 @@ class Table:
         queries = []
         for col in self.columns:
             if col.sequence_name:
-                queries.append(f'CREATE SEQUENCE IF NOT EXISTS "{col.sequence_name}";')
+                queries.append(f'CREATE SEQUENCE "{col.sequence_name}";')
         return queries
 
     def get_create_query(self):
-        query = f'CREATE TABLE IF NOT EXISTS "{self.name}" ('
+        query = f'CREATE TABLE "{self.name}" ('
 
         for i, col in enumerate(self.columns):
             converted_type = get_postgres_type(col.column_type)
             escaped_name = f'"{col.name}"'
 
-            if 'char' in col.column_type.lower().strip():
+            if col.domain_name:
+                # Column declared with a user domain: reference it (schema-qualified, lowercase)
+                # to preserve the original semantics and bypass pg_catalog name shadowing
+                col_def = f'{escaped_name} public."{col.domain_name}"'
+            elif 'char' in col.column_type.lower().strip():
                 col_def = f'{escaped_name} {converted_type}({col.size})'
             else:
                 col_def = f'{escaped_name} {converted_type}'
