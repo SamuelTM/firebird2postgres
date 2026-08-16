@@ -1,71 +1,83 @@
 # Firebird to PostgreSQL Migrator
 
-A script designed to automatically migrate schemas and data from Firebird databases to PostgreSQL. It handles the structural complexities of Firebird (like domains and generators) and translates them seamlessly into native PostgreSQL features.
+This tool migrates the schema and the data of a Firebird database to PostgreSQL. It converts Firebird structures (domains, generators, PSQL) to native PostgreSQL features. An ANTLR-based transpiler converts triggers, stored procedures and views to PL/pgSQL.
 
-## Key Features
+## Features
 
-### Schema Migration
-- **Smart Type Mapping**: Converts Firebird data types (including `NUMERIC` precision/scale) to their PostgreSQL equivalents.
-- **Domain Resolution**: Correctly resolves `NOT NULL` constraints and `DEFAULT` values even when they are hidden behind Firebird's implicit system domains.
-- **Auto-Increment Intelligence**: Parses Firebird triggers via regex to detect `GEN_ID` sequences and automatically ports them to native PostgreSQL Sequences (`DEFAULT nextval(...)`).
-- **Constraint Parsing**: Extracts and recreates Primary Keys, Foreign Keys, Unique Keys, and standard Indexes while properly filtering out system-generated indexes to avoid duplicates.
-- **View Filtering**: Skips Views during physical table extraction to prevent unwanted data duplication.
+### Schema
+- Converts Firebird data types to PostgreSQL types, with `NUMERIC` precision and scale.
 
-### Data Migration
-- **High-Performance Bulk Inserts**: Uses `psycopg2.extras.execute_values` to ingest thousands of rows in a single network transaction.
-- **Dynamic Batch Sizing**: Automatically detects heavy BLOB columns and dynamically shrinks the batch size to prevent memory exhaustion during extraction.
-- **Idempotency & Atomicity**: Before importing, the script runs `TRUNCATE CASCADE` to clear partial data from previous runs. Inserts are committed atomically per table, meaning you can restart a failed migration safely at any time.
-- **Constraint Bypassing**: Temporarily disables PostgreSQL triggers and constraints (`DISABLE TRIGGER ALL`) during the data load, completely eliminating the need for complex Foreign Key dependency sorting.
-- **Sequence Synchronization**: Automatically runs `setval()` on all generated sequences after the data is imported, ensuring your application won't hit duplicate key errors on its next `INSERT`.
-- **Data Sanitization**: Automatically scrubs NUL bytes (`\x00`) from text fields to satisfy PostgreSQL's C-string requirements.
+- Recreates user domains as PostgreSQL domains, with their `CHECK` constraints. Columns that use a domain keep the reference to it. Domain names are lowercase and schema-qualified (`public."varchar200"`). Thus keyword names (`REAL`) and unquoted references in PL/pgSQL resolve correctly.
 
-### Logic & Business Rules Export
-Firebird's PSQL and PostgreSQL's PL/pgSQL are fundamentally different. Instead of attempting risky automated translations, the script extracts your raw business logic into organized `.sql` dump files for manual translation:
-- `export_firebird_triggers()` -> `firebird_triggers_dump.sql`
-- `export_firebird_procedures()` -> `firebird_procedures_dump.sql`
-- `export_firebird_views()` -> `firebird_views_dump.sql`
+- Detects `GEN_ID` generators in triggers and converts them to sequences with `DEFAULT nextval(...)`.
+
+- Recreates primary keys, foreign keys, unique keys and indexes. Ignores system-generated indexes.
+
+### Data
+- Does bulk inserts with `psycopg2.extras.execute_values`.
+
+- Decreases the batch size for tables with BLOB columns to save memory.
+
+- Disables triggers and constraints during the load (`DISABLE TRIGGER ALL`). Thus no foreign-key sort is necessary.
+
+- Synchronizes the sequences with `setval()` after the import.
+
+- Removes NUL bytes from text values.
+
+### Idempotency
+- You can run the migration again at any time.
+
+- A teardown phase drops tables, sequences and domains, in this order. Tables go first: `DROP DOMAIN ... CASCADE` on a domain in use drops the columns that reference it.
+
+- The domains dump creates a domain only if it does not exist. The other dumps use `DROP IF EXISTS` guards.
+
+- `TRUNCATE CASCADE` clears partial data before each import. Each table commits atomically.
+
+### Transpilation
+Each export writes two files: the Firebird source and the converted PostgreSQL DDL. If the transpiler cannot convert an object, it writes the object with a `-- [TRANSPILER FAILED]` marker for manual review.
+
+### Validation
+`validate_postgres_ddl.py` executes all converted DDL against PostgreSQL in a dry run (rollback at the end). It prints a report for each object type.
 
 ## Requirements
 
-- Python 3.8+
-- `firebirdsql` (Pure Python Firebird driver)
-- `psycopg2` (PostgreSQL driver)
+Python 3.8 or later.
+
+```bash
+pip install -r requirements.txt
+```
+
+## Configuration
+
+1. Copy `.env.example` to `.env`.
+2. Set the Firebird and PostgreSQL connection parameters.
 
 ## Usage
 
-1. Configure your database connections in `main.py`:
-```python
-fb_connection = firebirdsql.connect(
-    host='localhost',
-    database='/path/to/database.fdb',
-    user='sysdba',
-    password='masterkey',
-    charset='WIN1252' # Ensures correct decoding of Latin-1 characters
-)
+Run the migration:
 
-pg_connection = psycopg2.connect(
-    host='localhost',
-    dbname='target_db',
-    user='postgres',
-    password='password'
-)
+```bash
+python main.py
 ```
 
-2. Run the migration:
-```python
-migrator = DatabaseMigrator(fb_connection, pg_connection)
+The pipeline does 7 steps:
 
-# 1. Create tables, columns, constraints, and sequences
-migrator.migrate_schema(print_queries=True)
+1. Export and transpile the Firebird DDL (domains, triggers, procedures, views).
+2. Drop the migrated objects in PostgreSQL (tables, sequences, domains).
+3. Apply the domains.
+4. Create the tables, sequences, keys and indexes.
+5. Import the data and synchronize the sequences.
+6. Apply the procedures and the views.
+7. Apply the triggers.
 
-# 2. Transfer the data
-migrator.import_data()
+To validate the converted DDL first (dry run, no changes):
 
-# 3. Dump business logic for manual translation
-migrator.export_firebird_triggers()
-migrator.export_firebird_procedures()
-migrator.export_firebird_views()
+```bash
+python validate_postgres_ddl.py
 ```
 
-## Known Limitations
-- The script must be run with a PostgreSQL user that has Superuser privileges (or sufficient rights to execute `ALTER TABLE ... DISABLE TRIGGER ALL`).
+## Limitations
+
+- The PostgreSQL user needs sufficient rights for `ALTER TABLE ... DISABLE TRIGGER ALL`.
+- A domain with the same name as a table or a view gets a `_dom` suffix. This is because each PostgreSQL relation owns a composite type with the same name.
+- The migration writes to the `public` schema.
