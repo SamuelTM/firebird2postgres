@@ -1,3 +1,4 @@
+import os
 import re
 import psycopg2.extras
 from enum import IntEnum
@@ -721,3 +722,140 @@ class DatabaseMigrator:
                 conv_f.write(pg_ddl)
 
         print(f"Exported {len(domains)} domains to '{output_file}' and '{converted_file}'")
+
+    def apply_sql_file(self, file_path: str, continue_on_error: bool = False) -> int:
+        """
+        Executes a PostgreSQL SQL file against the connected database.
+        Splits statements considering dollar-quoting ($$...$$), comments, and quotes.
+        Returns the number of successfully executed statements.
+        """
+        if not os.path.exists(file_path):
+            print(f"  [WARNING] File '{file_path}' not found. Skipping.")
+            return 0
+
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        statements = []
+        current_stmt = []
+        in_single_quote = False
+        in_line_comment = False
+        in_block_comment = False
+        dollar_tag = None
+
+        i = 0
+        n = len(content)
+
+        while i < n:
+            ch = content[i]
+            next_ch = content[i + 1] if i + 1 < n else ''
+
+            if ch == '\n':
+                if in_line_comment:
+                    in_line_comment = False
+                current_stmt.append(ch)
+                i += 1
+                continue
+
+            if in_line_comment:
+                current_stmt.append(ch)
+                i += 1
+                continue
+
+            if in_block_comment:
+                current_stmt.append(ch)
+                if ch == '*' and next_ch == '/':
+                    current_stmt.append(next_ch)
+                    in_block_comment = False
+                    i += 2
+                    continue
+                i += 1
+                continue
+
+            if in_single_quote:
+                current_stmt.append(ch)
+                if ch == "'":
+                    if next_ch == "'":
+                        current_stmt.append(next_ch)
+                        i += 2
+                        continue
+                    else:
+                        in_single_quote = False
+                i += 1
+                continue
+
+            if dollar_tag:
+                current_stmt.append(ch)
+                if ch == '$':
+                    sub = content[i:i + len(dollar_tag)]
+                    if sub == dollar_tag:
+                        current_stmt.extend(list(dollar_tag[1:]))
+                        i += len(dollar_tag)
+                        dollar_tag = None
+                        continue
+                i += 1
+                continue
+
+            if ch == '-' and next_ch == '-':
+                in_line_comment = True
+                current_stmt.append(ch)
+                current_stmt.append(next_ch)
+                i += 2
+                continue
+
+            if ch == '/' and next_ch == '*':
+                in_block_comment = True
+                current_stmt.append(ch)
+                current_stmt.append(next_ch)
+                i += 2
+                continue
+
+            if ch == "'":
+                in_single_quote = True
+                current_stmt.append(ch)
+                i += 1
+                continue
+
+            if ch == '$':
+                match = re.match(r'^\$[A-Za-z0-9_]*\$', content[i:])
+                if match:
+                    tag = match.group(0)
+                    dollar_tag = tag
+                    current_stmt.extend(list(tag))
+                    i += len(tag)
+                    continue
+
+            if ch == ';':
+                current_stmt.append(ch)
+                stmt_text = "".join(current_stmt).strip()
+                if stmt_text:
+                    statements.append(stmt_text)
+                current_stmt = []
+                i += 1
+                continue
+
+            current_stmt.append(ch)
+            i += 1
+
+        if current_stmt:
+            stmt_text = "".join(current_stmt).strip()
+            if stmt_text:
+                statements.append(stmt_text)
+
+        pg_cur = self.pg_con.cursor()
+        success_count = 0
+        for stmt in statements:
+            try:
+                pg_cur.execute(stmt)
+                success_count += 1
+            except Exception as e:
+                self.pg_con.rollback()
+                print(f"  [ERROR executing statement]: {e}")
+                print(f"  Query: {stmt[:200]}...")
+                if not continue_on_error:
+                    raise e
+
+        self.pg_con.commit()
+        print(f"  -> Successfully applied {success_count} statements from '{file_path}'.")
+        return success_count
+

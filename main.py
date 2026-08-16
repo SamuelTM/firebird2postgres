@@ -8,6 +8,7 @@ from database_migrator import DatabaseMigrator
 load_dotenv()
 
 if __name__ == '__main__':
+    print('Connecting to Firebird...')
     fb_connection = firebirdsql.connect(
         host=os.getenv('FIREBIRD_HOST', 'localhost'),
         database=os.getenv('FIREBIRD_DATABASE', '/firebird/data/sample_database.fdb'),
@@ -27,14 +28,44 @@ if __name__ == '__main__':
 
     migrator = DatabaseMigrator(fb_connection, pg_connection)
 
-    migrator.migrate_schema(print_queries=True)
+    # -------------------------------------------------------------
+    # STEP 1: Export and transpile all Firebird DDLs
+    # -------------------------------------------------------------
+    print("\n[STEP 1/6] Exporting and transpiling DDLs (Domains, Procedures, Views, Triggers)...")
+    migrator.export_all_firebird_ddl()
 
+    # -------------------------------------------------------------
+    # STEP 2: Apply Domains in PostgreSQL
+    # -------------------------------------------------------------
+    print("\n[STEP 2/6] Applying Domains in PostgreSQL...")
+    migrator.apply_sql_file('postgres_domains_dump.sql')
+
+    # -------------------------------------------------------------
+    # STEP 3: Create Tables, Sequences, Foreign and Primary Keys schema
+    # -------------------------------------------------------------
+    print("\n[STEP 3/6] Creating Tables, Sequences, Foreign and Primary Keys schema in PostgreSQL...")
+    migrator.migrate_schema(print_queries=False)
+
+    # -------------------------------------------------------------
+    # STEP 4: Migrate Table Data and Synchronize Sequences
+    # -------------------------------------------------------------
+    print("\n[STEP 4/6] Importing table data and synchronizing sequences...")
     migrator.import_data()
 
-    migrator.export_firebird_domains()
-    migrator.export_firebird_triggers()
-    migrator.export_firebird_procedures()
-    migrator.export_firebird_views()
+    # -------------------------------------------------------------
+    # STEP 5: Apply Procedures and Views in PostgreSQL
+    # -------------------------------------------------------------
+    print("\n[STEP 5/6] Applying Procedures and Views in PostgreSQL...")
+    migrator.apply_sql_file('postgres_procedures_dump.sql')
+    migrator.apply_sql_file('postgres_views_dump.sql')
+
+    # -------------------------------------------------------------
+    # STEP 6: Apply Triggers in PostgreSQL
+    # -------------------------------------------------------------
+    print("\n[STEP 6/6] Applying Triggers in PostgreSQL...")
+    migrator.apply_sql_file('postgres_triggers_dump.sql')
+
+    print("\nFirebird to PostgreSQL migration completed successfully!")
 
     fb_connection.close()
     pg_connection.close()
