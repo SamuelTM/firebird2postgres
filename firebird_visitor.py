@@ -5,7 +5,8 @@ import sys
 # Ensure the firebird_grammar directory is in the path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'firebird_grammar'))
 
-from antlr4 import InputStream, CommonTokenStream
+from typing import TypeVar
+from antlr4 import InputStream, CommonTokenStream, ParserRuleContext
 from antlr4.atn.PredictionMode import PredictionMode
 from antlr4.error.ErrorStrategy import BailErrorStrategy, DefaultErrorStrategy
 from antlr4.error.Errors import ParseCancellationException, RecognitionException
@@ -15,6 +16,23 @@ from firebird_grammar.FirebirdParserVisitor import FirebirdParserVisitor
 # noinspection PyUnresolvedReferences
 from firebird_grammar.FirebirdParser import FirebirdParser
 from firebird_grammar.FirebirdLexer import FirebirdLexer
+
+T = TypeVar('T', bound=ParserRuleContext)
+
+
+def _find_node(ctx: ParserRuleContext | None, node_type: type[T]) -> T | None:
+    """
+    Recursively searches the AST using depth-first search (DFS)
+    for the first descendant node matching node_type.
+    """
+    if isinstance(ctx, node_type):
+        return ctx
+    if hasattr(ctx, 'children') and ctx.children:
+        for child in ctx.children:
+            res = _find_node(child, node_type)
+            if res is not None:
+                return res
+    return None
 
 
 class ASTDialectRewriter(FirebirdParserVisitor):
@@ -117,7 +135,7 @@ class ASTDialectRewriter(FirebirdParserVisitor):
         Extracts FIRST n [SKIP m] tokens from the query block and relocates them
         as LIMIT n [OFFSET m] to the end of the enclosing select_statement or subquery.
         """
-        qb = self.find_query_block(ctx)
+        qb = _find_node(ctx, FirebirdParser.Query_blockContext)
         if qb and qb.FIRST() and id(qb) not in self.handled_qbs:
             self.handled_qbs.add(id(qb))
             first_val = qb.numeric(0).getText()
@@ -138,16 +156,6 @@ class ASTDialectRewriter(FirebirdParserVisitor):
     def visitSubquery(self, ctx: FirebirdParser.SubqueryContext):
         self._rewrite_first_skip(ctx)
         return self.visitChildren(ctx)
-
-    def find_query_block(self, ctx):
-        if isinstance(ctx, FirebirdParser.Query_blockContext):
-            return ctx
-        if hasattr(ctx, 'children') and ctx.children:
-            for child in ctx.children:
-                res = self.find_query_block(child)
-                if res:
-                    return res
-        return None
 
     def visitSeq_of_statements(self, ctx: FirebirdParser.Seq_of_statementsContext):
         if not ctx.children:
@@ -547,13 +555,17 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
             if not then_stmt.endswith(';'):
                 then_stmt += ';'
 
-        then_comments = self._get_comments_in_range(ctx.condition().stop.tokenIndex + 1, ctx.statement(0).start.tokenIndex - 1) if ctx.condition().stop and ctx.statement(0).start else []
+        then_comments = self._get_comments_in_range(ctx.condition().stop.tokenIndex + 1,
+                                                    ctx.statement(0).start.tokenIndex - 1) \
+            if ctx.condition().stop and ctx.statement(0).start else []
         then_comment_str = ('\n    ' + '\n    '.join(then_comments) + '\n') if then_comments else ''
 
         sql = f"IF {cond} THEN{then_comment_str}\n    {then_stmt}\n"
 
         if len(ctx.statement()) > 1:
-            else_comments = self._get_comments_in_range(ctx.statement(0).stop.tokenIndex + 1, ctx.statement(1).start.tokenIndex - 1) if ctx.statement(0).stop and ctx.statement(1).start else []
+            else_comments = self._get_comments_in_range(ctx.statement(0).stop.tokenIndex + 1,
+                                                        ctx.statement(1).start.tokenIndex - 1) \
+                if ctx.statement(0).stop and ctx.statement(1).start else []
             else_comment_str = ('\n    ' + '\n    '.join(else_comments) + '\n') if else_comments else ''
             else_stmt = self.visit(ctx.statement(1))
             if else_stmt:
@@ -631,7 +643,9 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
                         into_vars.append(self.get_raw_text(child).lstrip(':'))
 
             target = ", ".join(into_vars) if into_vars else "_rec"
-            loop_comments = self._get_comments_in_range(end_header_token.tokenIndex + 1, ctx.statement().start.tokenIndex - 1) if end_header_token and ctx.statement().start else []
+            loop_comments = self._get_comments_in_range(end_header_token.tokenIndex + 1,
+                                                        ctx.statement().start.tokenIndex - 1) \
+                if end_header_token and ctx.statement().start else []
             comment_str = ('\n    ' + '\n    '.join(loop_comments) + '\n') if loop_comments else ' '
 
             body_sql = self.visit(ctx.statement())
@@ -641,7 +655,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
 
         # Case 2: FOR select_statement DO statement
         if ctx.select_statement():
-            into_ctx = self.find_node(ctx.select_statement(), FirebirdParser.Into_clauseContext)
+            into_ctx = _find_node(ctx.select_statement(), FirebirdParser.Into_clauseContext)
 
             into_vars = []
             if into_ctx:
@@ -653,7 +667,9 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
             target = ", ".join(into_vars) if into_vars else "_rec"
 
             end_header_token = ctx.select_statement().stop
-            loop_comments = self._get_comments_in_range(end_header_token.tokenIndex + 1, ctx.statement().start.tokenIndex - 1) if end_header_token and ctx.statement().start else []
+            loop_comments = self._get_comments_in_range(end_header_token.tokenIndex + 1,
+                                                        ctx.statement().start.tokenIndex - 1) \
+                if end_header_token and ctx.statement().start else []
             comment_str = ('\n    ' + '\n    '.join(loop_comments) + '\n') if loop_comments else ' '
 
             body_sql = self.visit(ctx.statement())
@@ -668,7 +684,9 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         if ctx.condition():
             cond = self.get_raw_text(ctx.condition())
             end_header_token = ctx.condition().stop
-            loop_comments = self._get_comments_in_range(end_header_token.tokenIndex + 1, ctx.statement().start.tokenIndex - 1) if end_header_token and ctx.statement().start else []
+            loop_comments = self._get_comments_in_range(end_header_token.tokenIndex + 1,
+                                                        ctx.statement().start.tokenIndex - 1) \
+                if end_header_token and ctx.statement().start else []
             comment_str = ('\n    ' + '\n    '.join(loop_comments) + '\n') if loop_comments else ' '
 
             body_sql = self.visit(ctx.statement())
@@ -677,16 +695,6 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
             return f"WHILE {cond}{comment_str}LOOP\n{indented_body}\nEND LOOP;"
 
         return self.get_raw_text(ctx)
-
-    def find_node(self, ctx, node_type):
-        if isinstance(ctx, node_type):
-            return ctx
-        if hasattr(ctx, 'children') and ctx.children:
-            for child in ctx.children:
-                res = self.find_node(child, node_type)
-                if res:
-                    return res
-        return None
 
     def get_text_without_node(self, parent_ctx, exclude_ctx):
         if exclude_ctx is None:
