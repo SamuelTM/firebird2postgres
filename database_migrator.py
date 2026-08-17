@@ -471,6 +471,56 @@ class DatabaseMigrator:
 
         return f'{phase} {" OR ".join(events)}'
 
+    @staticmethod
+    def _dump_header(title: str) -> str:
+        return (f"-- ==========================================\n"
+                f"-- {title}\n"
+                f"-- ==========================================\n\n")
+
+    @staticmethod
+    def _export_transpiled_ddl(items: list[tuple[str, str]], output_file: str, converted_file: str,
+                               object_type: str, firebird_header: str, postgres_header: str,
+                               executor: ProcessPoolExecutor = None, chunksize: int = 4,
+                               per_item_separator: bool = False):
+        """
+        Shared export pipeline: transpiles (item_name, firebird_sql) items in parallel and
+        writes both dump files - the raw Firebird source and the converted PostgreSQL DDL.
+        Objects that fail transpilation are kept in the converted file with a
+        [TRANSPILER FAILED] marker for manual review.
+        """
+        print(f"Transpiling {len(items)} {object_type.lower()}s in parallel...")
+        owns_executor = executor is None
+        if owns_executor:
+            executor = ProcessPoolExecutor()
+        try:
+            results = list(executor.map(_transpile_worker, items, chunksize=chunksize))
+        finally:
+            if owns_executor:
+                executor.shutdown()
+
+        with open(output_file, 'w', encoding='utf-8') as f, open(converted_file, 'w', encoding='utf-8') as conv_f:
+            f.write(firebird_header)
+            conv_f.write(postgres_header)
+
+            for (item_name, fb_sql), (pg_sql, err) in zip(items, results):
+                if per_item_separator:
+                    separator = (f"-- ----------------------------------------\n"
+                                 f"-- {object_type.title()}: {item_name}\n"
+                                 f"-- ----------------------------------------\n")
+                    f.write(separator)
+                    conv_f.write(separator)
+
+                f.write(fb_sql)
+                if err is None and pg_sql:
+                    conv_f.write(pg_sql)
+                    conv_f.write("\n\n")
+                else:
+                    print(f"Failed to transpile {object_type.lower()} {item_name}: {err}")
+                    conv_f.write(f"-- [TRANSPILER FAILED] {object_type} {item_name}\n")
+                    conv_f.write(fb_sql)
+
+        print(f"Exported {len(items)} {object_type.lower()}s to '{output_file}' and '{converted_file}'")
+
     def export_firebird_triggers(self, output_file: str = 'firebird_triggers_dump.sql',
                                  converted_file: str = 'postgres_triggers_dump.sql',
                                  executor: ProcessPoolExecutor = None,
@@ -501,33 +551,16 @@ class DatabaseMigrator:
             fb_sql = f"CREATE TRIGGER {trigger_name} FOR {relation_name} {timing_events}\n{source}\n\n"
             items.append((trigger_name, fb_sql))
 
-        print(f"Transpiling {len(items)} triggers in parallel...")
-        if executor is not None:
-            results = list(executor.map(_transpile_worker, items, chunksize=chunksize))
-        else:
-            with ProcessPoolExecutor() as local_executor:
-                results = list(local_executor.map(_transpile_worker, items, chunksize=chunksize))
-
-        with open(output_file, 'w', encoding='utf-8') as f, open(converted_file, 'w', encoding='utf-8') as conv_f:
-            f.write("-- ==========================================\n")
-            f.write("-- FIREBIRD TRIGGERS DUMP\n")
-            f.write("-- ==========================================\n\n")
-
-            conv_f.write("-- ==========================================\n")
-            conv_f.write("-- POSTGRESQL TRIGGERS DUMP (CONVERTED)\n")
-            conv_f.write("-- ==========================================\n\n")
-
-            for (trigger_name, fb_sql), (pg_sql, err) in zip(items, results):
-                f.write(fb_sql)
-                if err is None and pg_sql:
-                    conv_f.write(pg_sql)
-                    conv_f.write("\n\n")
-                else:
-                    print(f"Failed to transpile trigger {trigger_name}: {err}")
-                    conv_f.write(f"-- [TRANSPILER FAILED] TRIGGER {trigger_name}\n")
-                    conv_f.write(fb_sql)
-
-        print(f"Exported {len(triggers)} triggers to '{output_file}' and '{converted_file}'")
+        self._export_transpiled_ddl(
+            items,
+            output_file=output_file,
+            converted_file=converted_file,
+            object_type='TRIGGER',
+            firebird_header=self._dump_header("FIREBIRD TRIGGERS DUMP"),
+            postgres_header=self._dump_header("POSTGRESQL TRIGGERS DUMP (CONVERTED)"),
+            executor=executor,
+            chunksize=chunksize,
+        )
 
     def export_firebird_procedures(self, output_file: str = 'firebird_procedures_dump.sql',
                                    converted_file: str = 'postgres_procedures_dump.sql',
@@ -614,33 +647,16 @@ class DatabaseMigrator:
 
             items.append((proc_name, fb_sql))
 
-        print(f"Transpiling {len(items)} procedures in parallel...")
-        if executor is not None:
-            results = list(executor.map(_transpile_worker, items, chunksize=chunksize))
-        else:
-            with ProcessPoolExecutor() as local_executor:
-                results = list(local_executor.map(_transpile_worker, items, chunksize=chunksize))
-
-        with open(output_file, 'w', encoding='utf-8') as f, open(converted_file, 'w', encoding='utf-8') as conv_f:
-            f.write("-- ==========================================\n")
-            f.write("-- FIREBIRD PROCEDURES DUMP\n")
-            f.write("-- ==========================================\n\n")
-
-            conv_f.write("-- ==========================================\n")
-            conv_f.write("-- POSTGRESQL PROCEDURES DUMP (CONVERTED)\n")
-            conv_f.write("-- ==========================================\n\n")
-
-            for (proc_name, fb_sql), (pg_sql, err) in zip(items, results):
-                f.write(fb_sql)
-                if err is None and pg_sql:
-                    conv_f.write(pg_sql)
-                    conv_f.write('\n\n')
-                else:
-                    print(f"Failed to transpile procedure {proc_name}: {err}")
-                    conv_f.write(f"-- [TRANSPILER FAILED] PROCEDURE {proc_name}\n")
-                    conv_f.write(fb_sql)
-
-        print(f"Exported {len(procedures)} procedures to '{output_file}' and '{converted_file}'")
+        self._export_transpiled_ddl(
+            items,
+            output_file=output_file,
+            converted_file=converted_file,
+            object_type='PROCEDURE',
+            firebird_header=self._dump_header("FIREBIRD PROCEDURES DUMP"),
+            postgres_header=self._dump_header("POSTGRESQL PROCEDURES DUMP (CONVERTED)"),
+            executor=executor,
+            chunksize=chunksize,
+        )
 
     def export_firebird_views(self, output_file: str = 'firebird_views_dump.sql',
                               converted_file: str = 'postgres_views_dump.sql',
@@ -688,42 +704,17 @@ class DatabaseMigrator:
             fb_sql = f'CREATE OR ALTER VIEW "{view_name}"{col_list} AS\n{source}\n\n'
             items.append((view_name, fb_sql))
 
-        print(f"Transpiling {len(items)} views in parallel...")
-        if executor is not None:
-            results = list(executor.map(_transpile_worker, items, chunksize=chunksize))
-        else:
-            with ProcessPoolExecutor() as local_executor:
-                results = list(local_executor.map(_transpile_worker, items, chunksize=chunksize))
-
-        with open(output_file, 'w', encoding='utf-8') as f, open(converted_file, 'w', encoding='utf-8') as conv_f:
-            f.write("-- ==========================================\n")
-            f.write("-- FIREBIRD VIEWS DUMP\n")
-            f.write("-- This file contains the raw SELECT source for manual translation to PostgreSQL views\n")
-            f.write("-- ==========================================\n\n")
-
-            conv_f.write("-- ==========================================\n")
-            conv_f.write("-- POSTGRESQL VIEWS DUMP (CONVERTED)\n")
-            conv_f.write("-- ==========================================\n\n")
-
-            for (view_name, fb_sql), (pg_sql, err) in zip(items, results):
-                f.write(f"-- ----------------------------------------\n")
-                f.write(f"-- View: {view_name}\n")
-                f.write(f"-- ----------------------------------------\n")
-                f.write(fb_sql)
-
-                conv_f.write(f"-- ----------------------------------------\n")
-                conv_f.write(f"-- View: {view_name}\n")
-                conv_f.write(f"-- ----------------------------------------\n")
-
-                if err is None and pg_sql:
-                    conv_f.write(pg_sql)
-                    conv_f.write("\n\n")
-                else:
-                    print(f"Failed to transpile view {view_name}: {err}")
-                    conv_f.write(f"-- [TRANSPILER FAILED] VIEW {view_name}\n")
-                    conv_f.write(fb_sql)
-
-        print(f"Exported {len(views)} views to '{output_file}' and '{converted_file}'")
+        self._export_transpiled_ddl(
+            items,
+            output_file=output_file,
+            converted_file=converted_file,
+            object_type='VIEW',
+            firebird_header=self._dump_header("FIREBIRD VIEWS DUMP"),
+            postgres_header=self._dump_header("POSTGRESQL VIEWS DUMP (CONVERTED)"),
+            executor=executor,
+            chunksize=chunksize,
+            per_item_separator=True,
+        )
 
     def export_all_firebird_ddl(self):
         """
