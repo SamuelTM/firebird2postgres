@@ -88,7 +88,7 @@ class Table:
                 col_def = f'{escaped_name} public."{col.domain_name}"'
             else:
                 # column_type is already a complete type declaration (e.g. VARCHAR(80),
-                # NUMERIC(10,2)) resolved by DatabaseMigrator._resolve_firebird_type
+                # NUMERIC(10,2)) resolved by firebird_types.resolve_firebird_type
                 col_def = f'{escaped_name} {converted_type}'
 
             if col.sequence_name:
