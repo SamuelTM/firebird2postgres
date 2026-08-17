@@ -12,6 +12,8 @@ from typing import List, Optional, Tuple
 import psycopg2
 from dotenv import load_dotenv
 
+from sql_splitter import split_sql_statements as split_sql_content
+
 load_dotenv()
 
 DEFAULT_TARGET_FILES = [
@@ -41,11 +43,8 @@ class ValidationResult:
 
 def split_sql_statements(file_path: str) -> List[SQLStatement]:
     """
-    Parses a PostgreSQL SQL file into individual statements, correctly handling:
-    - Single line comments (--)
-    - Multi-line comments (/* ... */)
-    - Single quotes ('...')
-    - Dollar-quoted strings ($$...$$ or $tag$...$tag$)
+    Parses a PostgreSQL SQL file into individual SQLStatement objects.
+    The low-level splitting (quotes, comments, dollar-quoting) lives in sql_splitter.
     """
     if not os.path.exists(file_path):
         print(f"[WARNING] File '{file_path}' not found. Skipping.")
@@ -55,145 +54,15 @@ def split_sql_statements(file_path: str) -> List[SQLStatement]:
         content = f.read()
 
     statements = []
-    current_stmt = []
-    current_line = 1
-    stmt_start_line = 1
-
-    in_single_quote = False
-    in_line_comment = False
-    in_block_comment = False
-    dollar_tag = None  # Holds the closing tag, e.g. "$$" or "$func$"
-
-    i = 0
-    n = len(content)
-
-    while i < n:
-        ch = content[i]
-        next_ch = content[i + 1] if i + 1 < n else ''
-
-        # Track line numbers
-        if ch == '\n':
-            current_line += 1
-            if in_line_comment:
-                in_line_comment = False
-            current_stmt.append(ch)
-            i += 1
-            continue
-
-        # Handle line comments
-        if in_line_comment:
-            current_stmt.append(ch)
-            i += 1
-            continue
-
-        # Handle block comments
-        if in_block_comment:
-            current_stmt.append(ch)
-            if ch == '*' and next_ch == '/':
-                current_stmt.append(next_ch)
-                in_block_comment = False
-                i += 2
-                continue
-            i += 1
-            continue
-
-        # Handle single quotes
-        if in_single_quote:
-            current_stmt.append(ch)
-            if ch == "'":
-                if next_ch == "'":  # Escaped single quote ''
-                    current_stmt.append(next_ch)
-                    i += 2
-                    continue
-                else:
-                    in_single_quote = False
-            i += 1
-            continue
-
-        # Handle dollar quotes ($$...$$)
-        if dollar_tag is not None:
-            if content.startswith(dollar_tag, i):
-                current_stmt.append(dollar_tag)
-                i += len(dollar_tag)
-                dollar_tag = None
-                continue
-            current_stmt.append(ch)
-            i += 1
-            continue
-
-        # --- OUTSIDE QUOTES AND COMMENTS ---
-
-        # Check start of line comment
-        if ch == '-' and next_ch == '-':
-            in_line_comment = True
-            current_stmt.append(ch)
-            current_stmt.append(next_ch)
-            i += 2
-            continue
-
-        # Check start of block comment
-        if ch == '/' and next_ch == '*':
-            in_block_comment = True
-            current_stmt.append(ch)
-            current_stmt.append(next_ch)
-            i += 2
-            continue
-
-        # Check start of single quote
-        if ch == "'":
-            in_single_quote = True
-            current_stmt.append(ch)
-            i += 1
-            continue
-
-        # Check start of dollar quote ($...$)
-        if ch == '$':
-            match = re.match(r'^\$[a-zA-Z0-9_]*\$', content[i:])
-            if match:
-                dollar_tag = match.group(0)
-                current_stmt.append(dollar_tag)
-                i += len(dollar_tag)
-                continue
-
-        # Check statement delimiter ';'
-        if ch == ';':
-            current_stmt.append(ch)
-            raw_sql = "".join(current_stmt).strip()
-
-            if raw_sql and not all(line.strip().startswith('--') for line in raw_sql.splitlines() if line.strip()):
-                obj_type, obj_name = identify_object(raw_sql)
-                statements.append(
-                    SQLStatement(
-                        file_name=os.path.basename(file_path),
-                        object_type=obj_type,
-                        object_name=obj_name,
-                        sql=raw_sql,
-                        start_line=stmt_start_line
-                    )
-                )
-
-            current_stmt = []
-            stmt_start_line = current_line
-            i += 1
-            continue
-
-        if not current_stmt and not ch.isspace():
-            stmt_start_line = current_line
-
-        current_stmt.append(ch)
-        i += 1
-
-    # Any remaining statement at EOF
-    raw_sql = "".join(current_stmt).strip()
-    if raw_sql and not all(line.strip().startswith('--') for line in raw_sql.splitlines() if line.strip()):
-        obj_type, obj_name = identify_object(raw_sql)
+    for sql, start_line in split_sql_content(content):
+        obj_type, obj_name = identify_object(sql)
         statements.append(
             SQLStatement(
                 file_name=os.path.basename(file_path),
                 object_type=obj_type,
                 object_name=obj_name,
-                sql=raw_sql,
-                start_line=stmt_start_line
+                sql=sql,
+                start_line=start_line
             )
         )
 
@@ -356,13 +225,9 @@ def print_diagnostic_report(results: List[ValidationResult]) -> bool:
             print("  SQL Snippet:")
             for s_line in sql_snippet.splitlines():
                 print(f"    | {s_line}")
-
-        print("\n" + "=" * 80)
-        print(f"💡 TIP: Use the error messages above to add translation rules in 'firebird_visitor.py'.")
-        print("=" * 80)
         return False
     else:
-        print("\n🎉 CONGRATULATIONS! 100% of SQL objects compiled in PostgreSQL without any errors!")
+        print("\nSUCCESS! 100% of SQL objects compiled in PostgreSQL without any errors")
         return True
 
 

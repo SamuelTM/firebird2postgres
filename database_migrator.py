@@ -6,6 +6,7 @@ from concurrent.futures import ProcessPoolExecutor
 
 from database_objects import Table, Column, ForeignKey, UniqueKey, Index, get_postgres_type
 from firebird_visitor import FirebirdToPostgresVisitor
+from sql_splitter import split_sql_statements
 
 
 def _transpile_worker(item: tuple[str, str]) -> tuple[str | None, str | None]:
@@ -866,7 +867,7 @@ class DatabaseMigrator:
     def apply_sql_file(self, file_path: str, continue_on_error: bool = False) -> int:
         """
         Executes a PostgreSQL SQL file against the connected database.
-        Splits statements considering dollar-quoting ($$...$$), comments, and quotes.
+        Statement splitting (quotes, comments, dollar-quoting) lives in sql_splitter.
         Returns the number of successfully executed statements.
         """
         if not os.path.exists(file_path):
@@ -876,111 +877,7 @@ class DatabaseMigrator:
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
 
-        statements = []
-        current_stmt = []
-        in_single_quote = False
-        in_line_comment = False
-        in_block_comment = False
-        dollar_tag = None
-
-        i = 0
-        n = len(content)
-
-        while i < n:
-            ch = content[i]
-            next_ch = content[i + 1] if i + 1 < n else ''
-
-            if ch == '\n':
-                if in_line_comment:
-                    in_line_comment = False
-                current_stmt.append(ch)
-                i += 1
-                continue
-
-            if in_line_comment:
-                current_stmt.append(ch)
-                i += 1
-                continue
-
-            if in_block_comment:
-                current_stmt.append(ch)
-                if ch == '*' and next_ch == '/':
-                    current_stmt.append(next_ch)
-                    in_block_comment = False
-                    i += 2
-                    continue
-                i += 1
-                continue
-
-            if in_single_quote:
-                current_stmt.append(ch)
-                if ch == "'":
-                    if next_ch == "'":
-                        current_stmt.append(next_ch)
-                        i += 2
-                        continue
-                    else:
-                        in_single_quote = False
-                i += 1
-                continue
-
-            if dollar_tag:
-                current_stmt.append(ch)
-                if ch == '$':
-                    sub = content[i:i + len(dollar_tag)]
-                    if sub == dollar_tag:
-                        current_stmt.extend(list(dollar_tag[1:]))
-                        i += len(dollar_tag)
-                        dollar_tag = None
-                        continue
-                i += 1
-                continue
-
-            if ch == '-' and next_ch == '-':
-                in_line_comment = True
-                current_stmt.append(ch)
-                current_stmt.append(next_ch)
-                i += 2
-                continue
-
-            if ch == '/' and next_ch == '*':
-                in_block_comment = True
-                current_stmt.append(ch)
-                current_stmt.append(next_ch)
-                i += 2
-                continue
-
-            if ch == "'":
-                in_single_quote = True
-                current_stmt.append(ch)
-                i += 1
-                continue
-
-            if ch == '$':
-                match = re.match(r'^\$[A-Za-z0-9_]*\$', content[i:])
-                if match:
-                    tag = match.group(0)
-                    dollar_tag = tag
-                    current_stmt.extend(list(tag))
-                    i += len(tag)
-                    continue
-
-            if ch == ';':
-                current_stmt.append(ch)
-                stmt_text = "".join(current_stmt).strip()
-                if stmt_text:
-                    statements.append(stmt_text)
-                current_stmt = []
-                i += 1
-                continue
-
-            current_stmt.append(ch)
-            i += 1
-
-        if current_stmt:
-            stmt_text = "".join(current_stmt).strip()
-            if stmt_text:
-                statements.append(stmt_text)
+        statements = [sql for sql, _ in split_sql_statements(content)]
 
         pg_cur = self.pg_con.cursor()
         success_count = 0
