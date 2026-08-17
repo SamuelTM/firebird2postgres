@@ -35,6 +35,18 @@ def _find_node(ctx: ParserRuleContext | None, node_type: type[T]) -> T | None:
     return None
 
 
+def _is_inside(ctx: ParserRuleContext | None, context_type: type[ParserRuleContext]) -> bool:
+    """
+    Checks whether ctx is enclosed within an ancestor AST node of type context_type.
+    """
+    curr = ctx
+    while curr:
+        if isinstance(curr, context_type):
+            return True
+        curr = getattr(curr, 'parentCtx', None)
+    return False
+
+
 class ASTDialectRewriter(FirebirdParserVisitor):
     """
     Pass 1 Visitor: Operates on AST nodes and rewrites tokens directly in the TokenStreamRewriter.
@@ -56,15 +68,7 @@ class ASTDialectRewriter(FirebirdParserVisitor):
 
     def visitTableview_name(self, ctx: FirebirdParser.Tableview_nameContext):
         # In CREATE VIEW context, quote table names in uppercase on the AST token stream
-        curr = ctx
-        is_in_view = False
-        while curr:
-            if isinstance(curr, FirebirdParser.Create_viewContext):
-                is_in_view = True
-                break
-            curr = getattr(curr, 'parentCtx', None)
-
-        if is_in_view:
+        if _is_inside(ctx, FirebirdParser.Create_viewContext):
             text = ctx.getText()
             if not (text.startswith('"') and text.endswith('"')):
                 self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f'"{text.upper()}"')
@@ -91,15 +95,7 @@ class ASTDialectRewriter(FirebirdParserVisitor):
             return self.visitChildren(ctx)
 
         # In CREATE VIEW context, quote table.column references in uppercase on the AST token stream
-        curr = ctx
-        is_in_view = False
-        while curr:
-            if isinstance(curr, FirebirdParser.Create_viewContext):
-                is_in_view = True
-                break
-            curr = getattr(curr, 'parentCtx', None)
-
-        if is_in_view:
+        if _is_inside(ctx, FirebirdParser.Create_viewContext):
             text = ctx.getText()
             if not (text.startswith('"') and text.endswith('"')):
                 self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f'"{text.upper()}"')
@@ -444,23 +440,59 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
                     comments.append(txt)
         return comments
 
+    def _collect_with_comments(self, child_nodes: list[ParserRuleContext],
+                               start_token_idx: int = 0,
+                               stop_token_idx: int = 0,
+                               indent_comments: bool = False,
+                               ensure_semicolon: bool = False) -> list[str]:
+        """
+        Visits a list of AST child nodes while extracting and preserving hidden-channel
+        comments situated before, between, and after each node.
+        """
+        items = []
+        if not child_nodes:
+            if stop_token_idx >= start_token_idx and start_token_idx > 0:
+                for c in self._get_comments_in_range(start_token_idx, stop_token_idx):
+                    items.append(f"    {c}" if indent_comments else c)
+            return items
+
+        curr_token_idx = start_token_idx if start_token_idx > 0 else (
+            child_nodes[0].start.tokenIndex if child_nodes and child_nodes[0].start else 0
+        )
+
+        for child in child_nodes:
+            if child.start:
+                pre_comments = self._get_comments_in_range(curr_token_idx, child.start.tokenIndex - 1)
+                for c in pre_comments:
+                    items.append(f"    {c}" if indent_comments else c)
+
+            res = self.visit(child)
+            if res:
+                res_str = res.strip()
+                if ensure_semicolon and not res_str.endswith(';'):
+                    res_str += ';'
+                items.append(res_str)
+
+            if child.stop:
+                curr_token_idx = child.stop.tokenIndex + 1
+
+        if stop_token_idx >= curr_token_idx and stop_token_idx > 0:
+            trailing_comments = self._get_comments_in_range(curr_token_idx, stop_token_idx)
+            for c in trailing_comments:
+                items.append(f"    {c}" if indent_comments else c)
+
+        return items
+
+    def _visit_declarations(self, declare_specs: list[ParserRuleContext]) -> str:
+        if not declare_specs:
+            return ""
+        start_idx = declare_specs[0].start.tokenIndex if declare_specs[0].start else 0
+        stop_idx = declare_specs[-1].stop.tokenIndex if declare_specs[-1].stop else 0
+        items = self._collect_with_comments(declare_specs, start_idx, stop_idx, indent_comments=True)
+        return "DECLARE\n" + "\n".join(items) + "\n" if items else ""
+
     def visitTrigger_block(self, ctx: FirebirdParser.Trigger_blockContext):
-        decl_str = ""
-        if ctx.declare_spec():
-            decl_items = []
-            curr_token_idx = ctx.declare_spec(0).start.tokenIndex if ctx.declare_spec(0).start else 0
-            for d in ctx.declare_spec():
-                if d.start:
-                    pre_comments = self._get_comments_in_range(curr_token_idx, d.start.tokenIndex - 1)
-                    for c in pre_comments:
-                        decl_items.append(f"    {c}")
-                res = self.visit(d)
-                if res:
-                    decl_items.append(res)
-                if d.stop:
-                    curr_token_idx = d.stop.tokenIndex + 1
-            if decl_items:
-                decl_str = "DECLARE\n" + "\n".join(decl_items) + "\n"
+        decl_str = self._visit_declarations(ctx.declare_spec()) if ctx.declare_spec() else ""
         body_str = self.visit(ctx.body()) if ctx.body() else ""
         return f"{decl_str}{body_str}"
 
@@ -479,7 +511,6 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
 
     def visitBody(self, ctx: FirebirdParser.BodyContext):
         # A body is usually BEGIN ... END
-        items = []
         stmt_contexts = []
         if ctx.seq_of_statements() and ctx.seq_of_statements().children:
             for child in ctx.seq_of_statements().children:
@@ -488,25 +519,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
 
         start_token_idx = ctx.start.tokenIndex + 1 if ctx.start else 0
         stop_token_idx = ctx.stop.tokenIndex - 1 if ctx.stop else 0
-        curr_token_idx = start_token_idx
-
-        for stmt_ctx in stmt_contexts:
-            if stmt_ctx.start:
-                pre_comments = self._get_comments_in_range(curr_token_idx, stmt_ctx.start.tokenIndex - 1)
-                items.extend(pre_comments)
-
-            stmt_str = self.visit(stmt_ctx)
-            if stmt_str:
-                stmt_str = stmt_str.strip()
-                if not stmt_str.endswith(';'):
-                    stmt_str += ';'
-                items.append(stmt_str)
-
-            if stmt_ctx.stop:
-                curr_token_idx = stmt_ctx.stop.tokenIndex + 1
-
-        trailing_comments = self._get_comments_in_range(curr_token_idx, stop_token_idx)
-        items.extend(trailing_comments)
+        items = self._collect_with_comments(stmt_contexts, start_token_idx, stop_token_idx, ensure_semicolon=True)
 
         inner_code = "\n".join(f"    {s}" for s in items)
         return f"BEGIN\n{inner_code}\nEND;"
@@ -528,22 +541,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         return self.get_raw_text(ctx)
 
     def visitBlock(self, ctx: FirebirdParser.BlockContext):
-        decl_str = ""
-        if ctx.declare_spec():
-            decl_items = []
-            curr_token_idx = ctx.declare_spec(0).start.tokenIndex if ctx.declare_spec(0).start else 0
-            for d in ctx.declare_spec():
-                if d.start:
-                    pre_comments = self._get_comments_in_range(curr_token_idx, d.start.tokenIndex - 1)
-                    for c in pre_comments:
-                        decl_items.append(f"    {c}")
-                res = self.visit(d)
-                if res:
-                    decl_items.append(res)
-                if d.stop:
-                    curr_token_idx = d.stop.tokenIndex + 1
-            if decl_items:
-                decl_str = "DECLARE\n" + "\n".join(decl_items) + "\n"
+        decl_str = self._visit_declarations(ctx.declare_spec()) if ctx.declare_spec() else ""
         body_str = self.visit(ctx.body()) if ctx.body() else ""
         return f"{decl_str}{body_str}"
 
@@ -594,30 +592,10 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         return ctx.getText()
 
     def visitSeq_of_declare_specs(self, ctx: FirebirdParser.Seq_of_declare_specsContext):
-        items = []
         decl_children = [c for c in ctx.children if hasattr(c, 'start') and hasattr(c, 'stop')] if ctx.children else []
-
         start_token_idx = ctx.start.tokenIndex if ctx.start else 0
         stop_token_idx = ctx.stop.tokenIndex if ctx.stop else 0
-        curr_token_idx = start_token_idx
-
-        for child in decl_children:
-            if child.start:
-                pre_comments = self._get_comments_in_range(curr_token_idx, child.start.tokenIndex - 1)
-                for c in pre_comments:
-                    items.append(f"    {c}")
-
-            decl_str = self.visit(child)
-            if decl_str:
-                items.append(decl_str)
-
-            if child.stop:
-                curr_token_idx = child.stop.tokenIndex + 1
-
-        trailing_comments = self._get_comments_in_range(curr_token_idx, stop_token_idx)
-        for c in trailing_comments:
-            items.append(f"    {c}")
-
+        items = self._collect_with_comments(decl_children, start_token_idx, stop_token_idx, indent_comments=True)
         return "\n".join(items)
 
     def visitVariable_declaration(self, ctx: FirebirdParser.Variable_declarationContext):
