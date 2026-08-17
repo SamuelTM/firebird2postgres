@@ -380,11 +380,19 @@ def validate_postgres_ddl(
         target_files = DEFAULT_TARGET_FILES
 
     if pg_connection is None:
-        host = os.getenv('POSTGRES_HOST', 'localhost')
-        port = int(os.getenv('POSTGRES_PORT', 5432))
-        dbname = os.getenv('POSTGRES_DB', 'clini7')
-        user = os.getenv('POSTGRES_USER', 'postgres')
-        password = os.getenv('POSTGRES_PASSWORD', 'Forever5543..')
+        required_env_vars = ['POSTGRES_HOST', 'POSTGRES_PORT', 'POSTGRES_DB',
+                             'POSTGRES_USER', 'POSTGRES_PASSWORD']
+        missing = [var for var in required_env_vars if not os.getenv(var)]
+        if missing:
+            print(f"[FATAL ERROR] Missing required environment variables: {', '.join(missing)}")
+            print("  Set them in your .env file (see .env.example).")
+            return False
+
+        host = os.environ['POSTGRES_HOST']
+        port = int(os.environ['POSTGRES_PORT'])
+        dbname = os.environ['POSTGRES_DB']
+        user = os.environ['POSTGRES_USER']
+        password = os.environ['POSTGRES_PASSWORD']
 
         print(f"\n[INFO] Connecting to PostgreSQL at '{host}:{port}/{dbname}'...")
         try:
