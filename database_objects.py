@@ -1,9 +1,8 @@
 class Column:
-    def __init__(self, name: str, column_type: str, size: int, nullable: bool, default_value: str = None,
+    def __init__(self, name: str, column_type: str, nullable: bool, default_value: str = None,
                  sequence_name: str = None, domain_name: str = None):
         self.name = name
         self.column_type = column_type
-        self.size = size
         self.nullable = nullable
         self.default_value = default_value
         self.sequence_name = sequence_name
@@ -87,9 +86,9 @@ class Table:
                 # Column declared with a user domain: reference it (schema-qualified, lowercase)
                 # to preserve the original semantics and bypass pg_catalog name shadowing
                 col_def = f'{escaped_name} public."{col.domain_name}"'
-            elif 'char' in col.column_type.lower().strip():
-                col_def = f'{escaped_name} {converted_type}({col.size})'
             else:
+                # column_type is already a complete type declaration (e.g. VARCHAR(80),
+                # NUMERIC(10,2)) resolved by DatabaseMigrator._resolve_firebird_type
                 col_def = f'{escaped_name} {converted_type}'
 
             if col.sequence_name:

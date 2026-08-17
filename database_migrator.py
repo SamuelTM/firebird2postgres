@@ -69,6 +69,29 @@ class DatabaseMigrator:
             return 'BLOB SUBTYPE 1' if subtype == 1 else 'BLOB SUBTYPE 0'
         return cls._TYPE_MAP.get(data_type_value)
 
+    @classmethod
+    def _resolve_firebird_type(cls, field_type: int, field_subtype: int = None,
+                               field_length: int = None, field_precision: int = None,
+                               field_scale: int = None) -> str | None:
+        """
+        Resolves the full Firebird type declaration for a field, column or parameter:
+        NUMERIC precision/scale for integer-based numeric subtypes, and length for
+        CHAR/VARCHAR. Returns the base type name otherwise (None if unknown).
+        """
+        type_name = cls._get_firebird_data_type_name(field_type, field_subtype)
+
+        if (field_type in (FirebirdDataType.SMALLINT, FirebirdDataType.INTEGER, FirebirdDataType.BIGINT)
+                and field_subtype is not None and field_subtype > 0):
+            if field_precision:
+                scale = abs(field_scale) if field_scale else 0
+                return f'NUMERIC({field_precision}, {scale})'
+            return 'NUMERIC'
+
+        if field_type in (FirebirdDataType.CHAR, FirebirdDataType.VARCHAR) and field_length:
+            return f'{type_name}({field_length})'
+
+        return type_name
+
     @staticmethod
     def _resolve_pg_domain_name(domain_name: str, relation_names: set[str]) -> str:
         """
@@ -123,21 +146,15 @@ class DatabaseMigrator:
                 column_name = column[0].strip()
                 column_type = column[1]
                 column_subtype = column[2]
-                column_data_type = self._get_firebird_data_type_name(column_type, column_subtype)
-                column_size = int(column[3])
                 nullable = column[4] is None
-                precision = column[5]
-                scale = abs(column[6]) if column[6] is not None else 0
                 column_default = column[7].strip() if column[7] else None
                 domain_default = column[8].strip() if column[8] else None
                 field_source = column[9].strip() if column[9] else None
 
-                if (column_type in [FirebirdDataType.SMALLINT, FirebirdDataType.INTEGER, FirebirdDataType.BIGINT]
-                        and column_subtype is not None and column_subtype > 0):
-                    if precision:
-                        column_data_type = f'NUMERIC({precision}, {scale})'
-                    else:
-                        column_data_type = 'NUMERIC'
+                column_data_type = self._resolve_firebird_type(column_type, column_subtype,
+                                                               field_length=column[3],
+                                                               field_precision=column[5],
+                                                               field_scale=column[6])
 
                 # RDB$FIELD_SOURCE starting with 'RDB$' is an implicit system domain, meaning the
                 # column was declared with a raw type. Anything else is a user-defined domain,
@@ -151,7 +168,7 @@ class DatabaseMigrator:
                     default_value = column_default or domain_default
 
                 table_obj.columns.append(
-                    Column(column_name, column_data_type, column_size, nullable, default_value,
+                    Column(column_name, column_data_type, nullable, default_value,
                            domain_name=domain_name))
 
             foreign_keys_query = f"""
@@ -610,23 +627,10 @@ class DatabaseMigrator:
             for param in params:
                 param_name = param[0].strip() if param[0] else 'UNKNOWN'
                 param_type_flag = param[1]  # 0=input, 1=output
-                field_type = param[3]
-                field_subtype = param[4]
-                field_length = param[5]
-                field_precision = param[6]
-                field_scale = abs(param[7]) if param[7] else 0
 
-                type_name = self._get_firebird_data_type_name(field_type, field_subtype)
+                type_name = self._resolve_firebird_type(param[3], param[4], param[5], param[6], param[7])
                 if type_name is None:
                     type_name = 'VARCHAR(255)'
-
-                if (field_type in (FirebirdDataType.SMALLINT, FirebirdDataType.INTEGER,
-                                   FirebirdDataType.BIGINT) and field_subtype is not None
-                        and field_subtype > 0 and field_precision):
-                    type_name = f'NUMERIC({field_precision}, {field_scale})'
-
-                elif field_type in (FirebirdDataType.CHAR, FirebirdDataType.VARCHAR) and field_length:
-                    type_name = f'{type_name}({field_length})'
 
                 if param_type_flag == 0:
                     input_params.append(f'    {param_name} {type_name}')
@@ -769,30 +773,16 @@ class DatabaseMigrator:
 
             for d in domains:
                 domain_name = d[0].strip() if d[0] else 'UNKNOWN'
-                field_type = d[1]
-                field_subtype = d[2]
-                field_length = d[3]
-                field_precision = d[4]
-                field_scale = abs(d[5]) if d[5] else 0
                 default_source = d[6].strip() if d[6] else None
                 not_null = (d[7] == 1)
                 validation_source = d[8].strip() if d[8] else None
 
-                fb_type_name = self._get_firebird_data_type_name(field_type, field_subtype)
-                if fb_type_name is None:
-                    fb_type_name = 'VARCHAR'
-
-                if (field_type in (FirebirdDataType.SMALLINT, FirebirdDataType.INTEGER,
-                                   FirebirdDataType.BIGINT) and field_subtype is not None
-                        and field_subtype > 0 and field_precision):
-                    fb_full_type = f'NUMERIC({field_precision}, {field_scale})'
-                    pg_type = fb_full_type
-                elif field_type in (FirebirdDataType.CHAR, FirebirdDataType.VARCHAR) and field_length:
-                    fb_full_type = f'{fb_type_name}({field_length})'
-                    pg_type = fb_full_type
-                else:
-                    fb_full_type = fb_type_name
-                    pg_type = get_postgres_type(fb_type_name)
+                fb_full_type = self._resolve_firebird_type(d[1], d[2], d[3], d[4], d[5])
+                if fb_full_type is None:
+                    fb_full_type = 'VARCHAR'
+                # get_postgres_type maps base types (e.g. FLOAT -> REAL) and passes through
+                # parameterized ones (e.g. NUMERIC(10,2), VARCHAR(20)) unchanged
+                pg_type = get_postgres_type(fb_full_type)
 
                 # Firebird DDL
                 fb_ddl = f'CREATE DOMAIN "{domain_name}" AS {fb_full_type}'
