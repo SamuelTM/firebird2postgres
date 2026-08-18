@@ -7,6 +7,27 @@ import psycopg2
 
 load_dotenv()
 
+DUMP_DIR: str = os.getenv('DUMP_DIR', 'dumps')
+
+
+class DumpFiles:
+    TRIGGERS_FB:   str = 'firebird_triggers_dump.sql'
+    TRIGGERS_PG:   str = 'postgres_triggers_dump.sql'
+    PROCEDURES_FB: str = 'firebird_procedures_dump.sql'
+    PROCEDURES_PG: str = 'postgres_procedures_dump.sql'
+    VIEWS_FB:      str = 'firebird_views_dump.sql'
+    VIEWS_PG:      str = 'postgres_views_dump.sql'
+    DOMAINS_FB:    str = 'firebird_domains_dump.sql'
+    DOMAINS_PG:    str = 'postgres_domains_dump.sql'
+
+
+def get_dump_path(filename: str, dump_dir: str = None) -> str:
+    """
+    Returns the resolved path for a SQL dump file inside the configured dump directory.
+    """
+    base_dir = dump_dir or DUMP_DIR
+    return os.path.join(base_dir, filename)
+
 
 def setup_logging(level: str = None, log_file: str = None) -> None:
     """

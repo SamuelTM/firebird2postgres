@@ -43,7 +43,8 @@ class DataMigrator:
                 batch_size = 10000
                 if blob_count > 0:
                     batch_size = max(500, 10000 // (blob_count * 5))
-                    logger.debug(f"Found {blob_count} BLOB column(s) in '{table.name}'. Adjusted batch size to {batch_size}.")
+                    logger.debug(f"Found {blob_count} BLOB column(s) in '{table.name}'. Adjusted batch size to "
+                                 f"{batch_size}.")
 
                 # Explicitly list columns to ensure it perfectly matches the postgres insert order
                 fb_column_names = [f'"{col.name}"' for col in table.columns]
@@ -102,13 +103,15 @@ class DataMigrator:
 
         if failed_tables:
             logger.error("=" * 80)
-            logger.error(f"DATA MIGRATION FAILED: {len(failed_tables)} of {len(table_objs)} table(s) encountered errors:")
+            logger.error(
+                f"DATA MIGRATION FAILED: {len(failed_tables)} of {len(table_objs)} table(s) encountered errors:")
             for tbl_name, err in failed_tables:
                 logger.error(f"  Table '{tbl_name}': {err}")
             logger.error("=" * 80)
             return False
 
         logger.info(
-            f"Data migration completed successfully! Total {total_rows_imported} rows across {successful_tables} tables."
+            f"Data migration completed successfully! Total {total_rows_imported} rows across "
+            f"{successful_tables} tables."
         )
         return True

@@ -1,6 +1,6 @@
 import sys
 import logging
-from config import get_firebird_connection, get_postgres_connection, setup_logging
+from config import get_firebird_connection, get_postgres_connection, get_dump_path, DumpFiles, setup_logging
 from database_migrator import DatabaseMigrator
 
 setup_logging()
@@ -34,7 +34,7 @@ if __name__ == '__main__':
         # STEP 3: Apply Domains in PostgreSQL
         # -------------------------------------------------------------
         logger.info("[STEP 3/7] Applying Domains in PostgreSQL...")
-        migrator.apply_sql_file('postgres_domains_dump.sql')
+        migrator.apply_sql_file(get_dump_path(DumpFiles.DOMAINS_PG))
 
         # -------------------------------------------------------------
         # STEP 4: Create Tables, Sequences, Foreign and Primary Keys schema
@@ -55,14 +55,14 @@ if __name__ == '__main__':
         # STEP 6: Apply Procedures and Views in PostgreSQL
         # -------------------------------------------------------------
         logger.info("[STEP 6/7] Applying Procedures and Views in PostgreSQL...")
-        migrator.apply_sql_file('postgres_procedures_dump.sql')
-        migrator.apply_sql_file('postgres_views_dump.sql')
+        migrator.apply_sql_file(get_dump_path(DumpFiles.PROCEDURES_PG))
+        migrator.apply_sql_file(get_dump_path(DumpFiles.VIEWS_PG))
 
         # -------------------------------------------------------------
         # STEP 7: Apply Triggers in PostgreSQL
         # -------------------------------------------------------------
         logger.info("[STEP 7/7] Applying Triggers in PostgreSQL...")
-        migrator.apply_sql_file('postgres_triggers_dump.sql')
+        migrator.apply_sql_file(get_dump_path(DumpFiles.TRIGGERS_PG))
 
         logger.info("Firebird to PostgreSQL migration completed successfully!")
 

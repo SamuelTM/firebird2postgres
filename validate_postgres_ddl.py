@@ -3,20 +3,19 @@ Validates the DDL syntax of converted PostgreSQL domains, views, functions/proce
 against a live PostgreSQL database without making permanent changes (Dry-Run by default).
 """
 
-import os
 import re
 import sys
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-from config import get_postgres_connection, PostgresConfig
+from config import get_postgres_connection, PostgresConfig, get_dump_path, DumpFiles
 from sql_splitter import split_sql_statements as split_sql_content
 
 DEFAULT_TARGET_FILES = [
-    'postgres_domains_dump.sql',
-    'postgres_views_dump.sql',
-    'postgres_procedures_dump.sql',
-    'postgres_triggers_dump.sql'
+    get_dump_path(DumpFiles.DOMAINS_PG),
+    get_dump_path(DumpFiles.VIEWS_PG),
+    get_dump_path(DumpFiles.PROCEDURES_PG),
+    get_dump_path(DumpFiles.TRIGGERS_PG)
 ]
 
 

@@ -64,31 +64,31 @@ class DatabaseMigrator:
         self._ensure_schema()
         return self.data_migrator.import_data(self.table_objs)
 
-    def export_firebird_triggers(self, output_file: str = 'firebird_triggers_dump.sql',
-                                 converted_file: str = 'postgres_triggers_dump.sql',
+    def export_firebird_triggers(self, output_file: str = None,
+                                 converted_file: str = None,
                                  executor=None, chunksize: int = 4):
         self.ddl_exporter.export_firebird_triggers(output_file, converted_file, executor, chunksize)
 
-    def export_firebird_procedures(self, output_file: str = 'firebird_procedures_dump.sql',
-                                   converted_file: str = 'postgres_procedures_dump.sql',
+    def export_firebird_procedures(self, output_file: str = None,
+                                   converted_file: str = None,
                                    executor=None, chunksize: int = 4):
         self.ddl_exporter.export_firebird_procedures(output_file, converted_file, executor, chunksize)
 
-    def export_firebird_views(self, output_file: str = 'firebird_views_dump.sql',
-                              converted_file: str = 'postgres_views_dump.sql',
+    def export_firebird_views(self, output_file: str = None,
+                              converted_file: str = None,
                               executor=None, chunksize: int = 4):
         self.ddl_exporter.export_firebird_views(output_file, converted_file, executor, chunksize)
 
-    def export_firebird_domains(self, output_file: str = 'firebird_domains_dump.sql',
-                                converted_file: str = 'postgres_domains_dump.sql'):
+    def export_firebird_domains(self, output_file: str = None,
+                                converted_file: str = None):
         self.ddl_exporter.export_firebird_domains(output_file, converted_file)
 
-    def export_all_firebird_ddl(self):
+    def export_all_firebird_ddl(self, output_dir: str = None):
         """
         Exports all Firebird domains, triggers, procedures, and views using a single shared
-        ProcessPoolExecutor.
+        ProcessPoolExecutor to the specified output directory (default configured in config.DUMP_DIR).
         """
-        self.ddl_exporter.export_all_firebird_ddl()
+        self.ddl_exporter.export_all_firebird_ddl(output_dir=output_dir)
 
     def apply_sql_file(self, file_path: str, continue_on_error: bool = False) -> int:
         """

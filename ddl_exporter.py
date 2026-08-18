@@ -1,10 +1,18 @@
+import os
 import logging
 from concurrent.futures import ProcessPoolExecutor
+from config import DUMP_DIR, DumpFiles, get_dump_path
 from database_objects import get_postgres_type
 from firebird_visitor import FirebirdToPostgresVisitor
 from firebird_types import resolve_firebird_type, resolve_pg_domain_name, decode_trigger_type
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_parent_dir(file_path: str):
+    directory = os.path.dirname(file_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
 
 
 def _transpile_worker(item: tuple[str, str]) -> tuple[str | None, str | None]:
@@ -26,6 +34,7 @@ class DdlExporter:
     Extracts Firebird domains, triggers, stored procedures, and views,
     transpiles their DDL in parallel to PostgreSQL, and writes out SQL dump files.
     """
+
 
     def __init__(self, fb_con):
         self.fb_con = fb_con
@@ -57,6 +66,9 @@ class DdlExporter:
             if owns_executor:
                 executor.shutdown()
 
+        _ensure_parent_dir(output_file)
+        _ensure_parent_dir(converted_file)
+
         with open(output_file, 'w', encoding='utf-8') as f, open(converted_file, 'w', encoding='utf-8') as conv_f:
             f.write(firebird_header)
             conv_f.write(postgres_header)
@@ -80,14 +92,16 @@ class DdlExporter:
 
         logger.info(f"Exported {len(items)} {object_type.lower()}s to '{output_file}' and '{converted_file}'")
 
-    def export_firebird_triggers(self, output_file: str = 'firebird_triggers_dump.sql',
-                                 converted_file: str = 'postgres_triggers_dump.sql',
+    def export_firebird_triggers(self, output_file: str = None,
+                                 converted_file: str = None,
                                  executor: ProcessPoolExecutor = None,
                                  chunksize: int = 4):
         """
         Extracts all user-defined triggers from Firebird and saves their source code to a file
         and converted PostgreSQL DDL to another file.
         """
+        out_file = output_file or get_dump_path(DumpFiles.TRIGGERS_FB)
+        conv_file = converted_file or get_dump_path(DumpFiles.TRIGGERS_PG)
         fb_cursor = self.fb_con.cursor()
 
         query = """
@@ -113,8 +127,8 @@ class DdlExporter:
 
         self._export_transpiled_ddl(
             items,
-            output_file=output_file,
-            converted_file=converted_file,
+            output_file=out_file,
+            converted_file=conv_file,
             object_type='TRIGGER',
             firebird_header=self._dump_header("FIREBIRD TRIGGERS DUMP"),
             postgres_header=self._dump_header("POSTGRESQL TRIGGERS DUMP (CONVERTED)"),
@@ -122,14 +136,16 @@ class DdlExporter:
             chunksize=chunksize,
         )
 
-    def export_firebird_procedures(self, output_file: str = 'firebird_procedures_dump.sql',
-                                   converted_file: str = 'postgres_procedures_dump.sql',
+    def export_firebird_procedures(self, output_file: str = None,
+                                   converted_file: str = None,
                                    executor: ProcessPoolExecutor = None,
                                    chunksize: int = 4):
         """
         Extracts all user-defined stored procedures from Firebird and saves their source code to a file
         and converted PostgreSQL DDL to another file.
         """
+        out_file = output_file or get_dump_path(DumpFiles.PROCEDURES_FB)
+        conv_file = converted_file or get_dump_path(DumpFiles.PROCEDURES_PG)
         fb_cursor = self.fb_con.cursor()
 
         query = """
@@ -197,8 +213,8 @@ class DdlExporter:
 
         self._export_transpiled_ddl(
             items,
-            output_file=output_file,
-            converted_file=converted_file,
+            output_file=out_file,
+            converted_file=conv_file,
             object_type='PROCEDURE',
             firebird_header=self._dump_header("FIREBIRD PROCEDURES DUMP"),
             postgres_header=self._dump_header("POSTGRESQL PROCEDURES DUMP (CONVERTED)"),
@@ -206,14 +222,16 @@ class DdlExporter:
             chunksize=chunksize,
         )
 
-    def export_firebird_views(self, output_file: str = 'firebird_views_dump.sql',
-                              converted_file: str = 'postgres_views_dump.sql',
+    def export_firebird_views(self, output_file: str = None,
+                              converted_file: str = None,
                               executor: ProcessPoolExecutor = None,
                               chunksize: int = 4):
         """
         Extracts all user-defined views from Firebird and saves their source code to a file
         and converted PostgreSQL DDL to another file.
         """
+        out_file = output_file or get_dump_path(DumpFiles.VIEWS_FB)
+        conv_file = converted_file or get_dump_path(DumpFiles.VIEWS_PG)
         fb_cursor = self.fb_con.cursor()
 
         query = """
@@ -255,8 +273,8 @@ class DdlExporter:
 
         self._export_transpiled_ddl(
             items,
-            output_file=output_file,
-            converted_file=converted_file,
+            output_file=out_file,
+            converted_file=conv_file,
             object_type='VIEW',
             firebird_header=self._dump_header("FIREBIRD VIEWS DUMP"),
             postgres_header=self._dump_header("POSTGRESQL VIEWS DUMP (CONVERTED)"),
@@ -265,23 +283,47 @@ class DdlExporter:
             per_item_separator=True,
         )
 
-    def export_all_firebird_ddl(self):
+    def export_all_firebird_ddl(self, output_dir: str = None):
         """
         Exports all Firebird domains, triggers, procedures, and views using a single shared
-        ProcessPoolExecutor, avoiding the overhead of repeated process spawns and parser imports.
+        ProcessPoolExecutor, saving all dump files to the specified output directory.
         """
-        self.export_firebird_domains()
-        with ProcessPoolExecutor() as executor:
-            self.export_firebird_triggers(executor=executor)
-            self.export_firebird_procedures(executor=executor)
-            self.export_firebird_views(executor=executor)
+        target_dir = output_dir or DUMP_DIR
+        os.makedirs(target_dir, exist_ok=True)
 
-    def export_firebird_domains(self, output_file: str = 'firebird_domains_dump.sql',
-                                converted_file: str = 'postgres_domains_dump.sql'):
+        def _path(filename: str) -> str:
+            return get_dump_path(filename, target_dir)
+
+        self.export_firebird_domains(
+            output_file=_path(DumpFiles.DOMAINS_FB),
+            converted_file=_path(DumpFiles.DOMAINS_PG)
+        )
+        with ProcessPoolExecutor() as executor:
+            self.export_firebird_triggers(
+                output_file=_path(DumpFiles.TRIGGERS_FB),
+                converted_file=_path(DumpFiles.TRIGGERS_PG),
+                executor=executor
+            )
+            self.export_firebird_procedures(
+                output_file=_path(DumpFiles.PROCEDURES_FB),
+                converted_file=_path(DumpFiles.PROCEDURES_PG),
+                executor=executor
+            )
+            self.export_firebird_views(
+                output_file=_path(DumpFiles.VIEWS_FB),
+                converted_file=_path(DumpFiles.VIEWS_PG),
+                executor=executor
+            )
+
+    def export_firebird_domains(self, output_file: str = None,
+                                converted_file: str = None):
         """
         Extracts all user-defined domains from Firebird and saves their source code to a file
         and the PostgreSQL converted CREATE DOMAIN definitions.
         """
+        out_file = output_file or get_dump_path(DumpFiles.DOMAINS_FB)
+        conv_file = converted_file or get_dump_path(DumpFiles.DOMAINS_PG)
+
         fb_cursor = self.fb_con.cursor()
 
         query = """
@@ -307,7 +349,10 @@ class DdlExporter:
         fb_cursor.execute('SELECT RDB$RELATION_NAME FROM RDB$RELATIONS WHERE RDB$SYSTEM_FLAG = 0;')
         relation_names = {r[0].strip() for r in fb_cursor.fetchall() if r[0]}
 
-        with open(output_file, 'w', encoding='utf-8') as f, open(converted_file, 'w', encoding='utf-8') as conv_f:
+        _ensure_parent_dir(out_file)
+        _ensure_parent_dir(conv_file)
+
+        with open(out_file, 'w', encoding='utf-8') as f, open(conv_file, 'w', encoding='utf-8') as conv_f:
             f.write("-- ==========================================\n")
             f.write("-- FIREBIRD DOMAINS DUMP\n")
             f.write("-- ==========================================\n\n")
@@ -388,4 +433,4 @@ class DdlExporter:
                 )
                 conv_f.write(pg_ddl)
 
-        logger.info(f"Exported {len(domains)} domains to '{output_file}' and '{converted_file}'")
+        logger.info(f"Exported {len(domains)} domains to '{out_file}' and '{conv_file}'")
