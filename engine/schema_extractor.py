@@ -54,7 +54,7 @@ class SchemaExtractor:
         """
         Extracts all columns for a given table, resolving types and domain mappings.
         """
-        cursor.execute(f"""
+        cursor.execute("""
             SELECT rf.RDB$FIELD_NAME, f.RDB$FIELD_TYPE, f.RDB$FIELD_SUB_TYPE, f.RDB$FIELD_LENGTH, 
                    COALESCE(rf.RDB$NULL_FLAG, f.RDB$NULL_FLAG),
                    f.RDB$FIELD_PRECISION, f.RDB$FIELD_SCALE,
@@ -62,9 +62,9 @@ class SchemaExtractor:
                    rf.RDB$FIELD_SOURCE
             FROM RDB$RELATION_FIELDS rf
             JOIN RDB$FIELDS f ON rf.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
-            WHERE rf.RDB$RELATION_NAME = '{table_name}'
+            WHERE rf.RDB$RELATION_NAME = ?
             ORDER BY rf.RDB$FIELD_POSITION;
-        """)
+        """, (table_name,))
         columns = []
         for column in cursor.fetchall():
             column_name = column[0].strip()
@@ -111,7 +111,7 @@ class SchemaExtractor:
         """
         Extracts foreign key definitions for a given table.
         """
-        cursor.execute(f"""
+        cursor.execute("""
             SELECT 
                 rc.RDB$CONSTRAINT_NAME AS foreign_key_name,
                 si.RDB$FIELD_POSITION AS column_position,
@@ -125,9 +125,9 @@ class SchemaExtractor:
             JOIN RDB$RELATION_CONSTRAINTS rs ON refc.RDB$CONST_NAME_UQ = rs.RDB$CONSTRAINT_NAME
             JOIN RDB$INDEX_SEGMENTS rsi ON rs.RDB$INDEX_NAME = rsi.RDB$INDEX_NAME
             WHERE rc.RDB$CONSTRAINT_TYPE = 'FOREIGN KEY'
-              AND rc.RDB$RELATION_NAME = '{table_name}'
+              AND rc.RDB$RELATION_NAME = ?
             ORDER BY foreign_key_name, column_position;
-        """)
+        """, (table_name,))
         foreign_keys = []
         for row in cursor.fetchall():
             foreign_keys.append(
@@ -147,7 +147,7 @@ class SchemaExtractor:
         """
         Extracts primary and unique key constraints for a given table.
         """
-        cursor.execute(f"""
+        cursor.execute("""
             SELECT 
                 rc.RDB$CONSTRAINT_NAME AS constraint_name,
                 si.RDB$FIELD_NAME AS column_name,
@@ -155,8 +155,8 @@ class SchemaExtractor:
             FROM RDB$RELATION_CONSTRAINTS rc
             JOIN RDB$INDEX_SEGMENTS si ON rc.RDB$INDEX_NAME = si.RDB$INDEX_NAME
             WHERE rc.RDB$CONSTRAINT_TYPE IN ('UNIQUE', 'PRIMARY KEY')
-              AND rc.RDB$RELATION_NAME = '{table_name}';
-        """)
+              AND rc.RDB$RELATION_NAME = ?;
+        """, (table_name,))
         unique_keys = []
         for row in cursor.fetchall():
             unique_key_column_name = row[1].strip()
@@ -175,7 +175,7 @@ class SchemaExtractor:
         """
         Extracts user-defined secondary indexes for a given table (excluding PK/UQ indexes).
         """
-        cursor.execute(f"""
+        cursor.execute("""
             SELECT 
                 i.RDB$INDEX_NAME AS index_name,
                 i.RDB$UNIQUE_FLAG AS is_unique,
@@ -184,7 +184,7 @@ class SchemaExtractor:
                 seg.RDB$FIELD_POSITION AS column_position
             FROM RDB$INDICES i
             JOIN RDB$INDEX_SEGMENTS seg ON i.RDB$INDEX_NAME = seg.RDB$INDEX_NAME
-            WHERE i.RDB$RELATION_NAME = '{table_name}'
+            WHERE i.RDB$RELATION_NAME = ?
               AND i.RDB$INDEX_NAME NOT IN (
                   SELECT RDB$INDEX_NAME 
                   FROM RDB$RELATION_CONSTRAINTS 
@@ -192,7 +192,7 @@ class SchemaExtractor:
                     AND RDB$INDEX_NAME IS NOT NULL
               )
             ORDER BY i.RDB$INDEX_NAME, seg.RDB$FIELD_POSITION;
-        """)
+        """, (table_name,))
         indexes = []
         for row in cursor.fetchall():
             indexes.append(

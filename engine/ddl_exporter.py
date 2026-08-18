@@ -184,7 +184,7 @@ class DdlExporter:
 
     @staticmethod
     def _fetch_procedure_parameters(cursor, proc_name: str) -> tuple[list[str], list[str]]:
-        params_query = f"""
+        params_query = """
             SELECT
                 pp.RDB$PARAMETER_NAME,
                 pp.RDB$PARAMETER_TYPE,
@@ -196,10 +196,10 @@ class DdlExporter:
                 f.RDB$FIELD_SCALE
             FROM RDB$PROCEDURE_PARAMETERS pp
             JOIN RDB$FIELDS f ON pp.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
-            WHERE pp.RDB$PROCEDURE_NAME = '{proc_name}'
+            WHERE pp.RDB$PROCEDURE_NAME = ?
             ORDER BY pp.RDB$PARAMETER_TYPE, pp.RDB$PARAMETER_NUMBER;
         """
-        cursor.execute(params_query)
+        cursor.execute(params_query, (proc_name,))
         params = cursor.fetchall()
 
         input_params = []
@@ -289,13 +289,13 @@ class DdlExporter:
 
     @staticmethod
     def _fetch_view_columns(cursor, view_name: str) -> list[str]:
-        columns_query = f"""
+        columns_query = """
             SELECT RDB$FIELD_NAME 
             FROM RDB$RELATION_FIELDS 
-            WHERE RDB$RELATION_NAME = '{view_name}' 
+            WHERE RDB$RELATION_NAME = ?
             ORDER BY RDB$FIELD_POSITION;
         """
-        cursor.execute(columns_query)
+        cursor.execute(columns_query, (view_name,))
         return [f'"{col[0].strip()}"' for col in cursor.fetchall() if col[0]]
 
     @staticmethod
