@@ -97,26 +97,34 @@ class SchemaMigrator:
         logger.info(f"Creating constraints and indexes for {len(table_objs)} tables in PostgreSQL...")
         cursor = self.pg_con.cursor()
 
-        for table in table_objs:
-            uniq_query = table.get_unique_keys_query()
-            if uniq_query:
-                logger.debug(uniq_query)
-                cursor.execute(uniq_query)
+        cursor.execute("SET synchronous_commit = OFF;")
+        try:
+            for table in table_objs:
+                uniq_query = table.get_unique_keys_query()
+                if uniq_query:
+                    logger.debug(uniq_query)
+                    cursor.execute(uniq_query)
 
-        for table in table_objs:
-            for idx_query in table.get_index_queries():
-                logger.debug(idx_query)
-                cursor.execute(idx_query)
+            for table in table_objs:
+                for idx_query in table.get_index_queries():
+                    logger.debug(idx_query)
+                    cursor.execute(idx_query)
 
-        for table in table_objs:
-            fk_query = table.get_foreign_keys_query()
-            if fk_query:
-                logger.debug(fk_query)
-                cursor.execute(fk_query)
+            for table in table_objs:
+                fk_query = table.get_foreign_keys_query()
+                if fk_query:
+                    logger.debug(fk_query)
+                    cursor.execute(fk_query)
 
-        logger.info("Saving constraint and index transactions...")
-        self.pg_con.commit()
-        logger.info("Constraints (PK, UK, FK) and indexes created successfully.")
+            logger.info("Saving constraint and index transactions...")
+            self.pg_con.commit()
+            logger.info("Constraints (PK, UK, FK) and indexes created successfully.")
+        finally:
+            try:
+                cursor.execute("RESET synchronous_commit;")
+                self.pg_con.commit()
+            except Exception:
+                pass
 
     def migrate_schema(self, table_objs: list[Table]):
         """
