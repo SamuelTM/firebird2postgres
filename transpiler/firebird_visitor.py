@@ -45,6 +45,26 @@ def _is_inside(ctx: ParserRuleContext | None, context_type: type[ParserRuleConte
     return False
 
 
+_EX_PATTERN = re.compile(
+    r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|"  # Group 1: strings / comments
+    r"(\bEXCEPTION\s+([a-zA-Z0-9_$]+)\s+('(?:''|[^'])*')\s*;)",  # Group 2, 3, 4: EXCEPTION with msg
+    flags=re.IGNORECASE
+)
+
+_OLD_NEW_PATTERN = re.compile(
+    r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|"  # Group 1: string literals and comments (preserve untouched)
+    r"(\b(old|new)\.;?\s*\n\s*([a-zA-Z0-9_]+)\b)|"  # Group 2, 3, 4: split 'old.; \n col' recovery
+    r"(\b(old|new)\.([a-zA-Z0-9_]+)\b)",  # Group 5, 6, 7: unquoted 'old.col'
+    flags=re.IGNORECASE | re.DOTALL
+)
+
+_COLON_PATTERN = re.compile(
+    r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|"  # Group 1: strings / comments
+    r"(\b(RETURNING|INTO|FROM|WHERE|AND|OR|SELECT|VALUES|SET|THEN|ELSE|DO|IF|IN|NOT|AS|JOIN|ON):([a-zA-Z0-9_$]+))",
+    flags=re.IGNORECASE
+)
+
+
 class ASTDialectRewriter(FirebirdParserVisitor):
     """
     Pass 1 Visitor: Operates on AST nodes and rewrites tokens directly in the TokenStreamRewriter.
@@ -62,15 +82,6 @@ class ASTDialectRewriter(FirebirdParserVisitor):
         raw = ctx.getText()
         if raw.startswith(':'):
             self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, raw.lstrip(':'))
-        return self.visitChildren(ctx)
-
-    def visitTableview_name(self, ctx: FirebirdParser.Tableview_nameContext):
-        # In CREATE VIEW context, quote table names in uppercase on the AST token stream
-        if _is_inside(ctx, FirebirdParser.Create_viewContext):
-            text = ctx.getText()
-            if not (text.startswith('"') and text.endswith('"')):
-                self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f'"{text.upper()}"')
-
         return self.visitChildren(ctx)
 
     def visitGeneral_element_part(self, ctx: FirebirdParser.General_element_partContext):
@@ -228,14 +239,9 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
            This function temporarily wraps record names in double quotes ("old".field),
            while ensuring string literals ('...') and comments (-- ... / /* ... */) remain 100% untouched.
            These temporary quotes are cleanly stripped in `_clean_sql` after parsing.
+        3. Normalizes keywords directly attached to colon bind variables without whitespace (e.g. `into:vid` -> `into :vid`).
         """
         # Step 1: Normalize custom exception messages (e.g. EXCEPTION EX_ERR 'custom msg';)
-        ex_pattern = re.compile(
-            r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|"  # Group 1: strings / comments
-            r"(\bEXCEPTION\s+([a-zA-Z0-9_$]+)\s+('(?:''|[^'])*')\s*;)",  # Group 2, 3, 4: EXCEPTION with msg
-            flags=re.IGNORECASE
-        )
-
         def ex_repl(match):
             if match.group(1):
                 return match.group(1)
@@ -243,16 +249,9 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
             ex_msg = match.group(4)
             return f"/* __FB_EX_MSG__:{ex_name}:{ex_msg} */ EXCEPTION {ex_name};"
 
-        sql = ex_pattern.sub(ex_repl, sql)
+        sql = _EX_PATTERN.sub(ex_repl, sql)
 
         # Step 2: Normalize OLD / NEW trigger records
-        pattern = re.compile(
-            r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|"  # Group 1: string literals and comments (preserve untouched)
-            r"(\b(old|new)\.;?\s*\n\s*([a-zA-Z0-9_]+)\b)|"  # Group 2, 3, 4: split 'old.; \n col' recovery
-            r"(\b(old|new)\.([a-zA-Z0-9_]+)\b)",  # Group 5, 6, 7: unquoted 'old.col'
-            flags=re.IGNORECASE | re.DOTALL
-        )
-
         def repl(match):
             if match.group(1):
                 return match.group(1)
@@ -263,7 +262,15 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
                 return f'"{match.group(6)}".{match.group(7)}'
             return match.group(0)
 
-        return pattern.sub(repl, sql)
+        sql = _OLD_NEW_PATTERN.sub(repl, sql)
+
+        # Step 3: Normalize keyword attached directly to a colon variable without space (e.g. into:vid -> into :vid)
+        def colon_repl(match):
+            if match.group(1):
+                return match.group(1)
+            return f"{match.group(3)} :{match.group(4)}"
+
+        return _COLON_PATTERN.sub(colon_repl, sql)
 
     @classmethod
     def transpile(cls, firebird_sql_string: str) -> str:
@@ -461,8 +468,8 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         func_name = f"{trigger_name}_func"
 
         func_sql = f'CREATE OR REPLACE FUNCTION "{func_name}"() RETURNS TRIGGER AS $$\n{body_str}\n$$ LANGUAGE plpgsql;'
-        trigger_sql = (f'DROP TRIGGER IF EXISTS "{trigger_name}" ON "{table_name}";\n'
-                       f'CREATE TRIGGER "{trigger_name}" {timing} {events} ON "{table_name}" '
+        trigger_sql = (f'DROP TRIGGER IF EXISTS "{trigger_name}" ON "{table_name.lower()}";\n'
+                       f'CREATE TRIGGER "{trigger_name}" {timing} {events} ON "{table_name.lower()}" '
                        f'FOR EACH ROW EXECUTE FUNCTION "{func_name}"();')
 
         return f"{func_sql}\n{trigger_sql}"

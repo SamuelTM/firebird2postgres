@@ -76,15 +76,15 @@ class TestTableDdlGenerators(unittest.TestCase):
         # Sequences
         seqs = table.get_sequence_queries()
         self.assertEqual(len(seqs), 1)
-        self.assertEqual(seqs[0], 'CREATE SEQUENCE "GEN_CLIENTES_ID";')
+        self.assertEqual(seqs[0], 'CREATE SEQUENCE "gen_clientes_id";')
 
         # Create Table
         create_sql = table.get_create_table_query()
-        self.assertIn('CREATE TABLE "CLIENTES"', create_sql)
-        self.assertIn('"ID" INTEGER DEFAULT nextval(\'"GEN_CLIENTES_ID"\') NOT NULL', create_sql)
-        self.assertIn('"NOME" VARCHAR(100) NOT NULL', create_sql)
-        self.assertIn('"OBS" TEXT \'N/A\'', create_sql)
-        self.assertIn('"STATUS" public."dom_status" NOT NULL', create_sql)
+        self.assertIn('CREATE TABLE "clientes"', create_sql)
+        self.assertIn('"id" INTEGER DEFAULT nextval(\'"gen_clientes_id"\') NOT NULL', create_sql)
+        self.assertIn('"nome" VARCHAR(100) NOT NULL', create_sql)
+        self.assertIn('"obs" TEXT \'N/A\'', create_sql)
+        self.assertIn('"status" public."dom_status" NOT NULL', create_sql)
 
     def test_table_unique_keys_ddl(self):
         table = Table('USERS')
@@ -94,7 +94,7 @@ class TestTableDdlGenerators(unittest.TestCase):
         uq_sql = table.get_unique_keys_query()
         self.assertIsNotNone(uq_sql)
         self.assertEqual(
-            'ALTER TABLE "USERS" ADD CONSTRAINT "PK_USERS" PRIMARY KEY ("ID"), ADD CONSTRAINT "UQ_USERS_EMAIL" UNIQUE ("EMAIL");',
+            'ALTER TABLE "users" ADD CONSTRAINT "pk_users" PRIMARY KEY ("id"), ADD CONSTRAINT "uq_users_email" UNIQUE ("email");',
             uq_sql
         )
 
@@ -106,7 +106,7 @@ class TestTableDdlGenerators(unittest.TestCase):
         uq_sql = table.get_unique_keys_query()
         self.assertIsNotNone(uq_sql)
         self.assertEqual(
-            'ALTER TABLE "USER_ROLES" ADD CONSTRAINT "PK_USER_ROLES" PRIMARY KEY ("ROLE_ID", "USER_ID");',
+            'ALTER TABLE "user_roles" ADD CONSTRAINT "pk_user_roles" PRIMARY KEY ("role_id", "user_id");',
             uq_sql
         )
 
@@ -126,7 +126,7 @@ class TestTableDdlGenerators(unittest.TestCase):
         fk_sql = table.get_foreign_keys_query()
         self.assertIsNotNone(fk_sql)
         self.assertEqual(
-            'ALTER TABLE "ORDERS" ADD CONSTRAINT "FK_ORDERS_CLIENTE" FOREIGN KEY ("CLIENTE_ID") REFERENCES "CLIENTES"("ID");',
+            'ALTER TABLE "orders" ADD CONSTRAINT "fk_orders_cliente" FOREIGN KEY ("cliente_id") REFERENCES "clientes"("id");',
             fk_sql
         )
 
@@ -156,7 +156,7 @@ class TestTableDdlGenerators(unittest.TestCase):
         fk_sql = table.get_foreign_keys_query()
         self.assertIsNotNone(fk_sql)
         self.assertEqual(
-            'ALTER TABLE "ORDER_ITEMS" ADD CONSTRAINT "FK_ORDER_ITEMS_ORDER" FOREIGN KEY ("COMPANY_ID", "ORDER_ID") REFERENCES "ORDERS"("COMPANY_ID", "ID");',
+            'ALTER TABLE "order_items" ADD CONSTRAINT "fk_order_items_order" FOREIGN KEY ("company_id", "order_id") REFERENCES "orders"("company_id", "id");',
             fk_sql
         )
 
@@ -183,8 +183,8 @@ class TestTableDdlGenerators(unittest.TestCase):
 
         idx_queries = table.get_index_queries()
         self.assertEqual(len(idx_queries), 2)
-        self.assertIn('CREATE INDEX "IDX_PRODUCTS_NAME" ON "PRODUCTS" ("NAME");', idx_queries)
-        self.assertIn('CREATE UNIQUE INDEX "IDX_PRODUCTS_SKU" ON "PRODUCTS" ("SKU");', idx_queries)
+        self.assertIn('CREATE INDEX "idx_products_name" ON "products" ("name");', idx_queries)
+        self.assertIn('CREATE UNIQUE INDEX "idx_products_sku" ON "products" ("sku");', idx_queries)
 
     def test_table_composite_indexes_ddl(self):
         table = Table('PRODUCTS')
@@ -210,7 +210,7 @@ class TestTableDdlGenerators(unittest.TestCase):
         idx_queries = table.get_index_queries()
         self.assertEqual(len(idx_queries), 1)
         self.assertEqual(
-            'CREATE INDEX "IDX_PRODUCTS_CAT_NAME" ON "PRODUCTS" ("CATEGORY_ID", "NAME");',
+            'CREATE INDEX "idx_products_cat_name" ON "products" ("category_id", "name");',
             idx_queries[0]
         )
 
@@ -238,7 +238,7 @@ class TestTableDdlGenerators(unittest.TestCase):
         idx_queries = table.get_index_queries()
         self.assertEqual(len(idx_queries), 1)
         self.assertEqual(
-            'CREATE INDEX "IDX_PRODUCTS_ACTIVE" ON "PRODUCTS" ("NAME");',
+            'CREATE INDEX "idx_products_active" ON "products" ("name");',
             idx_queries[0]
         )
 

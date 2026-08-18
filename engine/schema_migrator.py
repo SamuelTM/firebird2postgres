@@ -21,14 +21,14 @@ class SchemaMigrator:
         tables being (re)created reference them.
         """
         for table in table_objs:
-            drop_query = f'DROP TABLE IF EXISTS "{table.name}" CASCADE;'
+            drop_query = f'DROP TABLE IF EXISTS "{table.name.lower()}" CASCADE;'
             logger.debug(drop_query)
             cursor.execute(drop_query)
 
         for table in table_objs:
             for col in table.columns:
                 if col.sequence_name:
-                    drop_seq_query = f'DROP SEQUENCE IF EXISTS "{col.sequence_name}" CASCADE;'
+                    drop_seq_query = f'DROP SEQUENCE IF EXISTS "{col.sequence_name.lower()}" CASCADE;'
                     logger.debug(drop_seq_query)
                     cursor.execute(drop_seq_query)
 

@@ -74,7 +74,8 @@ def resolve_pg_domain_name(domain_name: str, relation_names: set[str]) -> str:
     relation, the domain is renamed with a '_dom' suffix.
     """
     pg_name = domain_name.lower()
-    while pg_name in relation_names:
+    lower_relations = {r.lower() for r in relation_names}
+    while pg_name in lower_relations:
         pg_name = f'{pg_name}_dom'
     return pg_name
 

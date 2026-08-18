@@ -27,8 +27,8 @@ class DataMigrator:
 
         logger.info("Disabling triggers and clearing existing table data for a clean import...")
         for table in table_objs:
-            pg_cur.execute(f'ALTER TABLE "{table.name}" DISABLE TRIGGER ALL;')
-            pg_cur.execute(f'TRUNCATE TABLE "{table.name}" CASCADE;')
+            pg_cur.execute(f'ALTER TABLE "{table.name.lower()}" DISABLE TRIGGER ALL;')
+            pg_cur.execute(f'TRUNCATE TABLE "{table.name.lower()}" CASCADE;')
         self.pg_con.commit()
 
         failed_tables: list[tuple[str, str]] = []
@@ -50,9 +50,12 @@ class DataMigrator:
                 fb_column_names = [f'"{col.name}"' for col in table.columns]
                 fb_columns_str = ", ".join(fb_column_names)
 
+                pg_column_names = [f'"{col.name.lower()}"' for col in table.columns]
+                pg_columns_str = ", ".join(pg_column_names)
+
                 fb_cur.execute(f'SELECT {fb_columns_str} FROM "{table.name}"')
 
-                insert_query = f'INSERT INTO "{table.name}" ({fb_columns_str}) VALUES %s'
+                insert_query = f'INSERT INTO "{table.name.lower()}" ({pg_columns_str}) VALUES %s'
 
                 total_rows = 0
                 while True:
@@ -86,7 +89,7 @@ class DataMigrator:
 
         logger.info("Re-enabling triggers in PostgreSQL...")
         for table in table_objs:
-            pg_cur.execute(f'ALTER TABLE "{table.name}" ENABLE TRIGGER ALL;')
+            pg_cur.execute(f'ALTER TABLE "{table.name.lower()}" ENABLE TRIGGER ALL;')
         self.pg_con.commit()
 
         logger.info("Synchronizing sequences...")
@@ -94,8 +97,8 @@ class DataMigrator:
             for col in table.columns:
                 if col.sequence_name:
                     sync_query = f"""
-                        SELECT setval('"{col.sequence_name}"', COALESCE(MAX("{col.name}"), 1))
-                        FROM "{table.name}";
+                        SELECT setval('"{col.sequence_name.lower()}"', COALESCE(MAX("{col.name.lower()}"), 1))
+                        FROM "{table.name.lower()}";
                     """
                     logger.debug(sync_query.strip())
                     pg_cur.execute(sync_query)

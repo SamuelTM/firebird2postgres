@@ -11,7 +11,7 @@ class TestTranspilerViews(unittest.TestCase):
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
         self.assertIn('DROP VIEW IF EXISTS "VW_CLIENTES_ATIVOS" CASCADE;', pg_sql)
         self.assertIn('CREATE VIEW "VW_CLIENTES_ATIVOS" (ID, NOME) AS SELECT', pg_sql)
-        self.assertIn('FROM "CLIENTES" C', pg_sql)
+        self.assertIn('FROM CLIENTES C', pg_sql)
 
     def test_view_with_joins(self):
         fb_sql = """
@@ -23,7 +23,7 @@ class TestTranspilerViews(unittest.TestCase):
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
         self.assertIn('DROP VIEW IF EXISTS "VW_PEDIDOS_CLIENTES" CASCADE;', pg_sql)
         self.assertIn('CREATE VIEW "VW_PEDIDOS_CLIENTES" AS SELECT', pg_sql)
-        self.assertIn('JOIN "CLIENTES" C', pg_sql)
+        self.assertIn('JOIN CLIENTES C', pg_sql)
 
     def test_view_with_column_expressions_and_aliases(self):
         fb_sql = """
@@ -36,4 +36,4 @@ class TestTranspilerViews(unittest.TestCase):
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
         self.assertIn('DROP VIEW IF EXISTS "VW_RESUMO_FINANCEIRO" CASCADE;', pg_sql)
         self.assertIn('CREATE VIEW "VW_RESUMO_FINANCEIRO" AS SELECT', pg_sql)
-        self.assertIn('LEFT JOIN "PEDIDOS" P', pg_sql)
+        self.assertIn('LEFT JOIN PEDIDOS P', pg_sql)

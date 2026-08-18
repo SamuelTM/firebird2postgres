@@ -75,18 +75,18 @@ class Table:
         queries = []
         for col in self.columns:
             if col.sequence_name:
-                queries.append(f'CREATE SEQUENCE "{col.sequence_name}";')
+                queries.append(f'CREATE SEQUENCE "{col.sequence_name.lower()}";')
         return queries
 
     def get_create_table_query(self) -> str:
         """
         Returns the single CREATE TABLE statement with column definitions and constraints.
         """
-        query = f'CREATE TABLE "{self.name}" ('
+        query = f'CREATE TABLE "{self.name.lower()}" ('
 
         for i, col in enumerate(self.columns):
             converted_type = get_postgres_type(col.column_type)
-            escaped_name = f'"{col.name}"'
+            escaped_name = f'"{col.name.lower()}"'
 
             if col.domain_name:
                 # Column declared with a user domain: reference it (schema-qualified, lowercase)
@@ -98,7 +98,7 @@ class Table:
                 col_def = f'{escaped_name} {converted_type}'
 
             if col.sequence_name:
-                col_def += f" DEFAULT nextval('\"{col.sequence_name}\"')"
+                col_def += f" DEFAULT nextval('\"{col.sequence_name.lower()}\"')"
             elif col.default_value:
                 col_def += f' {col.default_value}'
 
@@ -130,7 +130,7 @@ class Table:
             else:
                 foreign_keys_grouped_by_name[foreign_key.key_name].append(foreign_key)
 
-        query = f'ALTER TABLE "{self.name}" ADD '
+        query = f'ALTER TABLE "{self.name.lower()}" ADD '
 
         for foreign_key_index, foreign_key_name in enumerate(foreign_keys_grouped_by_name):
             foreign_keys = foreign_keys_grouped_by_name[foreign_key_name]
@@ -147,15 +147,15 @@ class Table:
                 local_columns = [x[0] for x in ordered_pairs]
                 referenced_columns = [x[1] for x in ordered_pairs]
 
-                local_columns_str = ", ".join([f'"{item}"' for item in local_columns])
-                referenced_columns_str = ", ".join([f'"{item}"' for item in referenced_columns])
+                local_columns_str = ", ".join([f'"{item.lower()}"' for item in local_columns])
+                referenced_columns_str = ", ".join([f'"{item.lower()}"' for item in referenced_columns])
 
-                query += (f'CONSTRAINT "{foreign_key_name}" FOREIGN KEY ({local_columns_str}) '
-                          f'REFERENCES "{foreign_keys[0].referenced_table_name}"({referenced_columns_str})')
+                query += (f'CONSTRAINT "{foreign_key_name.lower()}" FOREIGN KEY ({local_columns_str}) '
+                          f'REFERENCES "{foreign_keys[0].referenced_table_name.lower()}"({referenced_columns_str})')
             else:
                 foreign_key = foreign_keys[0]
-                query += (f'CONSTRAINT "{foreign_key.key_name}" FOREIGN KEY ("{foreign_key.local_column_name}") '
-                          f'REFERENCES "{foreign_key.referenced_table_name}"("{foreign_key.referenced_column_name}")')
+                query += (f'CONSTRAINT "{foreign_key.key_name.lower()}" FOREIGN KEY ("{foreign_key.local_column_name.lower()}") '
+                          f'REFERENCES "{foreign_key.referenced_table_name.lower()}"("{foreign_key.referenced_column_name.lower()}")')
 
             if foreign_key_index < len(foreign_keys_grouped_by_name) - 1:
                 query += ', ADD '
@@ -180,15 +180,15 @@ class Table:
             else:
                 unique_keys_grouped_by_name[unique_key.name][1].append(unique_key.column)
 
-        query = f'ALTER TABLE "{self.name}" ADD '
+        query = f'ALTER TABLE "{self.name.lower()}" ADD '
 
         for unique_key_index, unique_key_name in enumerate(unique_keys_grouped_by_name):
             is_primary_key, column_names = unique_keys_grouped_by_name[unique_key_name]
             ordered_column_names = sorted(list(column_names))
 
-            columns_constraint = ', '.join([f'"{column_name}"' for column_name in ordered_column_names])
+            columns_constraint = ', '.join([f'"{column_name.lower()}"' for column_name in ordered_column_names])
             constraint_type = "PRIMARY KEY" if is_primary_key else "UNIQUE"
-            query += f'CONSTRAINT "{unique_key_name}" {constraint_type} ({columns_constraint})'
+            query += f'CONSTRAINT "{unique_key_name.lower()}" {constraint_type} ({columns_constraint})'
 
             if unique_key_index < len(unique_keys_grouped_by_name) - 1:
                 query += ', ADD '
@@ -220,12 +220,12 @@ class Table:
                 continue
             unique = first_idx.unique
             if unique:
-                query = f'CREATE UNIQUE INDEX "{index_name}" ON "{self.name}" '
+                query = f'CREATE UNIQUE INDEX "{index_name.lower()}" ON "{self.name.lower()}" '
             else:
-                query = f'CREATE INDEX "{index_name}" ON "{self.name}" '
+                query = f'CREATE INDEX "{index_name.lower()}" ON "{self.name.lower()}" '
 
             column_names = ', '.join(
-                [f'"{idx.column_name}"' for idx in indexes_grouped_by_name[index_name]])
+                [f'"{idx.column_name.lower()}"' for idx in indexes_grouped_by_name[index_name]])
 
             query += f'({column_names});'
             queries.append(query)
