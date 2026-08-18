@@ -33,9 +33,9 @@ def split_sql_statements(content: str) -> list[tuple[str, int]]:
 
     def flush_statement():
         raw_sql = "".join(current_stmt).strip()
-        is_comment_only = all(line.strip().startswith('--')
-                              for line in raw_sql.splitlines() if line.strip())
-        if raw_sql and not is_comment_only:
+        code_without_comments = re.sub(r'--[^\n]*', '', raw_sql)
+        code_without_comments = re.sub(r'/\*.*?\*/', '', code_without_comments, flags=re.DOTALL)
+        if code_without_comments.strip():
             statements.append((raw_sql, stmt_start_line))
 
     while i < n:
@@ -47,16 +47,21 @@ def split_sql_statements(content: str) -> list[tuple[str, int]]:
             current_line += 1
             if in_line_comment:
                 in_line_comment = False
-            current_stmt.append(ch)
+            if current_stmt:
+                current_stmt.append(ch)
             i += 1
             continue
 
         if in_line_comment:
+            if not current_stmt:
+                stmt_start_line = current_line
             current_stmt.append(ch)
             i += 1
             continue
 
         if in_block_comment:
+            if not current_stmt:
+                stmt_start_line = current_line
             current_stmt.append(ch)
             if ch == '*' and next_ch == '/':
                 current_stmt.append(next_ch)
@@ -88,6 +93,12 @@ def split_sql_statements(content: str) -> list[tuple[str, int]]:
             continue
 
         # --- OUTSIDE QUOTES AND COMMENTS ---
+
+        if not current_stmt:
+            if ch.isspace():
+                i += 1
+                continue
+            stmt_start_line = current_line
 
         if ch == '-' and next_ch == '-':
             in_line_comment = True
@@ -121,12 +132,8 @@ def split_sql_statements(content: str) -> list[tuple[str, int]]:
             current_stmt.append(ch)
             flush_statement()
             current_stmt = []
-            stmt_start_line = current_line
             i += 1
             continue
-
-        if not current_stmt and not ch.isspace():
-            stmt_start_line = current_line
 
         current_stmt.append(ch)
         i += 1

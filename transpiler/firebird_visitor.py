@@ -8,6 +8,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'firebird_grammar'))
 from typing import TypeVar
 from antlr4 import InputStream, CommonTokenStream, ParserRuleContext
 from antlr4.atn.PredictionMode import PredictionMode
+from antlr4.error.ErrorListener import ErrorListener
 from antlr4.error.ErrorStrategy import BailErrorStrategy, DefaultErrorStrategy
 from antlr4.error.Errors import ParseCancellationException, RecognitionException
 from antlr4.TokenStreamRewriter import TokenStreamRewriter
@@ -60,7 +61,7 @@ class ASTDialectRewriter(FirebirdParserVisitor):
     def visitBind_variable(self, ctx: FirebirdParser.Bind_variableContext):
         raw = ctx.getText()
         if raw.startswith(':'):
-            self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f" {raw.lstrip(':')}")
+            self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, raw.lstrip(':'))
         return self.visitChildren(ctx)
 
     def visitTableview_name(self, ctx: FirebirdParser.Tableview_nameContext):
@@ -90,12 +91,6 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                                 ctx.start, ctx.stop, f"setval('{seq_name}', nextval('{seq_name}') + ({step}) - 1)"
                             )
             return self.visitChildren(ctx)
-
-        # In CREATE VIEW context, quote table.column references in uppercase on the AST token stream
-        if _is_inside(ctx, FirebirdParser.Create_viewContext):
-            text = ctx.getText()
-            if not (text.startswith('"') and text.endswith('"')):
-                self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f'"{text.upper()}"')
 
         return self.visitChildren(ctx)
 
@@ -197,6 +192,21 @@ class ASTDialectRewriter(FirebirdParserVisitor):
         return None
 
 
+class _CollectingErrorListener(ErrorListener):
+    """
+    Custom ANTLR error listener that captures syntax and lexical errors in memory
+    instead of printing verbose diagnostic dumps directly to sys.stderr.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.errors: list[str] = []
+
+    # noinspection PyPep8Naming
+    def syntaxError(self, recognizer, offendingSymbol, line, column, msg, e):
+        self.errors.append(f"line {line}:{column} {msg}")
+
+
 class FirebirdToPostgresVisitor(FirebirdParserVisitor):
     """
     Visitor that traverses the Firebird AST and translates it into PostgreSQL PL/pgSQL code.
@@ -207,15 +217,35 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         self.rewriter = rewriter
 
     @classmethod
-    def _normalize_trigger_records(cls, sql: str) -> str:
+    def _normalize_sql(cls, sql: str) -> str:
         """
         Pre-parse normalization:
-        In the Firebird grammar, 'old' and 'new' are reserved keywords in unquoted context.
-        When followed by a dot (e.g. 'old.field'), the lexer splits them unless quoted.
-        This function temporarily wraps record names in double quotes ("old".field),
-        while ensuring string literals ('...') and comments (-- ... / /* ... */) remain 100% untouched.
-        These temporary quotes are cleanly stripped in `_clean_sql` after parsing.
+        1. Firebird allows custom exception messages: `EXCEPTION <name> '<msg>';`.
+           We normalize this to `/* __FB_EX_MSG__:<name>:<msg> */ EXCEPTION <name>;`
+           so the ANTLR grammar parses it cleanly as a standard EXCEPTION statement.
+        2. In the Firebird grammar, 'old' and 'new' are reserved keywords in unquoted context.
+           When followed by a dot (e.g. 'old.field'), the lexer splits them unless quoted.
+           This function temporarily wraps record names in double quotes ("old".field),
+           while ensuring string literals ('...') and comments (-- ... / /* ... */) remain 100% untouched.
+           These temporary quotes are cleanly stripped in `_clean_sql` after parsing.
         """
+        # Step 1: Normalize custom exception messages (e.g. EXCEPTION EX_ERR 'custom msg';)
+        ex_pattern = re.compile(
+            r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|"  # Group 1: strings / comments
+            r"(\bEXCEPTION\s+([a-zA-Z0-9_$]+)\s+('(?:''|[^'])*')\s*;)",  # Group 2, 3, 4: EXCEPTION with msg
+            flags=re.IGNORECASE
+        )
+
+        def ex_repl(match):
+            if match.group(1):
+                return match.group(1)
+            ex_name = match.group(3)
+            ex_msg = match.group(4)
+            return f"/* __FB_EX_MSG__:{ex_name}:{ex_msg} */ EXCEPTION {ex_name};"
+
+        sql = ex_pattern.sub(ex_repl, sql)
+
+        # Step 2: Normalize OLD / NEW trigger records
         pattern = re.compile(
             r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|"  # Group 1: string literals and comments (preserve untouched)
             r"(\b(old|new)\.;?\s*\n\s*([a-zA-Z0-9_]+)\b)|"  # Group 2, 3, 4: split 'old.; \n col' recovery
@@ -241,11 +271,18 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         Parses Firebird SQL using Two-Stage Parsing (SLL -> LL), traverses the AST with the visitor,
         and applies dialect token rewriting to produce clean PostgreSQL SQL.
         """
-        normalized_sql = cls._normalize_trigger_records(firebird_sql_string)
+        normalized_sql = cls._normalize_sql(firebird_sql_string)
+
+        error_listener = _CollectingErrorListener()
 
         lexer = FirebirdLexer(InputStream(normalized_sql))
+        lexer.removeErrorListeners()
+        lexer.addErrorListener(error_listener)
+
         stream = CommonTokenStream(lexer)
         parser = FirebirdParser(stream)
+        parser.removeErrorListeners()
+        parser.addErrorListener(error_listener)
 
         # Stage 1: Fast SLL mode
         # noinspection PyProtectedMember
@@ -267,9 +304,11 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
 
         # Ensure syntax errors in LL mode fail loudly rather than returning partial/corrupt AST
         syntax_errors = parser.getNumberOfSyntaxErrors()
-        if syntax_errors > 0:
+        if syntax_errors > 0 or error_listener.errors:
+            details = "; ".join(error_listener.errors[:3])
+            count = len(error_listener.errors) if error_listener.errors else syntax_errors
             raise ParseCancellationException(
-                f"Syntax error during parsing: {syntax_errors} errors encountered in Firebird SQL script."
+                f"Syntax error during parsing: {count} error(s) encountered in Firebird SQL script ({details})."
             )
 
         rewriter = TokenStreamRewriter(stream)
@@ -291,10 +330,17 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
     def _clean_sql(pg_sql: str) -> str:
         """
         Post-transpilation cleanup:
-        Strips the temporary protective double-quotes on trigger pseudo-records
-        ("old".col / "new".col -> old.col / new.col) that were injected prior to parsing
-        to prevent Firebird lexer keyword collision. In PL/pgSQL, OLD/NEW are unquoted records.
+        1. Restores custom exception messages into `RAISE EXCEPTION '<name>: %', '<msg>';`.
+        2. Strips protective double-quotes on trigger pseudo-records ("old".col -> old.col).
         """
+        # Step 1: Restore custom exception messages
+        ex_clean = re.compile(
+            r"/\*\s*__FB_EX_MSG__:([a-zA-Z0-9_$]+):('(?:''|[^'])*')\s*\*/\s*RAISE\s+EXCEPTION\s+'\1';",
+            flags=re.IGNORECASE
+        )
+        pg_sql = ex_clean.sub(r"RAISE EXCEPTION '\1: %', \2;", pg_sql)
+
+        # Step 2: Strip protective double-quotes on trigger pseudo-records
         pg_sql = re.sub(r'"(old|new)"\.', r'\1.', pg_sql, flags=re.IGNORECASE)
         return pg_sql
 
@@ -615,7 +661,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
                 end_header_token = ctx.into_clause().stop
                 for child in ctx.into_clause().children:
                     if isinstance(child, (FirebirdParser.General_elementContext, FirebirdParser.Bind_variableContext)):
-                        into_vars.append(self.get_raw_text(child).lstrip(':'))
+                        into_vars.append(self.get_raw_text(child).strip().lstrip(':'))
 
             target = ", ".join(into_vars) if into_vars else "_rec"
             loop_comments = self._get_comments_in_range(end_header_token.tokenIndex + 1,
@@ -636,7 +682,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
             if into_ctx:
                 for child in into_ctx.children:
                     if isinstance(child, (FirebirdParser.General_elementContext, FirebirdParser.Bind_variableContext)):
-                        into_vars.append(self.get_raw_text(child).lstrip(':'))
+                        into_vars.append(self.get_raw_text(child).strip().lstrip(':'))
 
             select_sql = self.get_text_without_node(ctx.select_statement(), into_ctx).strip()
             target = ", ".join(into_vars) if into_vars else "_rec"

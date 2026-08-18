@@ -215,7 +215,10 @@ class Table:
         queries = []
 
         for index_name in indexes_grouped_by_name:
-            unique = indexes_grouped_by_name[index_name][0].unique
+            first_idx = indexes_grouped_by_name[index_name][0]
+            if first_idx.inactive:
+                continue
+            unique = first_idx.unique
             if unique:
                 query = f'CREATE UNIQUE INDEX "{index_name}" ON "{self.name}" '
             else:
