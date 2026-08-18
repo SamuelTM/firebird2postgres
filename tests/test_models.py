@@ -30,8 +30,10 @@ class TestFirebirdTypes(unittest.TestCase):
         self.assertEqual(resolve_firebird_type(field_type=37, field_length=50), 'VARCHAR(50)')
         self.assertEqual(resolve_firebird_type(field_type=14, field_length=10), 'CHAR(10)')
         # Numeric with precision and scale
-        self.assertEqual(resolve_firebird_type(field_type=16, field_subtype=1, field_precision=15, field_scale=-2), 'NUMERIC(15, 2)')
-        self.assertEqual(resolve_firebird_type(field_type=8, field_subtype=1, field_precision=9, field_scale=0), 'NUMERIC(9, 0)')
+        self.assertEqual(resolve_firebird_type(field_type=16, field_subtype=1, field_precision=15, field_scale=-2),
+                         'NUMERIC(15, 2)')
+        self.assertEqual(resolve_firebird_type(field_type=8, field_subtype=1, field_precision=9, field_scale=0),
+                         'NUMERIC(9, 0)')
         self.assertEqual(resolve_firebird_type(field_type=8, field_subtype=1, field_precision=None), 'NUMERIC')
         self.assertEqual(resolve_firebird_type(field_type=261, field_subtype=1), 'BLOB SUBTYPE 1')
         self.assertEqual(resolve_firebird_type(field_type=261, field_subtype=0), 'BLOB SUBTYPE 0')
@@ -94,8 +96,8 @@ class TestTableDdlGenerators(unittest.TestCase):
         uq_sql = table.get_unique_keys_query()
         self.assertIsNotNone(uq_sql)
         self.assertEqual(
-            'ALTER TABLE "users" ADD CONSTRAINT "pk_users" PRIMARY KEY ("id"), ADD CONSTRAINT "uq_users_email" UNIQUE ("email");',
-            uq_sql
+            'ALTER TABLE "users" ADD CONSTRAINT "pk_users" PRIMARY KEY ("id"), '
+            'ADD CONSTRAINT "uq_users_email" UNIQUE ("email");', uq_sql
         )
 
     def test_table_composite_unique_keys_ddl(self):
@@ -126,8 +128,8 @@ class TestTableDdlGenerators(unittest.TestCase):
         fk_sql = table.get_foreign_keys_query()
         self.assertIsNotNone(fk_sql)
         self.assertEqual(
-            'ALTER TABLE "orders" ADD CONSTRAINT "fk_orders_cliente" FOREIGN KEY ("cliente_id") REFERENCES "clientes"("id");',
-            fk_sql
+            'ALTER TABLE "orders" ADD CONSTRAINT "fk_orders_cliente" FOREIGN KEY ("cliente_id") '
+            'REFERENCES "clientes"("id");', fk_sql
         )
 
     def test_table_composite_foreign_keys_ddl(self):
@@ -156,8 +158,8 @@ class TestTableDdlGenerators(unittest.TestCase):
         fk_sql = table.get_foreign_keys_query()
         self.assertIsNotNone(fk_sql)
         self.assertEqual(
-            'ALTER TABLE "order_items" ADD CONSTRAINT "fk_order_items_order" FOREIGN KEY ("company_id", "order_id") REFERENCES "orders"("company_id", "id");',
-            fk_sql
+            'ALTER TABLE "order_items" ADD CONSTRAINT "fk_order_items_order" FOREIGN KEY ("company_id", "order_id") '
+            'REFERENCES "orders"("company_id", "id");', fk_sql
         )
 
     def test_table_indexes_ddl(self):

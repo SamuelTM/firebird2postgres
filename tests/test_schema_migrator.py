@@ -16,7 +16,8 @@ class TestSchemaMigrator(unittest.TestCase):
         self.table.columns.append(Column('ID', 'INTEGER', nullable=False, sequence_name='GEN_CLIENTES_ID'))
         self.table.columns.append(Column('NOME', 'VARCHAR(100)', nullable=False))
         self.table.unique_keys.append(UniqueKey('PK_CLIENTES', 'ID', is_primary_key=True))
-        self.table.indexes.append(Index('IDX_CLIENTES_NOME', unique=False, inactive=False, column_name='NOME', column_index=0))
+        self.table.indexes.append(
+            Index('IDX_CLIENTES_NOME', unique=False, inactive=False, column_name='NOME', column_index=0))
 
         self.table_orders = Table('ORDERS')
         self.table_orders.columns.append(Column('ID', 'INTEGER', nullable=False))
@@ -52,13 +53,15 @@ class TestSchemaMigrator(unittest.TestCase):
         executed_queries = [call[0][0] for call in self.mock_cursor.execute.call_args_list]
 
         # Should create PK / Unique Keys
-        self.assertTrue(any('ALTER TABLE "clientes" ADD CONSTRAINT "pk_clientes" PRIMARY KEY' in q for q in executed_queries))
+        self.assertTrue(
+            any('ALTER TABLE "clientes" ADD CONSTRAINT "pk_clientes" PRIMARY KEY' in q for q in executed_queries))
 
         # Should create Secondary Indexes
         self.assertTrue(any('CREATE INDEX "idx_clientes_nome" ON "clientes"' in q for q in executed_queries))
 
         # Should create Foreign Keys
-        self.assertTrue(any('ALTER TABLE "orders" ADD CONSTRAINT "fk_orders_clientes" FOREIGN KEY' in q for q in executed_queries))
+        self.assertTrue(
+            any('ALTER TABLE "orders" ADD CONSTRAINT "fk_orders_clientes" FOREIGN KEY' in q for q in executed_queries))
 
         self.mock_pg_con.commit.assert_called()
 

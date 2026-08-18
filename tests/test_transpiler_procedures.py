@@ -16,7 +16,8 @@ class TestTranspilerProcedures(unittest.TestCase):
         """
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
         self.assertIn('DROP FUNCTION IF EXISTS "SP_ATUALIZA_SALDO" CASCADE;', pg_sql)
-        self.assertIn('CREATE FUNCTION "SP_ATUALIZA_SALDO"(P_CONTA_ID INTEGER, P_VALOR NUMERIC(15,2)) RETURNS void AS $$', pg_sql)
+        self.assertIn('CREATE FUNCTION "SP_ATUALIZA_SALDO"(P_CONTA_ID INTEGER, P_VALOR NUMERIC(15,2)) '
+                      'RETURNS void AS $$', pg_sql)
         self.assertIn("UPDATE CONTAS SET SALDO = SALDO +", pg_sql)
 
     def test_selectable_procedure_with_suspend(self):
