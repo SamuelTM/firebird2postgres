@@ -9,12 +9,8 @@ import sys
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-import psycopg2
-from dotenv import load_dotenv
-
+from config import get_postgres_connection, PostgresConfig
 from sql_splitter import split_sql_statements as split_sql_content
-
-load_dotenv()
 
 DEFAULT_TARGET_FILES = [
     'postgres_domains_dump.sql',
@@ -245,29 +241,10 @@ def validate_postgres_ddl(
         target_files = DEFAULT_TARGET_FILES
 
     if pg_connection is None:
-        required_env_vars = ['POSTGRES_HOST', 'POSTGRES_PORT', 'POSTGRES_DB',
-                             'POSTGRES_USER', 'POSTGRES_PASSWORD']
-        missing = [var for var in required_env_vars if not os.getenv(var)]
-        if missing:
-            print(f"[FATAL ERROR] Missing required environment variables: {', '.join(missing)}")
-            print("  Set them in your .env file (see .env.example).")
-            return False
-
-        host = os.environ['POSTGRES_HOST']
-        port = int(os.environ['POSTGRES_PORT'])
-        dbname = os.environ['POSTGRES_DB']
-        user = os.environ['POSTGRES_USER']
-        password = os.environ['POSTGRES_PASSWORD']
-
-        print(f"\n[INFO] Connecting to PostgreSQL at '{host}:{port}/{dbname}'...")
+        cfg = PostgresConfig()
+        print(f"\n[INFO] Connecting to PostgreSQL at '{cfg.host}:{cfg.port}/{cfg.dbname}'...")
         try:
-            pg_connection = psycopg2.connect(
-                host=host,
-                port=port,
-                dbname=dbname,
-                user=user,
-                password=password
-            )
+            pg_connection = get_postgres_connection(cfg)
             close_connection = True
         except Exception as e:
             print(f"[FATAL ERROR] Could not connect to PostgreSQL: {e}")

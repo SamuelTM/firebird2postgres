@@ -1,30 +1,12 @@
-import os
-import firebirdsql
-import psycopg2
-from dotenv import load_dotenv
-
+from config import get_firebird_connection, get_postgres_connection
 from database_migrator import DatabaseMigrator
-
-load_dotenv()
 
 if __name__ == '__main__':
     print('Connecting to Firebird...')
-    fb_connection = firebirdsql.connect(
-        host=os.getenv('FIREBIRD_HOST', 'localhost'),
-        database=os.getenv('FIREBIRD_DATABASE', '/firebird/data/sample_database.fdb'),
-        user=os.getenv('FIREBIRD_USER', 'sysdba'),
-        password=os.getenv('FIREBIRD_PASSWORD', 'masterkey'),
-        charset='WIN1252'
-    )
+    fb_connection = get_firebird_connection()
 
     print('Connecting to PostgreSQL...')
-    pg_connection = psycopg2.connect(
-        host=os.getenv('POSTGRES_HOST', 'localhost'),
-        port=int(os.getenv('POSTGRES_PORT', 5432)),
-        dbname=os.getenv('POSTGRES_DB', 'sample_database'),
-        user=os.getenv('POSTGRES_USER', 'postgres'),
-        password=os.getenv('POSTGRES_PASSWORD', 'mypassword')
-    )
+    pg_connection = get_postgres_connection()
 
     migrator = DatabaseMigrator(fb_connection, pg_connection)
 

@@ -451,7 +451,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         """
         items = []
         if not child_nodes:
-            if stop_token_idx >= start_token_idx and start_token_idx > 0:
+            if stop_token_idx >= start_token_idx > 0:
                 for c in self._get_comments_in_range(start_token_idx, stop_token_idx):
                     items.append(f"    {c}" if indent_comments else c)
             return items
