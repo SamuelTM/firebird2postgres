@@ -49,6 +49,20 @@ class DatabaseMigrator:
         self._ensure_schema()
         self.schema_migrator.drop_schema(self.table_objs)
 
+    def create_tables(self):
+        """
+        Executes the generated PostgreSQL DDL to create base tables and sequences (without constraints/indexes).
+        """
+        self._ensure_schema()
+        self.schema_migrator.create_tables(self.table_objs)
+
+    def create_constraints_and_indexes(self):
+        """
+        Executes the generated PostgreSQL DDL to create Unique/Primary Keys, Secondary Indexes, and Foreign Keys.
+        """
+        self._ensure_schema()
+        self.schema_migrator.create_constraints_and_indexes(self.table_objs)
+
     def migrate_schema(self):
         """
         Executes the generated PostgreSQL DDL to create the tables, sequences, indexes, and keys.

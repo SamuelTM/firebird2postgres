@@ -62,11 +62,12 @@ class SchemaMigrator:
         self.pg_con.commit()
         logger.info("Existing schema teardown completed.")
 
-    def migrate_schema(self, table_objs: list[Table]):
+    def create_tables(self, table_objs: list[Table]):
         """
-        Executes the generated PostgreSQL DDL to create the schema.
+        Creates base tables and sequences in PostgreSQL without indexes or constraints.
+        This enables optimal bulk data loading performance.
         """
-        logger.info(f"Creating schema for {len(table_objs)} tables in PostgreSQL...")
+        logger.info(f"Creating base schema for {len(table_objs)} tables in PostgreSQL...")
         cursor = self.pg_con.cursor()
 
         # Teardown of tables/sequences only - domains must already exist (STEP 3), since the
@@ -82,6 +83,19 @@ class SchemaMigrator:
             create_query = table.get_create_table_query()
             logger.debug(create_query)
             cursor.execute(create_query)
+
+        logger.info("Saving base table schema transactions...")
+        self.pg_con.commit()
+        logger.info(f"Successfully created {len(table_objs)} base tables and sequences.")
+
+    def create_constraints_and_indexes(self, table_objs: list[Table]):
+        """
+        Creates Unique/Primary Keys, Secondary Indexes, and Foreign Keys in PostgreSQL.
+        Running this after data insertion allows PostgreSQL to build indexes via parallel sort
+        and validates foreign keys efficiently in a single pass.
+        """
+        logger.info(f"Creating constraints and indexes for {len(table_objs)} tables in PostgreSQL...")
+        cursor = self.pg_con.cursor()
 
         for table in table_objs:
             uniq_query = table.get_unique_keys_query()
@@ -100,6 +114,13 @@ class SchemaMigrator:
                 logger.debug(fk_query)
                 cursor.execute(fk_query)
 
-        logger.info("Saving schema transactions...")
+        logger.info("Saving constraint and index transactions...")
         self.pg_con.commit()
-        logger.info("Schema migration completed successfully.")
+        logger.info("Constraints (PK, UK, FK) and indexes created successfully.")
+
+    def migrate_schema(self, table_objs: list[Table]):
+        """
+        Convenience method executing both table creation and constraints/indexes creation.
+        """
+        self.create_tables(table_objs)
+        self.create_constraints_and_indexes(table_objs)
