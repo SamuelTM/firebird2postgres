@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from config import get_postgres_connection, PostgresConfig, get_dump_path, DumpFiles
-from sql_splitter import split_sql_statements as split_sql_content
+from utils import split_sql_statements as split_sql_content
 
 DEFAULT_TARGET_FILES = [
     get_dump_path(DumpFiles.DOMAINS_PG),

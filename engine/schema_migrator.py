@@ -1,5 +1,5 @@
 import logging
-from database_objects import Table
+from models import Table
 
 logger = logging.getLogger(__name__)
 

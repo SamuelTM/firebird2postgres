@@ -1,6 +1,5 @@
 import re
-from database_objects import Table, Column, ForeignKey, UniqueKey, Index
-from firebird_types import resolve_firebird_type, resolve_pg_domain_name
+from models import Table, Column, ForeignKey, UniqueKey, Index, resolve_firebird_type, resolve_pg_domain_name
 
 
 class SchemaExtractor:

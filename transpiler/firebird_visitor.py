@@ -12,10 +12,7 @@ from antlr4.error.ErrorStrategy import BailErrorStrategy, DefaultErrorStrategy
 from antlr4.error.Errors import ParseCancellationException, RecognitionException
 from antlr4.TokenStreamRewriter import TokenStreamRewriter
 
-from firebird_grammar.FirebirdParserVisitor import FirebirdParserVisitor
-# noinspection PyUnresolvedReferences
-from firebird_grammar.FirebirdParser import FirebirdParser
-from firebird_grammar.FirebirdLexer import FirebirdLexer
+from .firebird_grammar import FirebirdParserVisitor, FirebirdParser, FirebirdLexer
 
 T = TypeVar('T', bound=ParserRuleContext)
 

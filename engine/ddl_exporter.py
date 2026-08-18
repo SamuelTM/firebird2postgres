@@ -2,9 +2,8 @@ import os
 import logging
 from concurrent.futures import ProcessPoolExecutor
 from config import DUMP_DIR, DumpFiles, get_dump_path
-from database_objects import get_postgres_type
-from firebird_visitor import FirebirdToPostgresVisitor
-from firebird_types import resolve_firebird_type, resolve_pg_domain_name, decode_trigger_type
+from models import get_postgres_type, resolve_firebird_type, resolve_pg_domain_name, decode_trigger_type
+from transpiler import FirebirdToPostgresVisitor
 
 logger = logging.getLogger(__name__)
 

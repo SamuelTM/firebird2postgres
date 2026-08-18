@@ -1,10 +1,10 @@
-from database_objects import Table
-from firebird_visitor import FirebirdToPostgresVisitor
-from schema_extractor import SchemaExtractor
-from schema_migrator import SchemaMigrator
-from data_migrator import DataMigrator
-from ddl_exporter import DdlExporter
-from sql_runner import SqlRunner
+from models import Table
+from transpiler import FirebirdToPostgresVisitor
+from utils import SqlRunner
+from .schema_extractor import SchemaExtractor
+from .schema_migrator import SchemaMigrator
+from .data_migrator import DataMigrator
+from .ddl_exporter import DdlExporter
 
 
 class DatabaseMigrator:

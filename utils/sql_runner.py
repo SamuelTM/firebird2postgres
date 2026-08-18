@@ -1,6 +1,6 @@
 import os
 import logging
-from sql_splitter import split_sql_statements
+from .sql_splitter import split_sql_statements
 
 logger = logging.getLogger(__name__)
 

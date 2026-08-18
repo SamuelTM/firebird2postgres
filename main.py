@@ -1,7 +1,7 @@
 import sys
 import logging
 from config import get_firebird_connection, get_postgres_connection, get_dump_path, DumpFiles, setup_logging
-from database_migrator import DatabaseMigrator
+from engine import DatabaseMigrator
 
 setup_logging()
 logger = logging.getLogger('main')
