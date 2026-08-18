@@ -14,7 +14,6 @@ class DatabaseMigrator:
     DdlExporter, and SqlRunner.
     """
 
-
     def __init__(self, fb_con, pg_con):
         """
         Initializes the migrator with live connection objects to Firebird and PostgreSQL.
@@ -43,26 +42,27 @@ class DatabaseMigrator:
     def transpile_firebird_sql(firebird_sql_string: str) -> str:
         return FirebirdToPostgresVisitor.transpile(firebird_sql_string)
 
-    def drop_schema(self, print_queries: bool = False):
+    def drop_schema(self):
         """
         Drops all migrated objects (tables, sequences and domains) from PostgreSQL.
         """
         self._ensure_schema()
-        self.schema_migrator.drop_schema(self.table_objs, print_queries=print_queries)
+        self.schema_migrator.drop_schema(self.table_objs)
 
-    def migrate_schema(self, print_queries: bool = False):
+    def migrate_schema(self):
         """
         Executes the generated PostgreSQL DDL to create the tables, sequences, indexes, and keys.
         """
         self._ensure_schema()
-        self.schema_migrator.migrate_schema(self.table_objs, print_queries=print_queries)
+        self.schema_migrator.migrate_schema(self.table_objs)
 
-    def import_data(self):
+    def import_data(self) -> bool:
         """
         Reads data from Firebird and bulk inserts into PostgreSQL with sequence synchronization.
+        Returns True if successful, False if any table failed.
         """
         self._ensure_schema()
-        self.data_migrator.import_data(self.table_objs)
+        return self.data_migrator.import_data(self.table_objs)
 
     def export_firebird_triggers(self, output_file: str = 'firebird_triggers_dump.sql',
                                  converted_file: str = 'postgres_triggers_dump.sql',

@@ -1,10 +1,43 @@
 import os
+import logging
 from dataclasses import dataclass
 from dotenv import load_dotenv
 import firebirdsql
 import psycopg2
 
 load_dotenv()
+
+
+def setup_logging(level: str = None, log_file: str = None) -> None:
+    """
+    Configures standard structured logging for the application with dual handlers:
+    - Console output: formatted at the configured LOG_LEVEL (default INFO).
+    - File output: saves full log trace (including DEBUG queries) to a log file (default migration.log).
+    """
+    log_level = level or os.getenv('LOG_LEVEL', 'INFO').upper()
+    console_level = getattr(logging, log_level, logging.INFO)
+    file_path = log_file or os.getenv('LOG_FILE', 'migration.log')
+
+    formatter = logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    console_handler.setLevel(console_level)
+
+    handlers: list[logging.Handler] = [console_handler]
+
+    if file_path:
+        file_handler = logging.FileHandler(file_path, mode='a', encoding='utf-8')
+        file_handler.setFormatter(formatter)
+        file_handler.setLevel(logging.DEBUG)
+        handlers.append(file_handler)
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)
+    root_logger.handlers = handlers
 
 
 @dataclass(frozen=True)

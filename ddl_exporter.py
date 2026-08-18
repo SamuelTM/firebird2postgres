@@ -1,7 +1,10 @@
+import logging
 from concurrent.futures import ProcessPoolExecutor
 from database_objects import get_postgres_type
 from firebird_visitor import FirebirdToPostgresVisitor
 from firebird_types import resolve_firebird_type, resolve_pg_domain_name, decode_trigger_type
+
+logger = logging.getLogger(__name__)
 
 
 def _transpile_worker(item: tuple[str, str]) -> tuple[str | None, str | None]:
@@ -44,7 +47,7 @@ class DdlExporter:
         Objects that fail transpilation are kept in the converted file with a
         [TRANSPILER FAILED] marker for manual review.
         """
-        print(f"Transpiling {len(items)} {object_type.lower()}s in parallel...")
+        logger.info(f"Transpiling {len(items)} {object_type.lower()}s in parallel...")
         owns_executor = executor is None
         if owns_executor:
             executor = ProcessPoolExecutor()
@@ -71,11 +74,11 @@ class DdlExporter:
                     conv_f.write(pg_sql)
                     conv_f.write("\n\n")
                 else:
-                    print(f"Failed to transpile {object_type.lower()} {item_name}: {err}")
+                    logger.error(f"Failed to transpile {object_type.lower()} {item_name}: {err}")
                     conv_f.write(f"-- [TRANSPILER FAILED] {object_type} {item_name}\n")
                     conv_f.write(fb_sql)
 
-        print(f"Exported {len(items)} {object_type.lower()}s to '{output_file}' and '{converted_file}'")
+        logger.info(f"Exported {len(items)} {object_type.lower()}s to '{output_file}' and '{converted_file}'")
 
     def export_firebird_triggers(self, output_file: str = 'firebird_triggers_dump.sql',
                                  converted_file: str = 'postgres_triggers_dump.sql',
@@ -342,8 +345,8 @@ class DdlExporter:
                 # columns that reference this domain.
                 pg_domain_name = resolve_pg_domain_name(domain_name, relation_names)
                 if pg_domain_name != domain_name.lower():
-                    print(f'  [RENAMED] Domain "{domain_name}" collides with a table/view name; '
-                          f'exported as "{pg_domain_name}".')
+                    logger.info(f'  [RENAMED] Domain "{domain_name}" collides with a table/view name; '
+                                f'exported as "{pg_domain_name}".')
                     conv_f.write(f'-- [RENAMED] DOMAIN "{domain_name}" -> "{pg_domain_name}" '
                                  f'(collides with a table/view name)\n')
 
@@ -385,4 +388,4 @@ class DdlExporter:
                 )
                 conv_f.write(pg_ddl)
 
-        print(f"Exported {len(domains)} domains to '{output_file}' and '{converted_file}'")
+        logger.info(f"Exported {len(domains)} domains to '{output_file}' and '{converted_file}'")
