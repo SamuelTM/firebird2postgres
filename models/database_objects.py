@@ -68,14 +68,20 @@ class Table:
         self.unique_keys: list[UniqueKey] = []
         self.indexes: list[Index] = []
 
-    def get_sequences_query(self):
+    def get_sequence_queries(self) -> list[str]:
+        """
+        Returns a list of CREATE SEQUENCE statements for all sequence-bound columns.
+        """
         queries = []
         for col in self.columns:
             if col.sequence_name:
                 queries.append(f'CREATE SEQUENCE "{col.sequence_name}";')
         return queries
 
-    def get_create_query(self):
+    def get_create_table_query(self) -> str:
+        """
+        Returns the single CREATE TABLE statement with column definitions and constraints.
+        """
         query = f'CREATE TABLE "{self.name}" ('
 
         for i, col in enumerate(self.columns):
@@ -108,110 +114,117 @@ class Table:
 
         return query
 
-    def get_foreign_keys_query(self):
-        if len(self.foreign_keys) > 0:
-            foreign_keys_grouped_by_name: dict[str, list[ForeignKey]] = {}
+    def get_foreign_keys_query(self) -> str | None:
+        """
+        Returns an ALTER TABLE statement with all ADD CONSTRAINT FOREIGN KEY clauses,
+        or None if the table has no foreign keys.
+        """
+        if not self.foreign_keys:
+            return None
 
-            for foreign_key in self.foreign_keys:
-                if foreign_key.key_name not in foreign_keys_grouped_by_name:
-                    foreign_keys_grouped_by_name[foreign_key.key_name] = [foreign_key]
-                else:
-                    foreign_keys_grouped_by_name[foreign_key.key_name].append(foreign_key)
+        foreign_keys_grouped_by_name: dict[str, list[ForeignKey]] = {}
 
-            query = f'ALTER TABLE "{self.name}" ADD '
+        for foreign_key in self.foreign_keys:
+            if foreign_key.key_name not in foreign_keys_grouped_by_name:
+                foreign_keys_grouped_by_name[foreign_key.key_name] = [foreign_key]
+            else:
+                foreign_keys_grouped_by_name[foreign_key.key_name].append(foreign_key)
 
-            for foreign_key_index, foreign_key_name in enumerate(foreign_keys_grouped_by_name):
-                foreign_keys = foreign_keys_grouped_by_name[foreign_key_name]
-                if len(foreign_keys) > 1:
-                    local_referenced_pairs = set()
+        query = f'ALTER TABLE "{self.name}" ADD '
 
-                    for foreign_key in foreign_keys:
-                        if foreign_key.local_column_index == foreign_key.referenced_column_index:
-                            local_referenced_pairs.add(
-                                (foreign_key.local_column_name, foreign_key.referenced_column_name))
+        for foreign_key_index, foreign_key_name in enumerate(foreign_keys_grouped_by_name):
+            foreign_keys = foreign_keys_grouped_by_name[foreign_key_name]
+            if len(foreign_keys) > 1:
+                local_referenced_pairs = set()
 
-                    ordered_pairs = sorted(local_referenced_pairs, key=lambda x: x[1])
+                for foreign_key in foreign_keys:
+                    if foreign_key.local_column_index == foreign_key.referenced_column_index:
+                        local_referenced_pairs.add(
+                            (foreign_key.local_column_name, foreign_key.referenced_column_name))
 
-                    local_columns = [x[0] for x in ordered_pairs]
-                    referenced_columns = [x[1] for x in ordered_pairs]
+                ordered_pairs = sorted(local_referenced_pairs, key=lambda x: x[1])
 
-                    local_columns_str = ", ".join([f'"{item}"' for item in local_columns])
-                    referenced_columns_str = ", ".join([f'"{item}"' for item in referenced_columns])
+                local_columns = [x[0] for x in ordered_pairs]
+                referenced_columns = [x[1] for x in ordered_pairs]
 
-                    query += (f'CONSTRAINT "{foreign_key_name}" FOREIGN KEY ({local_columns_str}) '
-                              f'REFERENCES "{foreign_keys[0].referenced_table_name}"({referenced_columns_str})')
-                else:
-                    foreign_key = foreign_keys[0]
-                    query += (f'CONSTRAINT "{foreign_key.key_name}" FOREIGN KEY ("{foreign_key.local_column_name}") '
-                              f'REFERENCES "{foreign_key.referenced_table_name}"("{foreign_key.referenced_column_name}")')
+                local_columns_str = ", ".join([f'"{item}"' for item in local_columns])
+                referenced_columns_str = ", ".join([f'"{item}"' for item in referenced_columns])
 
-                if foreign_key_index < len(foreign_keys_grouped_by_name) - 1:
-                    query += ', ADD '
+                query += (f'CONSTRAINT "{foreign_key_name}" FOREIGN KEY ({local_columns_str}) '
+                          f'REFERENCES "{foreign_keys[0].referenced_table_name}"({referenced_columns_str})')
+            else:
+                foreign_key = foreign_keys[0]
+                query += (f'CONSTRAINT "{foreign_key.key_name}" FOREIGN KEY ("{foreign_key.local_column_name}") '
+                          f'REFERENCES "{foreign_key.referenced_table_name}"("{foreign_key.referenced_column_name}")')
 
-            query += ';'
+            if foreign_key_index < len(foreign_keys_grouped_by_name) - 1:
+                query += ', ADD '
 
-            return query
+        query += ';'
 
-        return None
+        return query
 
-    def get_unique_keys_query(self):
-        if len(self.unique_keys) > 0:
-            unique_keys_grouped_by_name: dict[str, tuple[bool, list[str]]] = {}
+    def get_unique_keys_query(self) -> str | None:
+        """
+        Returns an ALTER TABLE statement with all ADD CONSTRAINT PRIMARY KEY / UNIQUE clauses,
+        or None if the table has no unique/primary keys.
+        """
+        if not self.unique_keys:
+            return None
 
-            for unique_key in self.unique_keys:
-                if unique_key.name not in unique_keys_grouped_by_name:
-                    unique_keys_grouped_by_name[unique_key.name] = (unique_key.is_primary_key, [unique_key.column])
-                else:
-                    unique_keys_grouped_by_name[unique_key.name][1].append(unique_key.column)
+        unique_keys_grouped_by_name: dict[str, tuple[bool, list[str]]] = {}
 
-            query = f'ALTER TABLE "{self.name}" ADD '
+        for unique_key in self.unique_keys:
+            if unique_key.name not in unique_keys_grouped_by_name:
+                unique_keys_grouped_by_name[unique_key.name] = (unique_key.is_primary_key, [unique_key.column])
+            else:
+                unique_keys_grouped_by_name[unique_key.name][1].append(unique_key.column)
 
-            for unique_key_index, unique_key_name in enumerate(unique_keys_grouped_by_name):
+        query = f'ALTER TABLE "{self.name}" ADD '
 
-                is_primary_key, column_names = unique_keys_grouped_by_name[unique_key_name]
-                ordered_column_names = list(column_names)
-                ordered_column_names.sort()
+        for unique_key_index, unique_key_name in enumerate(unique_keys_grouped_by_name):
+            is_primary_key, column_names = unique_keys_grouped_by_name[unique_key_name]
+            ordered_column_names = sorted(list(column_names))
 
-                columns_constraint = ', '.join(
-                    [f'"{column_name}"' for column_name in ordered_column_names])
+            columns_constraint = ', '.join([f'"{column_name}"' for column_name in ordered_column_names])
+            constraint_type = "PRIMARY KEY" if is_primary_key else "UNIQUE"
+            query += f'CONSTRAINT "{unique_key_name}" {constraint_type} ({columns_constraint})'
 
-                constraint_type = "PRIMARY KEY" if is_primary_key else "UNIQUE"
-                query += f'CONSTRAINT "{unique_key_name}" {constraint_type} ({columns_constraint})'
+            if unique_key_index < len(unique_keys_grouped_by_name) - 1:
+                query += ', ADD '
 
-                if unique_key_index < len(unique_keys_grouped_by_name) - 1:
-                    query += ', ADD '
+        query += ';'
 
-            query += ';'
+        return query
 
-            return query
+    def get_index_queries(self) -> list[str]:
+        """
+        Returns a list of CREATE INDEX / CREATE UNIQUE INDEX statements for all secondary indexes.
+        """
+        if not self.indexes:
+            return []
 
-        return None
+        indexes_grouped_by_name: dict[str, list[Index]] = {}
 
-    def get_indexes_query(self):
-        if len(self.indexes) > 0:
-            indexes_grouped_by_name: dict[str, list[Index]] = {}
+        for index in self.indexes:
+            if index.index_name not in indexes_grouped_by_name:
+                indexes_grouped_by_name[index.index_name] = [index]
+            else:
+                indexes_grouped_by_name[index.index_name].append(index)
 
-            for index in self.indexes:
-                if index.index_name not in indexes_grouped_by_name:
-                    indexes_grouped_by_name[index.index_name] = [index]
-                else:
-                    indexes_grouped_by_name[index.index_name].append(index)
+        queries = []
 
-            queries = []
+        for index_name in indexes_grouped_by_name:
+            unique = indexes_grouped_by_name[index_name][0].unique
+            if unique:
+                query = f'CREATE UNIQUE INDEX "{index_name}" ON "{self.name}" '
+            else:
+                query = f'CREATE INDEX "{index_name}" ON "{self.name}" '
 
-            for index_name in indexes_grouped_by_name:
-                unique = indexes_grouped_by_name[index_name][0].unique
-                if unique:
-                    query = f'CREATE UNIQUE INDEX "{index_name}" ON "{self.name}" '
-                else:
-                    query = f'CREATE INDEX "{index_name}" ON "{self.name}" '
+            column_names = ', '.join(
+                [f'"{idx.column_name}"' for idx in indexes_grouped_by_name[index_name]])
 
-                column_names = ', '.join(
-                    [f'"{idx.column_name}"' for idx in indexes_grouped_by_name[index_name]])
+            query += f'({column_names});'
+            queries.append(query)
 
-                query += f'({column_names});'
-
-                queries.append(query)
-
-            return queries
-        return None
+        return queries

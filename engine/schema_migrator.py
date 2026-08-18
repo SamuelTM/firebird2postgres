@@ -74,13 +74,12 @@ class SchemaMigrator:
         self._drop_tables_and_sequences(cursor, table_objs)
 
         for table in table_objs:
-            seq_queries = table.get_sequences_query()
-            for seq_query in seq_queries:
+            for seq_query in table.get_sequence_queries():
                 logger.debug(seq_query)
                 cursor.execute(seq_query)
 
         for table in table_objs:
-            create_query = table.get_create_query()
+            create_query = table.get_create_table_query()
             logger.debug(create_query)
             cursor.execute(create_query)
 
@@ -91,11 +90,9 @@ class SchemaMigrator:
                 cursor.execute(uniq_query)
 
         for table in table_objs:
-            indexes_query = table.get_indexes_query()
-            if indexes_query:
-                for idx_query in indexes_query:
-                    logger.debug(idx_query)
-                    cursor.execute(idx_query)
+            for idx_query in table.get_index_queries():
+                logger.debug(idx_query)
+                cursor.execute(idx_query)
 
         for table in table_objs:
             fk_query = table.get_foreign_keys_query()
