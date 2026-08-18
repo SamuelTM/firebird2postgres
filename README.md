@@ -60,7 +60,7 @@ An ANTLR-based transpiler converts triggers, stored procedures and views to PL/p
 
 ### Validation
 
-`validate_postgres_ddl.py` runs all converted DDL against PostgreSQL in a dry run (rollback at the end).
+`validate_postgres_ddl.py` is an optional script that runs all converted DDL against PostgreSQL in a dry run (rollback at the end).
 It shows a report for each object type (domains, procedures, views, triggers).
 
 ## Requirements
@@ -105,14 +105,6 @@ The pipeline has 8 steps:
 7. **Apply procedures and views** - Runs the converted procedure and view DDL.
 
 8. **Apply triggers** - Runs the converted trigger DDL.
-
-### Validate the Converted DDL (Dry Run)
-
-Use this command to test all converted DDL without permanent changes:
-
-```bash
-python validate_postgres_ddl.py
-```
 
 The validator runs each SQL statement in a transaction and rolls back at the end.
 
