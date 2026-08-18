@@ -41,7 +41,7 @@ Each export writes two files: the Firebird source and the converted PostgreSQL D
 
 ## Requirements
 
-Python 3.8 or later.
+Python 3.10 or later.
 
 ```bash
 pip install -r requirements.txt
