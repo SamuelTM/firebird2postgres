@@ -106,8 +106,6 @@ The pipeline has 8 steps:
 
 8. **Apply triggers** - Runs the converted trigger DDL.
 
-The validator runs each SQL statement in a transaction and rolls back at the end.
-
 ### Run the Tests
 
 ```bash
