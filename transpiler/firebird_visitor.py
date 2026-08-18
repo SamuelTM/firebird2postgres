@@ -129,6 +129,50 @@ class ASTDialectRewriter(FirebirdParserVisitor):
             self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, '')
         return self.visitChildren(ctx)
 
+    def visitColumn_based_update_set_clause(self, ctx: FirebirdParser.Column_based_update_set_clauseContext):
+        """
+        In PostgreSQL, target columns in UPDATE ... SET cannot be table-qualified
+        (e.g. 'SET tcontas.id_class = ...' causes ERROR: 42703: SET target columns cannot be qualified).
+        This strips any table qualifier from the target column(s).
+        """
+        if ctx.column_name():
+            col_name_ctx = ctx.column_name()
+            if col_name_ctx.id_expression():
+                target_col = col_name_ctx.id_expression()[-1].getText()
+                self.rewriter.replaceRangeTokens(col_name_ctx.start, col_name_ctx.stop, target_col)
+        elif ctx.paren_column_list() and ctx.paren_column_list().column_name():
+            for col_name_ctx in ctx.paren_column_list().column_name():
+                if col_name_ctx.id_expression():
+                    target_col = col_name_ctx.id_expression()[-1].getText()
+                    self.rewriter.replaceRangeTokens(col_name_ctx.start, col_name_ctx.stop, target_col)
+        return self.visitChildren(ctx)
+
+    def visitInto_clause(self, ctx: FirebirdParser.Into_clauseContext):
+        """
+        In PostgreSQL PL/pgSQL, a singleton SELECT ... INTO that finds no rows overwrites
+        target variables with NULL. In Firebird PSQL, variables preserve their existing values.
+        Adding STRICT causes PL/pgSQL to raise NO_DATA_FOUND before overwriting variables,
+        which is caught and handled in visitStatement to preserve Firebird semantics.
+        """
+        # Only add STRICT to singleton SELECT statements (not FOR loops, nor INSERT/UPDATE/DELETE RETURNING)
+        is_select_into = isinstance(ctx.parentCtx, (FirebirdParser.Query_blockContext, FirebirdParser.Select_statementContext))
+
+        parent = ctx.parentCtx
+        is_for_loop = False
+        while parent:
+            if isinstance(parent, FirebirdParser.Loop_statementContext):
+                if hasattr(parent, 'FOR') and parent.FOR():
+                    is_for_loop = True
+                    break
+            parent = parent.parentCtx
+
+        if is_select_into and not is_for_loop:
+            for c in ctx.children:
+                if hasattr(c, 'symbol') and c.symbol.text.upper() == 'INTO':
+                    self.rewriter.replaceRangeTokens(c.symbol, c.symbol, f"{c.symbol.text} STRICT")
+                    break
+        return self.visitChildren(ctx)
+
     def _rewrite_first_skip(self, ctx):
         """
         Extracts FIRST n [SKIP m] tokens from the query block and relocates them
@@ -586,7 +630,18 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         )):
             return self.visit(child)
 
-        # For all other SQL statements (SELECT, UPDATE, DELETE, EXECUTE, etc.)
+        # Singleton SELECT ... INTO statements are wrapped in BEGIN ... EXCEPTION WHEN NO_DATA_FOUND THEN NULL; END;
+        # to match Firebird PSQL semantics (preserving target variable values when no rows are found).
+        into_ctx = _find_node(ctx, FirebirdParser.Into_clauseContext)
+        if into_ctx and _find_node(ctx, FirebirdParser.Select_statementContext):
+            raw_stmt = self.get_raw_text(ctx).strip()
+            if not raw_stmt.endswith(';'):
+                raw_stmt += ';'
+            stmt_lines = [f"    {line}" for line in raw_stmt.split('\n')]
+            indented_stmt = "\n".join(stmt_lines)
+            return f"BEGIN\n{indented_stmt}\nEXCEPTION WHEN NO_DATA_FOUND THEN\n    NULL;\nEND;"
+
+        # For all other SQL statements (UPDATE, DELETE, EXECUTE, plain SELECT, etc.)
         # we just return their rewritten text.
         return self.get_raw_text(ctx)
 

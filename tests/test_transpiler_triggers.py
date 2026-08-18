@@ -98,7 +98,7 @@ class TestTranspilerTriggers(unittest.TestCase):
         END
         """
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
-        self.assertIn("INTO VID;", pg_sql)
+        self.assertIn("INTO STRICT VID;", pg_sql)
         self.assertNotIn("INTOVID", pg_sql.upper())
 
     def test_trigger_with_unspaced_where_and_returning_bind_variable(self):

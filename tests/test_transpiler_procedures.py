@@ -175,3 +175,59 @@ class TestTranspilerProcedures(unittest.TestCase):
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
         self.assertIn('CREATE FUNCTION "SP_BLOB_TEST"(P_TEXTO TEXT, P_BINARIO BYTEA) RETURNS void AS $$', pg_sql)
         self.assertIn("INSERT INTO DADOS (DOC, ARQ) VALUES (P_TEXTO, P_BINARIO);", pg_sql)
+
+    def test_update_set_qualified_columns_stripped(self):
+        fb_sql = """
+        CREATE OR ALTER PROCEDURE LIFEMEDIC
+        AS
+        declare variable CONTINUA varchar(1);
+        declare variable VIDCONTA integer;
+        declare variable VIDCLASS integer;
+        begin
+            continua = 'T';
+            while (continua <> 'F') do
+            begin
+                select first 1 tcontas_ccusto.id_ccusto,tcontas_ccusto.id_conta from tcontas_ccusto
+                              inner join tcontas on (tcontas_ccusto.id_conta = tcontas.id)
+                             where tcontas.id_class is null into :vidclass ,:vidconta;
+
+                if (vidclass > 0) then
+                    update tcontas set tcontas.id_class = :vidclass
+                    where tcontas.id = :vidconta;
+
+                if (vidclass < 1) then
+                    continua = 'F';
+
+                vidclass = 0;
+            end
+            suspend;
+        end;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("update tcontas set id_class = vidclass", pg_sql)
+        self.assertIn("where tcontas.id = vidconta;", pg_sql)
+        self.assertNotIn("set tcontas.id_class", pg_sql)
+        self.assertIn("into STRICT vidclass ,vidconta", pg_sql)
+        self.assertIn("EXCEPTION WHEN NO_DATA_FOUND THEN", pg_sql)
+
+    def test_singleton_select_into_strict_with_exception_block(self):
+        fb_sql = """
+        CREATE OR ALTER PROCEDURE SP_GET_INFO (
+            P_ID INTEGER
+        )
+        RETURNS (
+            V_NOME VARCHAR(100),
+            V_VALOR NUMERIC(15,2)
+        )
+        AS
+        DECLARE VARIABLE V_AUX INTEGER;
+        BEGIN
+            V_AUX = 0;
+            SELECT NOME, VALOR FROM CLIENTES WHERE ID = :P_ID INTO :V_NOME, :V_VALOR;
+            SUSPEND;
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("INTO STRICT V_NOME, V_VALOR", pg_sql)
+        self.assertIn("EXCEPTION WHEN NO_DATA_FOUND THEN", pg_sql)
+        self.assertIn("NULL;", pg_sql)
