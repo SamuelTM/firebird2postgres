@@ -1,4 +1,5 @@
 import logging
+import psycopg2
 from models import Table
 
 logger = logging.getLogger(__name__)
@@ -123,7 +124,7 @@ class SchemaMigrator:
             try:
                 cursor.execute("RESET synchronous_commit;")
                 self.pg_con.commit()
-            except Exception:
+            except (psycopg2.Error, OSError):
                 pass
 
     def migrate_schema(self, table_objs: list[Table]):

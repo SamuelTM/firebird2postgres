@@ -70,13 +70,13 @@ class DatabaseMigrator:
         self._ensure_schema()
         self.schema_migrator.migrate_schema(self.table_objs)
 
-    def import_data(self) -> bool:
+    def import_data(self, max_workers: int = 4) -> bool:
         """
         Reads data from Firebird and bulk inserts into PostgreSQL with sequence synchronization.
         Returns True if successful, False if any table failed.
         """
         self._ensure_schema()
-        return self.data_migrator.import_data(self.table_objs)
+        return self.data_migrator.import_data(self.table_objs, max_workers=max_workers)
 
     def export_firebird_triggers(self, output_file: str = None,
                                  converted_file: str = None,
