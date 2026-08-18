@@ -2,7 +2,7 @@
 Validates the DDL syntax of converted PostgreSQL domains, views, functions/procedures, and triggers
 against a live PostgreSQL database without making permanent changes (Dry-Run by default).
 """
-
+import os
 import re
 import sys
 from dataclasses import dataclass
