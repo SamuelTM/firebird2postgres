@@ -3,10 +3,10 @@ import logging
 from config import get_firebird_connection, get_postgres_connection, get_dump_path, DumpFiles, setup_logging
 from engine import DatabaseMigrator
 
-setup_logging()
 logger = logging.getLogger('main')
 
 if __name__ == '__main__':
+    setup_logging()
     logger.info("Connecting to Firebird...")
     fb_connection = get_firebird_connection()
 
