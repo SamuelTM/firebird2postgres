@@ -46,17 +46,23 @@ class SchemaExtractor:
 
             for column in fb_cursor.fetchall():
                 column_name = column[0].strip()
-                column_type = column[1]
-                column_subtype = column[2]
+                field_type = column[1]
+                field_subtype = column[2]
+                field_length = column[3]
                 nullable = column[4] is None
+                field_precision = column[5]
+                field_scale = column[6]
                 column_default = column[7].strip() if column[7] else None
                 domain_default = column[8].strip() if column[8] else None
                 field_source = column[9].strip() if column[9] else None
 
-                column_data_type = resolve_firebird_type(column_type, column_subtype,
-                                                         field_length=column[3],
-                                                         field_precision=column[5],
-                                                         field_scale=column[6])
+                column_data_type = resolve_firebird_type(
+                    field_type=field_type,
+                    field_subtype=field_subtype,
+                    field_length=field_length,
+                    field_precision=field_precision,
+                    field_scale=field_scale,
+                )
 
                 # RDB$FIELD_SOURCE starting with 'RDB$' is an implicit system domain, meaning the
                 # column was declared with a raw type. Anything else is a user-defined domain,

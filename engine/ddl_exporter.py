@@ -186,8 +186,19 @@ class DdlExporter:
             for param in params:
                 param_name = param[0].strip() if param[0] else 'UNKNOWN'
                 param_type_flag = param[1]  # 0=input, 1=output
+                field_type = param[3]
+                field_subtype = param[4]
+                field_length = param[5]
+                field_precision = param[6]
+                field_scale = param[7]
 
-                type_name = resolve_firebird_type(param[3], param[4], param[5], param[6], param[7])
+                type_name = resolve_firebird_type(
+                    field_type=field_type,
+                    field_subtype=field_subtype,
+                    field_length=field_length,
+                    field_precision=field_precision,
+                    field_scale=field_scale,
+                )
                 if type_name is None:
                     type_name = 'VARCHAR(255)'
 
@@ -362,11 +373,22 @@ class DdlExporter:
 
             for d in domains:
                 domain_name = d[0].strip() if d[0] else 'UNKNOWN'
+                field_type = d[1]
+                field_subtype = d[2]
+                field_length = d[3]
+                field_precision = d[4]
+                field_scale = d[5]
                 default_source = d[6].strip() if d[6] else None
                 not_null = (d[7] == 1)
                 validation_source = d[8].strip() if d[8] else None
 
-                fb_full_type = resolve_firebird_type(d[1], d[2], d[3], d[4], d[5])
+                fb_full_type = resolve_firebird_type(
+                    field_type=field_type,
+                    field_subtype=field_subtype,
+                    field_length=field_length,
+                    field_precision=field_precision,
+                    field_scale=field_scale,
+                )
                 if fb_full_type is None:
                     fb_full_type = 'VARCHAR'
                 # get_postgres_type maps base types (e.g. FLOAT -> REAL) and passes through
