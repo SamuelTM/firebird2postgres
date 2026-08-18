@@ -51,7 +51,7 @@ def setup_logging(level: str = None, log_file: str = None) -> None:
     handlers: list[logging.Handler] = [console_handler]
 
     if file_path:
-        file_handler = logging.FileHandler(file_path, mode='a', encoding='utf-8')
+        file_handler = logging.FileHandler(file_path, mode='w', encoding='utf-8')
         file_handler.setFormatter(formatter)
         file_handler.setLevel(logging.DEBUG)
         handlers.append(file_handler)
