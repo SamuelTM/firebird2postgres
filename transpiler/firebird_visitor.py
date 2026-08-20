@@ -155,7 +155,8 @@ class ASTDialectRewriter(FirebirdParserVisitor):
         which is caught and handled in visitStatement to preserve Firebird semantics.
         """
         # Only add STRICT to singleton SELECT statements (not FOR loops, nor INSERT/UPDATE/DELETE RETURNING)
-        is_select_into = isinstance(ctx.parentCtx, (FirebirdParser.Query_blockContext, FirebirdParser.Select_statementContext))
+        is_select_into = isinstance(ctx.parentCtx,
+                                    (FirebirdParser.Query_blockContext, FirebirdParser.Select_statementContext))
 
         parent = ctx.parentCtx
         is_for_loop = False
@@ -283,8 +284,10 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
            This function temporarily wraps record names in double quotes ("old".field),
            while ensuring string literals ('...') and comments (-- ... / /* ... */) remain 100% untouched.
            These temporary quotes are cleanly stripped in `_clean_sql` after parsing.
-        3. Normalizes keywords directly attached to colon bind variables without whitespace (e.g. `into:vid` -> `into :vid`).
+        3. Normalizes keywords directly attached to colon bind variables without
+           whitespace (e.g. `into:vid` -> `into :vid`).
         """
+
         # Step 1: Normalize custom exception messages (e.g. EXCEPTION EX_ERR 'custom msg';)
         def ex_repl(match):
             if match.group(1):
