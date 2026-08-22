@@ -117,11 +117,19 @@ class SchemaMigrator:
                     logger.debug(fk_query)
                     cursor.execute(fk_query)
 
-            logger.info("Saving constraint and index transactions...")
             self.pg_con.commit()
             logger.info("Constraints (PK, UK, FK) and indexes created successfully.")
+        except Exception:
+            # Discard the partial constraints transaction explicitly: without this rollback
+            # the connection stays aborted and every following statement fails with
+            # InFailedSqlTransaction (the RESET below would also fail silently)
+            self.pg_con.rollback()
+            logger.error("Constraint/index creation failed; transaction rolled back.")
+            raise
         finally:
             try:
+                # On the failure path the rollback above already restored the session default;
+                # on success this clears the session-wide synchronous_commit = OFF
                 cursor.execute("RESET synchronous_commit;")
                 self.pg_con.commit()
             except (psycopg2.Error, OSError):
