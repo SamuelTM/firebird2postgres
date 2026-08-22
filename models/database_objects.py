@@ -5,25 +5,33 @@ class Column:
         self.column_type = column_type
         self.nullable = nullable
         self.default_value = default_value
-        self.sequence_name = sequence_name
+        # PostgreSQL-side identifier (lowercase); `name` keeps the original Firebird casing,
+        # which is required for quoted (case-sensitive) queries against the source database
+        self.sequence_name = sequence_name.lower() if sequence_name else None
         self.domain_name = domain_name
+
+    @property
+    def pg_name(self) -> str:
+        return self.name.lower()
 
 
 class ForeignKey:
     def __init__(self, key_name: str, local_column_name: str, local_column_index: int, referenced_table_name: str,
                  referenced_column_name: str, referenced_column_index: int):
+        # All identifiers here are PostgreSQL-side only, so they are normalized to lowercase
         self.referenced_column_index = referenced_column_index
-        self.referenced_column_name = referenced_column_name
-        self.referenced_table_name = referenced_table_name
+        self.referenced_column_name = referenced_column_name.lower()
+        self.referenced_table_name = referenced_table_name.lower()
         self.local_column_index = local_column_index
-        self.local_column_name = local_column_name
-        self.key_name = key_name
+        self.local_column_name = local_column_name.lower()
+        self.key_name = key_name.lower()
 
 
 class UniqueKey:
     def __init__(self, name: str, column: str, is_primary_key: bool = False):
-        self.name = name
-        self.column = column
+        # PostgreSQL-side only identifiers, normalized to lowercase
+        self.name = name.lower()
+        self.column = column.lower()
         self.is_primary_key = is_primary_key
 
     def __str__(self):
@@ -33,11 +41,12 @@ class UniqueKey:
 
 class Index:
     def __init__(self, index_name: str, unique: bool, inactive: bool, column_name: str, column_index: int):
+        # PostgreSQL-side only identifiers, normalized to lowercase
         self.column_index = column_index
-        self.column_name = column_name
+        self.column_name = column_name.lower()
         self.inactive = inactive
         self.unique = unique
-        self.index_name = index_name
+        self.index_name = index_name.lower()
 
 
 def get_postgres_type(firebird_type: str) -> str:
@@ -68,25 +77,28 @@ class Table:
         self.unique_keys: list[UniqueKey] = []
         self.indexes: list[Index] = []
 
+    @property
+    def pg_name(self) -> str:
+        # PostgreSQL-side identifier (lowercase); `name` keeps the original Firebird casing,
+        # which is required for quoted (case-sensitive) queries against the source database
+        return self.name.lower()
+
     def get_sequence_queries(self) -> list[str]:
         """
         Returns a list of CREATE SEQUENCE statements for all sequence-bound columns.
         """
-        queries = []
-        for col in self.columns:
-            if col.sequence_name:
-                queries.append(f'CREATE SEQUENCE "{col.sequence_name.lower()}";')
-        return queries
+        return [f'CREATE SEQUENCE "{col.sequence_name}";'
+                for col in self.columns if col.sequence_name]
 
     def get_create_table_query(self) -> str:
         """
         Returns the single CREATE TABLE statement with column definitions and constraints.
         """
-        query = f'CREATE TABLE "{self.name.lower()}" ('
+        query = f'CREATE TABLE "{self.pg_name}" ('
 
         for i, col in enumerate(self.columns):
             converted_type = get_postgres_type(col.column_type)
-            escaped_name = f'"{col.name.lower()}"'
+            escaped_name = f'"{col.pg_name}"'
 
             if col.domain_name:
                 # Column declared with a user domain: reference it (schema-qualified, lowercase)
@@ -98,7 +110,7 @@ class Table:
                 col_def = f'{escaped_name} {converted_type}'
 
             if col.sequence_name:
-                col_def += f" DEFAULT nextval('\"{col.sequence_name.lower()}\"')"
+                col_def += f" DEFAULT nextval('\"{col.sequence_name}\"')"
             elif col.default_value:
                 col_def += f' {col.default_value}'
 
@@ -130,7 +142,7 @@ class Table:
             else:
                 foreign_keys_grouped_by_name[foreign_key.key_name].append(foreign_key)
 
-        query = f'ALTER TABLE "{self.name.lower()}" ADD '
+        query = f'ALTER TABLE "{self.pg_name}" ADD '
 
         for foreign_key_index, foreign_key_name in enumerate(foreign_keys_grouped_by_name):
             foreign_keys = foreign_keys_grouped_by_name[foreign_key_name]
@@ -144,18 +156,15 @@ class Table:
 
                 ordered_pairs = sorted(local_referenced_pairs, key=lambda x: x[1])
 
-                local_columns = [x[0] for x in ordered_pairs]
-                referenced_columns = [x[1] for x in ordered_pairs]
+                local_columns_str = ", ".join([f'"{item}"' for item, _ in ordered_pairs])
+                referenced_columns_str = ", ".join([f'"{item}"' for _, item in ordered_pairs])
 
-                local_columns_str = ", ".join([f'"{item.lower()}"' for item in local_columns])
-                referenced_columns_str = ", ".join([f'"{item.lower()}"' for item in referenced_columns])
-
-                query += (f'CONSTRAINT "{foreign_key_name.lower()}" FOREIGN KEY ({local_columns_str}) '
-                          f'REFERENCES "{foreign_keys[0].referenced_table_name.lower()}"({referenced_columns_str})')
+                query += (f'CONSTRAINT "{foreign_key_name}" FOREIGN KEY ({local_columns_str}) '
+                          f'REFERENCES "{foreign_keys[0].referenced_table_name}"({referenced_columns_str})')
             else:
                 foreign_key = foreign_keys[0]
-                query += (f'CONSTRAINT "{foreign_key.key_name.lower()}" FOREIGN KEY ("{foreign_key.local_column_name.lower()}") '
-                          f'REFERENCES "{foreign_key.referenced_table_name.lower()}"("{foreign_key.referenced_column_name.lower()}")')
+                query += (f'CONSTRAINT "{foreign_key.key_name}" FOREIGN KEY ("{foreign_key.local_column_name}") '
+                          f'REFERENCES "{foreign_key.referenced_table_name}"("{foreign_key.referenced_column_name}")')
 
             if foreign_key_index < len(foreign_keys_grouped_by_name) - 1:
                 query += ', ADD '
@@ -180,15 +189,15 @@ class Table:
             else:
                 unique_keys_grouped_by_name[unique_key.name][1].append(unique_key.column)
 
-        query = f'ALTER TABLE "{self.name.lower()}" ADD '
+        query = f'ALTER TABLE "{self.pg_name}" ADD '
 
         for unique_key_index, unique_key_name in enumerate(unique_keys_grouped_by_name):
             is_primary_key, column_names = unique_keys_grouped_by_name[unique_key_name]
-            ordered_column_names = sorted(list(column_names))
+            ordered_column_names = sorted(column_names)
 
-            columns_constraint = ', '.join([f'"{column_name.lower()}"' for column_name in ordered_column_names])
+            columns_constraint = ', '.join([f'"{column_name}"' for column_name in ordered_column_names])
             constraint_type = "PRIMARY KEY" if is_primary_key else "UNIQUE"
-            query += f'CONSTRAINT "{unique_key_name.lower()}" {constraint_type} ({columns_constraint})'
+            query += f'CONSTRAINT "{unique_key_name}" {constraint_type} ({columns_constraint})'
 
             if unique_key_index < len(unique_keys_grouped_by_name) - 1:
                 query += ', ADD '
@@ -218,14 +227,12 @@ class Table:
             first_idx = indexes_grouped_by_name[index_name][0]
             if first_idx.inactive:
                 continue
-            unique = first_idx.unique
-            if unique:
-                query = f'CREATE UNIQUE INDEX "{index_name.lower()}" ON "{self.name.lower()}" '
+            if first_idx.unique:
+                query = f'CREATE UNIQUE INDEX "{index_name}" ON "{self.pg_name}" '
             else:
-                query = f'CREATE INDEX "{index_name.lower()}" ON "{self.name.lower()}" '
+                query = f'CREATE INDEX "{index_name}" ON "{self.pg_name}" '
 
-            column_names = ', '.join(
-                [f'"{idx.column_name.lower()}"' for idx in indexes_grouped_by_name[index_name]])
+            column_names = ', '.join([f'"{idx.column_name}"' for idx in indexes_grouped_by_name[index_name]])
 
             query += f'({column_names});'
             queries.append(query)

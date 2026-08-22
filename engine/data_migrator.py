@@ -23,7 +23,7 @@ def _import_single_table(table: Table, fb_cur, pg_cur, pg_con) -> int:
 
     # Clean existing table data (no CASCADE: constraints don't exist at this pipeline stage,
     # and CASCADE would be dangerous with concurrent workers if they did)
-    pg_cur.execute(f'TRUNCATE TABLE "{table.name.lower()}";')
+    pg_cur.execute(f'TRUNCATE TABLE "{table.pg_name}";')
 
     blob_count = sum(1 for col in table.columns if 'BLOB' in col.column_type)
     batch_size = 10000
@@ -31,15 +31,17 @@ def _import_single_table(table: Table, fb_cur, pg_cur, pg_con) -> int:
         batch_size = max(1000, 10000 // (blob_count * 2))
         logger.debug(f"Found {blob_count} BLOB column(s) in '{table.name}'. Adjusted batch size to {batch_size}.")
 
-    # Explicitly list columns to ensure it perfectly matches the postgres insert order
+    # Explicitly list columns to ensure it perfectly matches the postgres insert order.
+    # Firebird-side keeps the original casing (quoted identifiers are case-sensitive there);
+    # PostgreSQL-side uses the lowercase identifier.
     fb_column_names = [f'"{col.name}"' for col in table.columns]
     fb_columns_str = ", ".join(fb_column_names)
 
-    pg_column_names = [f'"{col.name.lower()}"' for col in table.columns]
+    pg_column_names = [f'"{col.pg_name}"' for col in table.columns]
     pg_columns_str = ", ".join(pg_column_names)
 
     fb_cur.execute(f'SELECT {fb_columns_str} FROM "{table.name}"')
-    insert_query = f'INSERT INTO "{table.name.lower()}" ({pg_columns_str}) VALUES %s'
+    insert_query = f'INSERT INTO "{table.pg_name}" ({pg_columns_str}) VALUES %s'
 
     # Identify column indices that can contain text/strings to avoid unnecessary checks on numeric/date columns
     # Note: 'BLOB SUBTYPE 1' maps to TEXT (strings), while 'BLOB SUBTYPE 0' maps to BYTEA (binary)
@@ -139,7 +141,7 @@ class DataMigrator:
 
         logger.info("Disabling triggers in PostgreSQL for a clean import...")
         for table in table_objs:
-            pg_cur.execute(f'ALTER TABLE "{table.name.lower()}" DISABLE TRIGGER ALL;')
+            pg_cur.execute(f'ALTER TABLE "{table.pg_name}" DISABLE TRIGGER ALL;')
         self.pg_con.commit()
 
         # Sort tables by estimated workload (LPT: Longest Processing Time first)
@@ -190,7 +192,7 @@ class DataMigrator:
 
         logger.info("Re-enabling triggers in PostgreSQL...")
         for table in table_objs:
-            pg_cur.execute(f'ALTER TABLE "{table.name.lower()}" ENABLE TRIGGER ALL;')
+            pg_cur.execute(f'ALTER TABLE "{table.pg_name}" ENABLE TRIGGER ALL;')
         self.pg_con.commit()
 
         logger.info("Synchronizing sequences...")
@@ -198,8 +200,8 @@ class DataMigrator:
             for col in table.columns:
                 if col.sequence_name:
                     sync_query = f"""
-                        SELECT setval('"{col.sequence_name.lower()}"', COALESCE(MAX("{col.name.lower()}"), 1))
-                        FROM "{table.name.lower()}";
+                        SELECT setval('"{col.sequence_name}"', COALESCE(MAX("{col.pg_name}"), 1))
+                        FROM "{table.pg_name}";
                     """
                     logger.debug(sync_query.strip())
                     pg_cur.execute(sync_query)

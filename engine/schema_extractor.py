@@ -233,7 +233,7 @@ class SchemaExtractor:
             match = pattern.search(source)
             if match:
                 column_name = match.group(1).strip()
-                sequence_name = match.group(2).strip()
+                sequence_name = match.group(2).strip().lower()
 
                 table = tables_by_name.get(relation_name)
                 if table:
