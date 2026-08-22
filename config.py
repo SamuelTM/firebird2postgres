@@ -1,6 +1,7 @@
 import os
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Callable, TypeVar
 from dotenv import load_dotenv
 import firebirdsql
 import psycopg2
@@ -61,23 +62,37 @@ def setup_logging(level: str = None, log_file: str = None) -> None:
     root_logger.handlers = handlers
 
 
+T = TypeVar('T')
+
+
+def env_default(env_var: str, default: T, converter: Callable[[str], T] = str) -> Callable[[], T]:
+    """
+    Builds a default_factory that reads an environment variable at instantiation time
+    (instead of at module import), so late changes to os.environ are picked up and
+    conversion errors surface where the config is actually created.
+    """
+    def factory() -> T:
+        return converter(os.getenv(env_var, default))
+    return factory
+
+
 @dataclass(frozen=True)
 class FirebirdConfig:
-    host: str = os.getenv('FIREBIRD_HOST', 'localhost')
-    database: str = os.getenv('FIREBIRD_DATABASE', '/firebird/data/sample_database.fdb')
-    user: str = os.getenv('FIREBIRD_USER', 'sysdba')
-    password: str = os.getenv('FIREBIRD_PASSWORD', 'masterkey')
-    charset: str = os.getenv('FIREBIRD_CHARSET', 'WIN1252')
-    port: int = int(os.getenv('FIREBIRD_PORT', '3050'))
+    host: str = field(default_factory=env_default('FIREBIRD_HOST', 'localhost'))
+    database: str = field(default_factory=env_default('FIREBIRD_DATABASE', '/firebird/data/sample_database.fdb'))
+    user: str = field(default_factory=env_default('FIREBIRD_USER', 'sysdba'))
+    password: str = field(default_factory=env_default('FIREBIRD_PASSWORD', 'masterkey'))
+    charset: str = field(default_factory=env_default('FIREBIRD_CHARSET', 'WIN1252'))
+    port: int = field(default_factory=env_default('FIREBIRD_PORT', 3050, int))
 
 
 @dataclass(frozen=True)
 class PostgresConfig:
-    host: str = os.getenv('POSTGRES_HOST', 'localhost')
-    port: int = int(os.getenv('POSTGRES_PORT', '5432'))
-    dbname: str = os.getenv('POSTGRES_DB', 'sample_database')
-    user: str = os.getenv('POSTGRES_USER', 'postgres')
-    password: str = os.getenv('POSTGRES_PASSWORD', 'mypassword')
+    host: str = field(default_factory=env_default('POSTGRES_HOST', 'localhost'))
+    port: int = field(default_factory=env_default('POSTGRES_PORT', 5432, int))
+    dbname: str = field(default_factory=env_default('POSTGRES_DB', 'sample_database'))
+    user: str = field(default_factory=env_default('POSTGRES_USER', 'postgres'))
+    password: str = field(default_factory=env_default('POSTGRES_PASSWORD', 'mypassword'))
 
 
 def get_firebird_connection(config: FirebirdConfig = None):
