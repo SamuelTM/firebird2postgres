@@ -146,6 +146,8 @@ class SchemaExtractor:
     def _extract_unique_keys(cursor, table_name: str) -> list[UniqueKey]:
         """
         Extracts primary and unique key constraints for a given table.
+        Rows are ordered by segment position so composite keys preserve the original
+        Firebird column order in the generated PostgreSQL DDL.
         """
         cursor.execute("""
             SELECT 
@@ -155,7 +157,8 @@ class SchemaExtractor:
             FROM RDB$RELATION_CONSTRAINTS rc
             JOIN RDB$INDEX_SEGMENTS si ON rc.RDB$INDEX_NAME = si.RDB$INDEX_NAME
             WHERE rc.RDB$CONSTRAINT_TYPE IN ('UNIQUE', 'PRIMARY KEY')
-              AND rc.RDB$RELATION_NAME = ?;
+              AND rc.RDB$RELATION_NAME = ?
+            ORDER BY rc.RDB$CONSTRAINT_NAME, si.RDB$FIELD_POSITION;
         """, (table_name,))
         unique_keys = []
         for row in cursor.fetchall():

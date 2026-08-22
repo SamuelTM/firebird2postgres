@@ -157,9 +157,11 @@ class TestTableDdlGenerators(unittest.TestCase):
 
         fk_sql = table.get_foreign_keys_query()
         self.assertIsNotNone(fk_sql)
+        # Columns follow the original Firebird segment positions (ORDER_ID = 0, COMPANY_ID = 1),
+        # not alphabetical order
         self.assertEqual(
-            'ALTER TABLE "order_items" ADD CONSTRAINT "fk_order_items_order" FOREIGN KEY ("company_id", "order_id") '
-            'REFERENCES "orders"("company_id", "id");', fk_sql
+            'ALTER TABLE "order_items" ADD CONSTRAINT "fk_order_items_order" FOREIGN KEY ("order_id", "company_id") '
+            'REFERENCES "orders"("id", "company_id");', fk_sql
         )
 
     def test_table_indexes_ddl(self):

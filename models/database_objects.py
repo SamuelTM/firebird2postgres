@@ -147,14 +147,16 @@ class Table:
         for foreign_key_index, foreign_key_name in enumerate(foreign_keys_grouped_by_name):
             foreign_keys = foreign_keys_grouped_by_name[foreign_key_name]
             if len(foreign_keys) > 1:
-                local_referenced_pairs = set()
-
+                # The catalog join yields a local x referenced segment cross product; keep
+                # only the position-matched pairs, indexed by the real column position so
+                # composite keys preserve the original Firebird column order
+                pairs_by_position: dict[int, tuple[str, str]] = {}
                 for foreign_key in foreign_keys:
                     if foreign_key.local_column_index == foreign_key.referenced_column_index:
-                        local_referenced_pairs.add(
-                            (foreign_key.local_column_name, foreign_key.referenced_column_name))
+                        pairs_by_position[foreign_key.local_column_index] = (
+                            foreign_key.local_column_name, foreign_key.referenced_column_name)
 
-                ordered_pairs = sorted(local_referenced_pairs, key=lambda x: x[1])
+                ordered_pairs = [pairs_by_position[pos] for pos in sorted(pairs_by_position)]
 
                 local_columns_str = ", ".join([f'"{item}"' for item, _ in ordered_pairs])
                 referenced_columns_str = ", ".join([f'"{item}"' for _, item in ordered_pairs])
@@ -193,9 +195,10 @@ class Table:
 
         for unique_key_index, unique_key_name in enumerate(unique_keys_grouped_by_name):
             is_primary_key, column_names = unique_keys_grouped_by_name[unique_key_name]
-            ordered_column_names = sorted(column_names)
+            # Column order follows the original Firebird segment positions (guaranteed by
+            # the extraction ORDER BY)
 
-            columns_constraint = ', '.join([f'"{column_name}"' for column_name in ordered_column_names])
+            columns_constraint = ', '.join([f'"{column_name}"' for column_name in column_names])
             constraint_type = "PRIMARY KEY" if is_primary_key else "UNIQUE"
             query += f'CONSTRAINT "{unique_key_name}" {constraint_type} ({columns_constraint})'
 
