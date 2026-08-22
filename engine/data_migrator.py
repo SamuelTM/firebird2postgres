@@ -130,6 +130,26 @@ class DataMigrator:
         self.fb_con = fb_con
         self.pg_con = pg_con
 
+    def _re_enable_triggers(self, table_objs: list[Table]):
+        """
+        Re-enables all triggers disabled for the data load. Executed from a finally block:
+        an unexpected failure (e.g. a broken worker pool) must never leave the database
+        with all triggers disabled. Errors are logged instead of raised so they do not
+        mask the original exception.
+        """
+        pg_cur = self.pg_con.cursor()
+        logger.info("Re-enabling triggers in PostgreSQL...")
+        try:
+            # Clear a possibly aborted transaction left over from a failure, otherwise
+            # the ALTER TABLE statements below would fail with InFailedSqlTransaction
+            self.pg_con.rollback()
+            for table in table_objs:
+                pg_cur.execute(f'ALTER TABLE "{table.pg_name}" ENABLE TRIGGER ALL;')
+            self.pg_con.commit()
+        except psycopg2.Error as e:
+            logger.error(f"Failed to re-enable triggers: {e}. "
+                         f"Re-enable them manually with ALTER TABLE ... ENABLE TRIGGER ALL.")
+
     def import_data(self, table_objs: list[Table], max_workers: int = 4, executor: Executor = None) -> bool:
         """
         Reads data from Firebird and bulk inserts into PostgreSQL using a multi-process worker pool.
@@ -144,68 +164,68 @@ class DataMigrator:
             pg_cur.execute(f'ALTER TABLE "{table.pg_name}" DISABLE TRIGGER ALL;')
         self.pg_con.commit()
 
-        # Sort tables by estimated workload (LPT: Longest Processing Time first)
-        # Tables with BLOBs and higher column count are scheduled first
-        sorted_tables = sorted(
-            table_objs,
-            key=lambda t: (sum(1 for c in t.columns if 'BLOB' in c.column_type), len(t.columns)),
-            reverse=True
-        )
+        # Everything between DISABLE and the finally block is guarded: triggers are always
+        # re-enabled, even when an unexpected exception escapes the import
+        try:
+            # Sort tables by estimated workload (LPT: Longest Processing Time first)
+            # Tables with BLOBs and higher column count are scheduled first
+            sorted_tables = sorted(
+                table_objs,
+                key=lambda t: (sum(1 for c in t.columns if 'BLOB' in c.column_type), len(t.columns)),
+                reverse=True
+            )
 
-        results: list[tuple[str, int, str | None]] = []
+            results: list[tuple[str, int, str | None]] = []
 
-        if max_workers <= 1 or len(sorted_tables) <= 1:
-            # Sequential execution using caller connections
-            logger.info("Executing sequential table import...")
-            pg_cur.execute("SET synchronous_commit = OFF;")
-            fb_cur = self.fb_con.cursor()
-            try:
-                for table in sorted_tables:
-                    try:
-                        rows_imported = _import_single_table(table, fb_cur, pg_cur, self.pg_con)
-                        results.append((table.name, rows_imported, None))
-                    except (psycopg2.Error, firebirdsql.Error, OSError, ValueError, TypeError) as e:
-                        self.pg_con.rollback()
-                        logger.error(f"Failed to import table '{table.name}': {e}", exc_info=True)
-                        results.append((table.name, 0, str(e)))
-            finally:
+            if max_workers <= 1 or len(sorted_tables) <= 1:
+                # Sequential execution using caller connections
+                logger.info("Executing sequential table import...")
+                pg_cur.execute("SET synchronous_commit = OFF;")
+                fb_cur = self.fb_con.cursor()
                 try:
-                    pg_cur.execute("RESET synchronous_commit;")
-                    self.pg_con.commit()
-                except (psycopg2.Error, OSError):
-                    pass
-        else:
-            # Parallel execution with multi-process pool
-            logger.info(f"Spawning {max_workers} worker processes for concurrent table migration...")
-            owns_executor = executor is None
-            if owns_executor:
-                executor = ProcessPoolExecutor(max_workers=max_workers)
-
-            try:
-                futures = {executor.submit(_migrate_table_worker, table): table for table in sorted_tables}
-                for future in as_completed(futures):
-                    tbl_name, rows_imported, err = future.result()
-                    results.append((tbl_name, rows_imported, err))
-            finally:
+                    for table in sorted_tables:
+                        try:
+                            rows_imported = _import_single_table(table, fb_cur, pg_cur, self.pg_con)
+                            results.append((table.name, rows_imported, None))
+                        except (psycopg2.Error, firebirdsql.Error, OSError, ValueError, TypeError) as e:
+                            self.pg_con.rollback()
+                            logger.error(f"Failed to import table '{table.name}': {e}", exc_info=True)
+                            results.append((table.name, 0, str(e)))
+                finally:
+                    try:
+                        pg_cur.execute("RESET synchronous_commit;")
+                        self.pg_con.commit()
+                    except (psycopg2.Error, OSError):
+                        pass
+            else:
+                # Parallel execution with multi-process pool
+                logger.info(f"Spawning {max_workers} worker processes for concurrent table migration...")
+                owns_executor = executor is None
                 if owns_executor:
-                    executor.shutdown()
+                    executor = ProcessPoolExecutor(max_workers=max_workers)
 
-        logger.info("Re-enabling triggers in PostgreSQL...")
-        for table in table_objs:
-            pg_cur.execute(f'ALTER TABLE "{table.pg_name}" ENABLE TRIGGER ALL;')
-        self.pg_con.commit()
+                try:
+                    futures = {executor.submit(_migrate_table_worker, table): table for table in sorted_tables}
+                    for future in as_completed(futures):
+                        tbl_name, rows_imported, err = future.result()
+                        results.append((tbl_name, rows_imported, err))
+                finally:
+                    if owns_executor:
+                        executor.shutdown()
 
-        logger.info("Synchronizing sequences...")
-        for table in table_objs:
-            for col in table.columns:
-                if col.sequence_name:
-                    sync_query = f"""
-                        SELECT setval('"{col.sequence_name}"', COALESCE(MAX("{col.pg_name}"), 1))
-                        FROM "{table.pg_name}";
-                    """
-                    logger.debug(sync_query.strip())
-                    pg_cur.execute(sync_query)
-        self.pg_con.commit()
+            logger.info("Synchronizing sequences...")
+            for table in table_objs:
+                for col in table.columns:
+                    if col.sequence_name:
+                        sync_query = f"""
+                            SELECT setval('"{col.sequence_name}"', COALESCE(MAX("{col.pg_name}"), 1))
+                            FROM "{table.pg_name}";
+                        """
+                        logger.debug(sync_query.strip())
+                        pg_cur.execute(sync_query)
+            self.pg_con.commit()
+        finally:
+            self._re_enable_triggers(table_objs)
 
         failed_tables = [(tbl, err) for tbl, _, err in results if err is not None]
         successful_tables = sum(1 for _, _, err in results if err is None)
