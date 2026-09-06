@@ -15,8 +15,8 @@ class TestTranspilerProcedures(unittest.TestCase):
         END;
         """
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
-        self.assertIn('DROP FUNCTION IF EXISTS SP_ATUALIZA_SALDO CASCADE;', pg_sql)
-        self.assertIn('CREATE FUNCTION SP_ATUALIZA_SALDO(P_CONTA_ID INTEGER, P_VALOR NUMERIC(15,2)) '
+        self.assertIn('DROP FUNCTION IF EXISTS "sp_atualiza_saldo" CASCADE;', pg_sql)
+        self.assertIn('CREATE FUNCTION "sp_atualiza_saldo"(P_CONTA_ID INTEGER, P_VALOR NUMERIC(15,2)) '
                       'RETURNS void AS $$', pg_sql)
         self.assertIn("UPDATE CONTAS SET SALDO = SALDO +", pg_sql)
 
@@ -36,7 +36,7 @@ class TestTranspilerProcedures(unittest.TestCase):
         END;
         """
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
-        self.assertIn('DROP FUNCTION IF EXISTS SP_LISTA_ATIVOS CASCADE;', pg_sql)
+        self.assertIn('DROP FUNCTION IF EXISTS "sp_lista_ativos" CASCADE;', pg_sql)
         self.assertIn("RETURNS SETOF record", pg_sql)
         self.assertIn("RETURN NEXT;", pg_sql)
 
@@ -173,7 +173,7 @@ class TestTranspilerProcedures(unittest.TestCase):
         END;
         """
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
-        self.assertIn('CREATE FUNCTION SP_BLOB_TEST(P_TEXTO TEXT, P_BINARIO BYTEA) RETURNS void AS $$', pg_sql)
+        self.assertIn('CREATE FUNCTION "sp_blob_test"(P_TEXTO TEXT, P_BINARIO BYTEA) RETURNS void AS $$', pg_sql)
         self.assertIn("INSERT INTO DADOS (DOC, ARQ) VALUES (P_TEXTO, P_BINARIO);", pg_sql)
 
     def test_update_set_qualified_columns_stripped(self):

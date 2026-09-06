@@ -466,8 +466,8 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
 
         # DROP first to guarantee idempotency, since changing an existing function's
         # signature (parameter types or return type) requires recreating it
-        return (f'DROP FUNCTION IF EXISTS {proc_name} CASCADE;\n'
-                f'CREATE FUNCTION {proc_name}({params_str}) {return_type} AS $$\n{decl_str}{body_str}\n'
+        return (f'DROP FUNCTION IF EXISTS "{proc_name.lower()}" CASCADE;\n'
+                f'CREATE FUNCTION "{proc_name.lower()}"({params_str}) {return_type} AS $$\n{decl_str}{body_str}\n'
                 f'$$ LANGUAGE plpgsql;')
 
     def visitParameter(self, ctx: FirebirdParser.ParameterContext):
