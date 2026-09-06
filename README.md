@@ -26,7 +26,7 @@ An ANTLR-based transpiler converts triggers, stored procedures and views to PL/p
 
 - Sorts tables by workload before the import starts (LPT scheduling). Tables with BLOB columns and more columns start first.
 
-- Does bulk inserts with `psycopg2.extras.execute_values`.
+- Streams bulk data directly into PostgreSQL using the native `COPY` protocol (`copy_expert`).
 
 - Adjusts the batch size for tables with BLOB columns to save memory.
 

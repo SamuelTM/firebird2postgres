@@ -1,3 +1,4 @@
+import io
 import logging
 from concurrent.futures import ProcessPoolExecutor, as_completed, Executor
 import firebirdsql
@@ -14,9 +15,8 @@ def _import_single_table(table: Table, fb_cur, pg_cur, pg_con) -> int:
     Imports data for a single table:
     1. Truncates table in PostgreSQL (no CASCADE)
     2. Queries Firebird and fetches rows in adaptive batches
-    3. Sanitizes strings only when text columns exist and NUL bytes are detected
-    4. Inserts into PostgreSQL via execute_values with page_size=batch_size
-    5. Commits table transaction in PostgreSQL
+    3. Streams rows into PostgreSQL using native COPY protocol (copy_expert)
+    4. Commits table transaction in PostgreSQL
     Returns total rows imported.
     """
     logger.info(f"Importing data for '{table.name}'...")
@@ -43,15 +43,7 @@ def _import_single_table(table: Table, fb_cur, pg_cur, pg_con) -> int:
     pg_columns_str = ", ".join(pg_column_names)
 
     fb_cur.execute(f'SELECT {fb_columns_str} FROM "{table.name}"')
-    insert_query = f'INSERT INTO "{table.pg_name}" ({pg_columns_str}) VALUES %s'
-
-    # Identify column indices that can contain text/strings to avoid unnecessary checks on numeric/date columns
-    # Note: 'BLOB SUBTYPE 1' maps to TEXT (strings), while 'BLOB SUBTYPE 0' maps to BYTEA (binary)
-    str_col_indices = [
-        i for i, col in enumerate(cols_to_import)
-        if any(t in col.column_type.upper() for t in ('VARCHAR', 'CHAR', 'TEXT', 'BLOB SUBTYPE 1', 'CSTRING'))
-        or col.domain_name
-    ]
+    copy_sql = f'COPY "{table.pg_name}" ({pg_columns_str}) FROM STDIN WITH (FORMAT text, NULL \'\\N\')'
 
     total_rows = 0
     while True:
@@ -59,29 +51,25 @@ def _import_single_table(table: Table, fb_cur, pg_cur, pg_con) -> int:
         if not rows:
             break
 
-        # Sanitize strings only if table contains text/domain columns and a NUL byte is found
-        if not str_col_indices:
-            sanitized_rows = rows
-        else:
-            sanitized_rows = []
-            for row in rows:
-                has_nul = False
-                for idx in str_col_indices:
-                    val = row[idx]
-                    if isinstance(val, str) and '\x00' in val:
-                        has_nul = True
-                        break
-                if has_nul:
-                    row_list = list(row)
-                    for idx in str_col_indices:
-                        val = row_list[idx]
-                        if isinstance(val, str) and '\x00' in val:
-                            row_list[idx] = val.replace('\x00', '')
-                    sanitized_rows.append(tuple(row_list))
+        buf = io.StringIO()
+        for row in rows:
+            line = []
+            for val in row:
+                if val is None:
+                    line.append(r'\N')
+                elif isinstance(val, bytes):
+                    line.append(r'\\x' + val.hex())
+                elif isinstance(val, str):
+                    line.append(val.replace('\x00', '').replace('\\', '\\\\')
+                                   .replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t'))
+                elif isinstance(val, bool):
+                    line.append('t' if val else 'f')
                 else:
-                    sanitized_rows.append(row)
+                    line.append(str(val))
+            buf.write('\t'.join(line) + '\n')
 
-        psycopg2.extras.execute_values(pg_cur, insert_query, sanitized_rows, page_size=batch_size)
+        buf.seek(0)
+        pg_cur.copy_expert(copy_sql, buf)
         total_rows += len(rows)
 
     pg_con.commit()

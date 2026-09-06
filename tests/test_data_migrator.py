@@ -39,8 +39,14 @@ class TestDataMigrator(unittest.TestCase):
         success = self.migrator.import_data([table])
         self.assertTrue(success)
 
-        # Check commit was called
+        # Check commit was called and COPY protocol was used with sanitized buffer
         self.mock_pg_con.commit.assert_called()
+        self.mock_pg_cur.copy_expert.assert_called()
+        copy_sql, buf = self.mock_pg_cur.copy_expert.call_args[0]
+        self.assertIn('COPY "clientes"', copy_sql)
+        buf_val = buf.getvalue()
+        self.assertIn('JOAO SILVA', buf_val)
+        self.assertNotIn('\x00', buf_val)
 
     def test_data_migration_zero_copy_for_numeric_tables(self):
         table = Table('ESTATISTICAS')
@@ -131,5 +137,37 @@ class TestDataMigrator(unittest.TestCase):
             # Commits were executed across worker connections
             total_commits = sum(pg_conn.commit.call_count for pg_conn in created_pg_conns)
             self.assertGreaterEqual(total_commits, 2)
+
+    def test_copy_formatting_various_types(self):
+        import datetime
+        table = Table('DADOS')
+        table.columns.append(Column('ID', 'INTEGER', nullable=False))
+        table.columns.append(Column('TEXTO', 'VARCHAR(50)', nullable=True))
+        table.columns.append(Column('FOTO', 'BLOB SUBTYPE 0', nullable=True))
+        table.columns.append(Column('ATIVO', 'BOOLEAN', nullable=True))
+        table.columns.append(Column('CRIADO_EM', 'TIMESTAMP', nullable=True))
+
+        raw_rows = [
+            (1, 'Texto com \n newline e \t tab e \\ barra', b'\xde\xad\xbe\xef', True, datetime.datetime(2026, 1, 1, 12, 0, 0)),
+            (2, None, None, False, None)
+        ]
+        self.mock_fb_cur.fetchmany.side_effect = [raw_rows, []]
+
+        success = self.migrator.import_data([table], max_workers=1)
+        self.assertTrue(success)
+
+        self.mock_pg_cur.copy_expert.assert_called()
+        copy_sql, buf = self.mock_pg_cur.copy_expert.call_args[0]
+        self.assertIn('COPY "dados"', copy_sql)
+        buf_val = buf.getvalue()
+        # Escaping
+        self.assertIn(r'Texto com \n newline e \t tab e \\ barra', buf_val)
+        # Bytea hex
+        self.assertIn(r'\\xdeadbeef', buf_val)
+        # Booleans
+        self.assertIn('\tt\t', buf_val)
+        self.assertIn('\tf\t', buf_val)
+        # NULLs
+        self.assertIn(r'\N', buf_val)
 
 
