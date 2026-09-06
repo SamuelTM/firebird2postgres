@@ -75,21 +75,6 @@ def get_postgres_type(firebird_type: str) -> str:
     return type_mapping.get(firebird_type, firebird_type)
 
 
-def _is_enclosed_in_parens(s: str) -> bool:
-    s = s.strip()
-    if not (s.startswith('(') and s.endswith(')')):
-        return False
-    depth = 0
-    for i, ch in enumerate(s):
-        if ch == '(':
-            depth += 1
-        elif ch == ')':
-            depth -= 1
-            if depth == 0 and i < len(s) - 1:
-                return False
-    return depth == 0
-
-
 class Table:
     def __init__(self, name: str):
         self.name = name
@@ -123,9 +108,7 @@ class Table:
 
             if col.computed_source:
                 expr = col.computed_source.strip()
-                if not _is_enclosed_in_parens(expr):
-                    expr = f"({expr})"
-                col_def = f'{escaped_name} {type_decl} GENERATED ALWAYS AS {expr} STORED'
+                col_def = f'{escaped_name} {type_decl} GENERATED ALWAYS AS ({expr}) STORED'
             else:
                 col_def = f'{escaped_name} {type_decl}'
 
@@ -266,9 +249,7 @@ class Table:
 
             if first_idx.expression:
                 expr = first_idx.expression.strip()
-                if not _is_enclosed_in_parens(expr):
-                    expr = f"({expr})"
-                query += f'({expr});'
+                query += f'(({expr}));'
             else:
                 column_names = ', '.join([f'"{idx.column_name}"' for idx in indexes_grouped_by_name[index_name] if idx.column_name])
                 query += f'({column_names});'

@@ -192,11 +192,13 @@ class TestTableDdlGenerators(unittest.TestCase):
         table.columns.append(Column('TOTAL', 'NUMERIC(15,2)', nullable=True, computed_source='QTD * PRECO'))
         table.columns.append(Column('TOTAL_LIQUIDO', 'NUMERIC(15,2)', nullable=False, domain_name='dom_moeda', computed_source='QTD * PRECO * 0.9'))
         table.columns.append(Column('SUM_VALS', 'NUMERIC(15,2)', nullable=True, computed_source='(QTD) + (PRECO)'))
+        table.columns.append(Column('STR_CONCAT', 'VARCHAR(100)', nullable=True, computed_source="('(') || (')')"))
 
         create_sql = table.get_create_table_query()
         self.assertIn('"total" NUMERIC(15,2) GENERATED ALWAYS AS (QTD * PRECO) STORED', create_sql)
         self.assertIn('"total_liquido" public."dom_moeda" GENERATED ALWAYS AS (QTD * PRECO * 0.9) STORED NOT NULL', create_sql)
         self.assertIn('"sum_vals" NUMERIC(15,2) GENERATED ALWAYS AS ((QTD) + (PRECO)) STORED', create_sql)
+        self.assertIn('"str_concat" VARCHAR(100) GENERATED ALWAYS AS ((\'(\') || (\')\')) STORED', create_sql)
 
     def test_table_indexes_ddl(self):
         table = Table('PRODUCTS')
@@ -314,10 +316,20 @@ class TestTableDdlGenerators(unittest.TestCase):
             )
         )
 
+        table.indexes.append(
+            Index(
+                index_name='IDX_STR_CONCAT',
+                unique=False,
+                inactive=False,
+                expression="('(') || (')')",
+            )
+        )
+
         idx_queries = table.get_index_queries()
-        self.assertEqual(len(idx_queries), 2)
-        self.assertIn('CREATE INDEX "idx_clientes_nome_upper" ON "clientes" ((UPPER(NOME)));', idx_queries)
+        self.assertEqual(len(idx_queries), 3)
+        self.assertIn('CREATE INDEX "idx_clientes_nome_upper" ON "clientes" (((UPPER(NOME))));', idx_queries)
         self.assertIn('CREATE UNIQUE INDEX "uk_clientes_doc_clean" ON "clientes" ((TRIM(CNPJ)));', idx_queries)
+        self.assertIn('CREATE INDEX "idx_str_concat" ON "clientes" (((\'(\') || (\')\')));', idx_queries)
 
 
 class TestSequenceModel(unittest.TestCase):
