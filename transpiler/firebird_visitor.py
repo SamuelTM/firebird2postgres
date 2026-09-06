@@ -151,7 +151,7 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                 f"({date_str} + ({num_str}) * INTERVAL '1 {part_str}')"
             )
         elif fn_name == 'DATEDIFF' and len(args) == 3:
-            part_str = self._get_tokens_text(args[0]).strip().lower()
+            part_str = self._get_tokens_text(args[0]).strip().strip("'\"").lower()
             d1_str = self._get_tokens_text(args[1]).strip()
             d2_str = self._get_tokens_text(args[2]).strip()
             if part_str in ('day', 'days'):
@@ -170,26 +170,33 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                     f"((EXTRACT(YEAR FROM {d2_str}::timestamp) - EXTRACT(YEAR FROM {d1_str}::timestamp)) * 12 + "
                     f"EXTRACT(MONTH FROM {d2_str}::timestamp) - EXTRACT(MONTH FROM {d1_str}::timestamp))"
                 )
+            elif part_str in ('week', 'weeks'):
+                self.rewriter.replaceRangeTokens(
+                    ctx.start, ctx.stop,
+                    f"((DATE_TRUNC('week', {d2_str}::timestamp)::date - DATE_TRUNC('week', {d1_str}::timestamp)::date) / 7)"
+                )
             elif part_str in ('hour', 'hours'):
                 self.rewriter.replaceRangeTokens(
                     ctx.start, ctx.stop,
-                    f"FLOOR(EXTRACT(EPOCH FROM ({d2_str}::timestamp - {d1_str}::timestamp)) / 3600)"
+                    f"ROUND(EXTRACT(EPOCH FROM (DATE_TRUNC('hour', {d2_str}::timestamp) - DATE_TRUNC('hour', {d1_str}::timestamp))) / 3600)"
                 )
             elif part_str in ('minute', 'minutes'):
                 self.rewriter.replaceRangeTokens(
                     ctx.start, ctx.stop,
-                    f"FLOOR(EXTRACT(EPOCH FROM ({d2_str}::timestamp - {d1_str}::timestamp)) / 60)"
+                    f"ROUND(EXTRACT(EPOCH FROM (DATE_TRUNC('minute', {d2_str}::timestamp) - DATE_TRUNC('minute', {d1_str}::timestamp))) / 60)"
                 )
             elif part_str in ('second', 'seconds'):
                 self.rewriter.replaceRangeTokens(
                     ctx.start, ctx.stop,
-                    f"FLOOR(EXTRACT(EPOCH FROM ({d2_str}::timestamp - {d1_str}::timestamp)))"
+                    f"ROUND(EXTRACT(EPOCH FROM (DATE_TRUNC('second', {d2_str}::timestamp) - DATE_TRUNC('second', {d1_str}::timestamp))))"
                 )
-            else:
+            elif part_str in ('millisecond', 'milliseconds', 'ms'):
                 self.rewriter.replaceRangeTokens(
                     ctx.start, ctx.stop,
-                    f"(DATE({d2_str}) - DATE({d1_str}))"
+                    f"ROUND(EXTRACT(EPOCH FROM (DATE_TRUNC('milliseconds', {d2_str}::timestamp) - DATE_TRUNC('milliseconds', {d1_str}::timestamp))) * 1000)"
                 )
+            else:
+                raise ValueError(f"Unsupported DATEDIFF unit: '{part_str}'")
 
         return None
 

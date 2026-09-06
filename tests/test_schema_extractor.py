@@ -83,6 +83,26 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
             "(DATE(D2) - DATE(D1))",
         )
         self.assertEqual(
+            FirebirdToPostgresVisitor.transpile_expression("DATEDIFF(WEEK, D1, D2)"),
+            "((DATE_TRUNC('week', D2::timestamp)::date - DATE_TRUNC('week', D1::timestamp)::date) / 7)",
+        )
+        self.assertEqual(
+            FirebirdToPostgresVisitor.transpile_expression("DATEDIFF(HOUR, D1, D2)"),
+            "ROUND(EXTRACT(EPOCH FROM (DATE_TRUNC('hour', D2::timestamp) - DATE_TRUNC('hour', D1::timestamp))) / 3600)",
+        )
+        self.assertEqual(
+            FirebirdToPostgresVisitor.transpile_expression("DATEDIFF(MINUTE, D1, D2)"),
+            "ROUND(EXTRACT(EPOCH FROM (DATE_TRUNC('minute', D2::timestamp) - DATE_TRUNC('minute', D1::timestamp))) / 60)",
+        )
+        self.assertEqual(
+            FirebirdToPostgresVisitor.transpile_expression("DATEDIFF(SECOND, D1, D2)"),
+            "ROUND(EXTRACT(EPOCH FROM (DATE_TRUNC('second', D2::timestamp) - DATE_TRUNC('second', D1::timestamp))))",
+        )
+        self.assertEqual(
+            FirebirdToPostgresVisitor.transpile_expression("DATEDIFF(MILLISECOND, D1, D2)"),
+            "ROUND(EXTRACT(EPOCH FROM (DATE_TRUNC('milliseconds', D2::timestamp) - DATE_TRUNC('milliseconds', D1::timestamp))) * 1000)",
+        )
+        self.assertEqual(
             FirebirdToPostgresVisitor.transpile_expression("GEN_ID(GEN_SEQ, 1)"),
             "nextval('GEN_SEQ')",
         )

@@ -432,6 +432,7 @@ class TestTranspilerProcedures(unittest.TestCase):
             V_DT = DATEADD(DAY, 5, V_DT);
             V_DT = DATEADD(MONTH, -1, V_DT);
             V_DIFF = DATEDIFF(DAY, V_DT, CURRENT_DATE);
+            V_DIFF = DATEDIFF(HOUR, V_DT, CURRENT_TIMESTAMP);
         END;
         """
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
@@ -441,6 +442,7 @@ class TestTranspilerProcedures(unittest.TestCase):
         self.assertIn("V_DT := (V_DT + (5) * INTERVAL '1 day');", pg_sql)
         self.assertIn("V_DT := (V_DT + (-1) * INTERVAL '1 month');", pg_sql)
         self.assertIn("V_DIFF := (DATE(CURRENT_DATE) - DATE(V_DT));", pg_sql)
+        self.assertIn("V_DIFF := ROUND(EXTRACT(EPOCH FROM (DATE_TRUNC('hour', CURRENT_TIMESTAMP::timestamp) - DATE_TRUNC('hour', V_DT::timestamp))) / 3600);", pg_sql)
 
 
 

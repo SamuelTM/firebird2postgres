@@ -23,3 +23,16 @@ class TestTranspilerErrors(unittest.TestCase):
         garbled_sql = "FOOBAR BAZ QUX %$$#@! 123"
         with self.assertRaises(ParseCancellationException):
             FirebirdToPostgresVisitor.transpile(garbled_sql)
+
+    def test_unsupported_datediff_unit_raises_value_error(self):
+        sql = """
+        CREATE OR ALTER PROCEDURE SP_BAD_DATEDIFF
+        AS
+        DECLARE VARIABLE V_X INTEGER;
+        BEGIN
+            V_X = DATEDIFF(FOOBAR, CURRENT_DATE, CURRENT_DATE);
+        END;
+        """
+        with self.assertRaises(ValueError):
+            FirebirdToPostgresVisitor.transpile(sql)
+
