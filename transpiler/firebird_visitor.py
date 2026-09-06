@@ -364,10 +364,9 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                     f"(SELECT CASE WHEN is_called THEN last_value ELSE last_value - 1 END FROM {quoted_seq})"
                 )
             else:
-                series_arg = step if step.isdigit() else f"({step})::bigint"
-                self.rewriter.replaceRangeTokens(
-                    ctx.start, ctx.stop,
-                    f"(SELECT max(nextval('{raw_seq}')) FROM generate_series(1, {series_arg}))"
+                raise ValueError(
+                    f"Unsupported GEN_ID step '{step}' for sequence '{clean_seq}'. "
+                    f"PostgreSQL sequences only support atomic step 1 (nextval) and step 0 (current state inspection)."
                 )
         elif fn_name == 'IIF' and len(args) == 3:
             cond_str = self._get_tokens_text(args[0]).strip()

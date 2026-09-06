@@ -118,22 +118,25 @@ class TestTranspilerProcedures(unittest.TestCase):
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
         self.assertIn("RAISE EXCEPTION 'EX_SALDO_INSUFICIENTE: %', 'Saldo insuficiente para a operacao';", pg_sql)
 
-    def test_gen_id_currval_and_setval(self):
+    def test_gen_id_step_zero_and_one_and_rejection_of_custom_steps(self):
         fb_sql = """
         CREATE OR ALTER PROCEDURE SP_TEST_GEN
-        RETURNS (CURR_VAL INTEGER, CUSTOM_STEP INTEGER, STEP_TWO INTEGER)
+        RETURNS (CURR_VAL INTEGER, NEXT_VAL INTEGER)
         AS
         BEGIN
             CURR_VAL = GEN_ID(GEN_PEDIDOS, 0);
-            CUSTOM_STEP = GEN_ID(GEN_PEDIDOS, 5);
-            STEP_TWO = GEN_ID(GEN_PEDIDOS, 2);
+            NEXT_VAL = GEN_ID(GEN_PEDIDOS, 1);
             SUSPEND;
         END;
         """
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
         self.assertIn("CURR_VAL := (SELECT CASE WHEN is_called THEN last_value ELSE last_value - 1 END FROM \"gen_pedidos\");", pg_sql)
-        self.assertIn("CUSTOM_STEP := (SELECT max(nextval('GEN_PEDIDOS')) FROM generate_series(1, 5));", pg_sql)
-        self.assertIn("STEP_TWO := (SELECT max(nextval('GEN_PEDIDOS')) FROM generate_series(1, 2));", pg_sql)
+        self.assertIn("NEXT_VAL := nextval('GEN_PEDIDOS');", pg_sql)
+
+        for invalid_step in [2, 5, -1, 100]:
+            with self.assertRaises(ValueError) as cm:
+                FirebirdToPostgresVisitor.transpile(f"CREATE PROCEDURE P AS BEGIN DUMMY = GEN_ID(GEN_PEDIDOS, {invalid_step}); END;")
+            self.assertIn("Unsupported GEN_ID step", str(cm.exception))
 
     def test_execute_procedure_to_perform(self):
         fb_sql = """
