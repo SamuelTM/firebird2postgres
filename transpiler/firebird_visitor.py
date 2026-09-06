@@ -341,6 +341,17 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                         self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, norm)
         return self.visitChildren(ctx)
 
+    @staticmethod
+    def _normalize_sequence_target(raw_seq: str) -> tuple[str, str, str]:
+        raw = raw_seq.strip()
+        if raw.startswith('"') and raw.endswith('"'):
+            clean = raw[1:-1].replace('""', '"')
+            quoted = pg_quote_ident(clean.lower())
+            return quoted.replace("'", "''"), quoted, clean
+        clean = raw
+        quoted = pg_quote_ident(clean.lower())
+        return raw.replace("'", "''"), quoted, clean
+
     def visitGeneral_element_part(self, ctx: FirebirdParser.General_element_partContext):
         self.visitChildren(ctx)
 
@@ -364,14 +375,9 @@ class ASTDialectRewriter(FirebirdParserVisitor):
 
         if fn_name == 'GEN_ID' and len(args) >= 2:
             raw_seq = args[0].getText()
-            clean_seq = raw_seq.strip('\'"').lower()
-            quoted_seq = pg_quote_ident(clean_seq)
+            seq_target, quoted_seq, clean_seq = self._normalize_sequence_target(raw_seq)
             step = args[1].getText().strip()
             if step == '1':
-                if raw_seq.startswith('"') and raw_seq.endswith('"'):
-                    seq_target = quoted_seq.replace("'", "''")
-                else:
-                    seq_target = raw_seq.replace("'", "''")
                 self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"nextval('{seq_target}')")
             elif step == '0':
                 self.rewriter.replaceRangeTokens(
@@ -465,12 +471,7 @@ class ASTDialectRewriter(FirebirdParserVisitor):
     def visitUnary_expression(self, ctx: FirebirdParser.Unary_expressionContext):
         raw = ctx.getText().upper()
         if 'NEXTVALUEFOR' in raw and ctx.identifier():
-            raw_seq = ctx.identifier().getText().strip()
-            if raw_seq.startswith('"') and raw_seq.endswith('"'):
-                clean_seq = raw_seq[1:-1].replace('""', '"')
-                seq_target = pg_quote_ident(clean_seq.lower()).replace("'", "''")
-            else:
-                seq_target = raw_seq.replace("'", "''")
+            seq_target, _, _ = self._normalize_sequence_target(ctx.identifier().getText())
             self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"nextval('{seq_target}')")
             return None
         return self.visitChildren(ctx)

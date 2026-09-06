@@ -150,6 +150,18 @@ class TestTranspilerProcedures(unittest.TestCase):
         self.assertIn("nextval('\"gen_test\"')", pg_sql)
         self.assertIn('FROM "gen_test"', pg_sql)
 
+    def test_gen_id_with_internal_quotes_in_sequence_name(self):
+        fb_sql = '''
+        CREATE PROCEDURE P AS
+        BEGIN
+            DUMMY = GEN_ID("GEN_""SPECIAL""", 1);
+            CURRENT_VAL = GEN_ID("GEN_""SPECIAL""", 0);
+        END;
+        '''
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn('nextval(\'"gen_""special"""\')', pg_sql)
+        self.assertIn('FROM "gen_""special"""', pg_sql)
+
     def test_next_value_for_with_quoted_and_unquoted_sequence(self):
         fb_sql = """
         CREATE PROCEDURE P AS
