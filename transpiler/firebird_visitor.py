@@ -465,8 +465,14 @@ class ASTDialectRewriter(FirebirdParserVisitor):
     def visitUnary_expression(self, ctx: FirebirdParser.Unary_expressionContext):
         raw = ctx.getText().upper()
         if 'NEXTVALUEFOR' in raw and ctx.identifier():
-            seq_name = ctx.identifier().getText()
-            self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"nextval('{seq_name}')")
+            raw_seq = ctx.identifier().getText().strip()
+            if raw_seq.startswith('"') and raw_seq.endswith('"'):
+                clean_seq = raw_seq[1:-1].replace('""', '"')
+                seq_target = pg_quote_ident(clean_seq.lower()).replace("'", "''")
+            else:
+                seq_target = raw_seq.replace("'", "''")
+            self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"nextval('{seq_target}')")
+            return None
         return self.visitChildren(ctx)
 
     def visitCall_statement(self, ctx: FirebirdParser.Call_statementContext):

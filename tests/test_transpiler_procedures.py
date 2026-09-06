@@ -150,6 +150,18 @@ class TestTranspilerProcedures(unittest.TestCase):
         self.assertIn("nextval('\"gen_test\"')", pg_sql)
         self.assertIn('FROM "gen_test"', pg_sql)
 
+    def test_next_value_for_with_quoted_and_unquoted_sequence(self):
+        fb_sql = """
+        CREATE PROCEDURE P AS
+        BEGIN
+            DUMMY = NEXT VALUE FOR "GEN_TEST";
+            DUMMY = NEXT VALUE FOR GEN_NORMAL;
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("nextval('\"gen_test\"')", pg_sql)
+        self.assertIn("nextval('GEN_NORMAL')", pg_sql)
+
     def test_execute_procedure_to_perform(self):
         fb_sql = """
         CREATE OR ALTER PROCEDURE SP_CHAMA_OUTRA
