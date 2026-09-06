@@ -45,6 +45,31 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
         self.assertIn("RDB$TRIGGER_INACTIVE = 0", called_sql)
         self.assertIn("RDB$TRIGGER_INACTIVE IS NULL", called_sql)
 
+    def test_bind_sequence_generators_filters_non_defaults_and_comments(self):
+        table = Table('USERS')
+        col_id = Column('ID', 'INTEGER', nullable=False)
+        col_ext = Column('EXT_ID', 'INTEGER', nullable=True)
+        col_audit = Column('AUDIT_ID', 'INTEGER', nullable=True)
+        table.columns.extend([col_id, col_ext, col_audit])
+
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [
+            # Commented out code should NOT bind
+            ("USERS", "AS BEGIN /* NEW.ID = GEN_ID(GEN_COMMENTED, 1); */ -- NEW.ID = GEN_ID(GEN_SINGLE, 1);\n END;", 1),
+            # Step 0 (inspect current value) should NOT bind
+            ("USERS", "AS BEGIN NEW.ID = GEN_ID(GEN_CURRENT, 0); END;", 1),
+            # Condition on another column should NOT bind (arbitrary business logic)
+            ("USERS", "AS BEGIN IF (NEW.STATUS = 'SPECIAL') THEN NEW.EXT_ID = GEN_ID(GEN_SPECIAL, 1); END;", 1),
+            # Non-BEFORE INSERT trigger (e.g. trigger_type 3 = BEFORE UPDATE) should NOT bind
+            ("USERS", "AS BEGIN NEW.AUDIT_ID = GEN_ID(GEN_AUDIT, 1); END;", 3),
+        ]
+
+        SchemaExtractor._bind_sequence_generators(mock_cursor, [table])
+
+        self.assertIsNone(col_id.sequence_name)
+        self.assertIsNone(col_ext.sequence_name)
+        self.assertIsNone(col_audit.sequence_name)
+
     def test_extract_columns_transpiles_computed_source(self):
         mock_cursor = MagicMock()
         # column tuple: name, type, subtype, length, null_flag, prec, scale, col_def, dom_def, fld_src, comp_src

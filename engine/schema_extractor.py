@@ -299,39 +299,70 @@ class SchemaExtractor:
     def _bind_sequence_generators(cursor, table_objs: list[Table]) -> None:
         """
         Inspects trigger bodies for GEN_ID / NEXT VALUE FOR usage and binds identified
-        sequences to table columns, matching case-insensitively and ignoring inactive triggers.
+        sequences to table columns only for genuine auto-increment / identity defaults
+        on BEFORE INSERT triggers (RDB$TRIGGER_TYPE = 1).
+        Ignores commented-out code, step != 1 (e.g. GEN_ID(..., 0)), non-BEFORE-INSERT triggers,
+        and assignments conditioned on other columns.
         """
         cursor.execute("""
-            SELECT RDB$RELATION_NAME, RDB$TRIGGER_SOURCE
+            SELECT RDB$RELATION_NAME, RDB$TRIGGER_SOURCE, RDB$TRIGGER_TYPE
             FROM RDB$TRIGGERS
             WHERE RDB$SYSTEM_FLAG = 0
               AND RDB$TRIGGER_SOURCE IS NOT NULL
               AND (RDB$TRIGGER_INACTIVE = 0 OR RDB$TRIGGER_INACTIVE IS NULL);
         """)
         triggers = cursor.fetchall()
-        pattern = re.compile(
-            r'NEW\.(?:")?([A-Za-z0-9_]+)(?:")?\s*=\s*(?:GEN_ID\s*\(\s*([A-Za-z0-9_]+)\s*,\s*\d+\s*\)|NEXT\s+VALUE\s+FOR\s+([A-Za-z0-9_]+))',
+        tables_by_name = {t.name.upper(): t for t in table_objs}
+
+        uncond_re = re.compile(
+            r"^(?:(?:AS\s+)?BEGIN\s+)?NEW\.(?:\"|\s)*([A-Za-z0-9_]+)(?:\"|\s)*=\s*(?:GEN_ID\s*\(\s*([A-Za-z0-9_]+)\s*,\s*1\s*\)|NEXT\s+VALUE\s+FOR\s+([A-Za-z0-9_]+))\s*(?:END)?$",
             re.IGNORECASE
         )
-        tables_by_name = {t.name.upper(): t for t in table_objs}
+        if_re = re.compile(
+            r"^(?:(?:AS\s+)?BEGIN\s+)?IF\s*\((.*?)\)\s*THEN\s*(?:BEGIN\s+)?NEW\.(?:\"|\s)*([A-Za-z0-9_]+)(?:\"|\s)*=\s*(?:GEN_ID\s*\(\s*([A-Za-z0-9_]+)\s*,\s*1\s*\)|NEXT\s+VALUE\s+FOR\s+([A-Za-z0-9_]+))\s*(?:END)?$",
+            re.IGNORECASE | re.DOTALL
+        )
 
         for trigger in triggers:
             relation_name = trigger[0].strip() if trigger[0] else None
             source = trigger[1]
-            if not relation_name or not source:
+            trigger_type = trigger[2] if len(trigger) > 2 else 1
+            if not relation_name or not source or trigger_type != 1:
                 continue
 
             table = tables_by_name.get(relation_name.upper())
             if not table:
                 continue
 
-            for match in pattern.finditer(source):
-                column_name = match.group(1).strip()
-                sequence_name = (match.group(2) or match.group(3)).strip().lower()
+            # Strip comments (-- and /* ... */)
+            clean = re.sub(r"--[^\r\n]*", "", source)
+            clean = re.sub(r"/\*.*?\*/", "", clean, flags=re.DOTALL)
 
-                column = next((c for c in table.columns if c.name.upper() == column_name.upper()), None)
-                if column:
-                    column.sequence_name = sequence_name
+            stmts = [s.strip() for s in clean.split(";") if s.strip()]
+            for stmt in stmts:
+                col_name = None
+                seq_name = None
+
+                m_uncond = uncond_re.match(stmt)
+                if m_uncond:
+                    col_name = m_uncond.group(1).strip()
+                    seq_name = (m_uncond.group(2) or m_uncond.group(3)).strip().lower()
+                else:
+                    m_if = if_re.match(stmt)
+                    if m_if:
+                        cond = m_if.group(1).strip()
+                        c = m_if.group(2).strip()
+                        s = (m_if.group(3) or m_if.group(4)).strip().lower()
+                        cond_cols = re.findall(r"NEW\.(?:\"|\s)*([A-Za-z0-9_]+)(?:\"|\s)*", cond, re.IGNORECASE)
+                        # Verify condition only guards this same column (e.g. NEW.ID IS NULL or NEW.ID = 0)
+                        if cond_cols and all(col.upper() == c.upper() for col in cond_cols):
+                            col_name = c
+                            seq_name = s
+
+                if col_name and seq_name:
+                    column = next((c for c in table.columns if c.name.upper() == col_name.upper()), None)
+                    if column:
+                        column.sequence_name = seq_name
 
     @staticmethod
     def _extract_sequences(cursor) -> list[Sequence]:
