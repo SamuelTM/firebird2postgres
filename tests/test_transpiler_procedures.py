@@ -138,6 +138,18 @@ class TestTranspilerProcedures(unittest.TestCase):
                 FirebirdToPostgresVisitor.transpile(f"CREATE PROCEDURE P AS BEGIN DUMMY = GEN_ID(GEN_PEDIDOS, {invalid_step}); END;")
             self.assertIn("Unsupported GEN_ID step", str(cm.exception))
 
+    def test_gen_id_with_quoted_sequence_name(self):
+        fb_sql = """
+        CREATE PROCEDURE P AS
+        BEGIN
+            DUMMY = GEN_ID("GEN_TEST", 1);
+            CURRENT_VAL = GEN_ID("GEN_TEST", 0);
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("nextval('\"gen_test\"')", pg_sql)
+        self.assertIn('FROM "gen_test"', pg_sql)
+
     def test_execute_procedure_to_perform(self):
         fb_sql = """
         CREATE OR ALTER PROCEDURE SP_CHAMA_OUTRA

@@ -48,3 +48,14 @@ class TestTranspilerViews(unittest.TestCase):
         self.assertIn('CREATE VIEW "v_base" ("id") AS SELECT ID FROM T;', pg_sql)
         self.assertIn('DROP VIEW IF EXISTS "v_child" CASCADE;', pg_sql)
         self.assertIn('CREATE VIEW "v_child" ("id") AS SELECT ID FROM V_BASE;', pg_sql)
+
+    def test_view_with_quoted_identifiers_in_select_body(self):
+        fb_sql = """
+        CREATE VIEW "V_BASE" ("ID") AS SELECT "ID" FROM "T";
+        CREATE VIEW "V_CHILD" ("ID") AS SELECT "ID" FROM "V_BASE";
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn('DROP VIEW IF EXISTS "v_base" CASCADE;', pg_sql)
+        self.assertIn('CREATE VIEW "v_base" ("id") AS SELECT "id" FROM "t";', pg_sql)
+        self.assertIn('DROP VIEW IF EXISTS "v_child" CASCADE;', pg_sql)
+        self.assertIn('CREATE VIEW "v_child" ("id") AS SELECT "id" FROM "v_base";', pg_sql)

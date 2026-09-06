@@ -330,6 +330,17 @@ class ASTDialectRewriter(FirebirdParserVisitor):
             )
         return ctx.getText()
 
+    def visitId_expression(self, ctx: FirebirdParser.Id_expressionContext):
+        if ctx.DELIMITED_ID():
+            raw = ctx.getText()
+            if raw.startswith('"') and raw.endswith('"'):
+                clean = raw[1:-1].replace('""', '"')
+                if clean.upper() not in ('NEW', 'OLD'):
+                    norm = pg_quote_ident(clean.lower())
+                    if norm != raw:
+                        self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, norm)
+        return self.visitChildren(ctx)
+
     def visitGeneral_element_part(self, ctx: FirebirdParser.General_element_partContext):
         self.visitChildren(ctx)
 
@@ -357,7 +368,11 @@ class ASTDialectRewriter(FirebirdParserVisitor):
             quoted_seq = pg_quote_ident(clean_seq)
             step = args[1].getText().strip()
             if step == '1':
-                self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"nextval('{raw_seq}')")
+                if raw_seq.startswith('"') and raw_seq.endswith('"'):
+                    seq_target = quoted_seq.replace("'", "''")
+                else:
+                    seq_target = raw_seq.replace("'", "''")
+                self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"nextval('{seq_target}')")
             elif step == '0':
                 self.rewriter.replaceRangeTokens(
                     ctx.start, ctx.stop,
