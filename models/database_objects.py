@@ -119,7 +119,8 @@ class Table:
 
             if not col.computed_source:
                 if col.sequence_name:
-                    col_def += f" DEFAULT nextval('{pg_quote_ident(col.sequence_name)}')"
+                    nextval_literal = pg_quote_ident(col.sequence_name).replace("'", "''")
+                    col_def += f" DEFAULT nextval('{nextval_literal}')"
                 elif col.default_value:
                     col_def += f' {col.default_value}'
 

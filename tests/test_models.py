@@ -100,6 +100,12 @@ class TestTableDdlGenerators(unittest.TestCase):
         seqs = table.get_sequence_queries()
         self.assertEqual(seqs[0], 'CREATE SEQUENCE "gen_""seq""";')
 
+    def test_table_sequence_with_apostrophe(self):
+        table = Table('EMPLOYEES')
+        table.columns.append(Column('ID', 'INTEGER', nullable=False, sequence_name="gen_o'brien"))
+        create_sql = table.get_create_table_query()
+        self.assertIn('DEFAULT nextval(\'"gen_o\'\'brien"\')', create_sql)
+
     def test_table_unique_keys_ddl(self):
         table = Table('USERS')
         table.unique_keys.append(UniqueKey('PK_USERS', column='ID', is_primary_key=True))
