@@ -281,3 +281,36 @@ class TestTableDdlGenerators(unittest.TestCase):
         self.assertEqual(table.get_index_queries(), [])
         self.assertIsNone(table.get_unique_keys_query())
         self.assertIsNone(table.get_foreign_keys_query())
+
+    def test_table_expression_indexes_ddl(self):
+        table = Table('CLIENTES')
+        table.indexes.append(
+            Index(
+                index_name='IDX_CLIENTES_NOME_UPPER',
+                unique=False,
+                inactive=False,
+                expression='(UPPER(NOME))',
+            )
+        )
+        table.indexes.append(
+            Index(
+                index_name='UK_CLIENTES_DOC_CLEAN',
+                unique=True,
+                inactive=False,
+                expression='TRIM(CNPJ)',
+            )
+        )
+        table.indexes.append(
+            Index(
+                index_name='IDX_EXPR_INACTIVE',
+                unique=False,
+                inactive=True,
+                expression='(EXTRACT(YEAR FROM DATA_CADASTRO))',
+            )
+        )
+
+        idx_queries = table.get_index_queries()
+        self.assertEqual(len(idx_queries), 2)
+        self.assertIn('CREATE INDEX "idx_clientes_nome_upper" ON "clientes" ((UPPER(NOME)));', idx_queries)
+        self.assertIn('CREATE UNIQUE INDEX "uk_clientes_doc_clean" ON "clientes" ((TRIM(CNPJ)));', idx_queries)
+

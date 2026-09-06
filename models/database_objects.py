@@ -44,13 +44,15 @@ class UniqueKey:
 
 
 class Index:
-    def __init__(self, index_name: str, unique: bool, inactive: bool, column_name: str, column_index: int):
+    def __init__(self, index_name: str, unique: bool, inactive: bool,
+                 column_name: str = None, column_index: int = 0, expression: str = None):
         # PostgreSQL-side only identifiers, normalized to lowercase
         self.column_index = column_index
-        self.column_name = column_name.lower()
+        self.column_name = column_name.lower() if column_name else None
         self.inactive = inactive
         self.unique = unique
         self.index_name = index_name.lower()
+        self.expression = expression.strip() if expression else None
 
 
 def get_postgres_type(firebird_type: str) -> str:
@@ -253,9 +255,15 @@ class Table:
             else:
                 query = f'CREATE INDEX "{index_name}" ON "{self.pg_name}" '
 
-            column_names = ', '.join([f'"{idx.column_name}"' for idx in indexes_grouped_by_name[index_name]])
+            if first_idx.expression:
+                expr = first_idx.expression
+                if not expr.startswith('(') or not expr.endswith(')'):
+                    expr = f"({expr})"
+                query += f'({expr});'
+            else:
+                column_names = ', '.join([f'"{idx.column_name}"' for idx in indexes_grouped_by_name[index_name] if idx.column_name])
+                query += f'({column_names});'
 
-            query += f'({column_names});'
             queries.append(query)
 
         return queries

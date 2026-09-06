@@ -182,7 +182,8 @@ class SchemaExtractor:
     @staticmethod
     def _extract_indexes(cursor, table_name: str) -> list[Index]:
         """
-        Extracts user-defined secondary indexes for a given table (excluding PK/UQ indexes).
+        Extracts user-defined secondary indexes for a given table (excluding PK/UQ indexes),
+        supporting both standard column-segment indexes and expression-based indexes (COMPUTED BY).
         """
         cursor.execute("""
             SELECT 
@@ -190,9 +191,10 @@ class SchemaExtractor:
                 i.RDB$UNIQUE_FLAG AS is_unique,
                 i.RDB$INDEX_INACTIVE AS is_inactive,
                 seg.RDB$FIELD_NAME AS column_name,
-                seg.RDB$FIELD_POSITION AS column_position
+                seg.RDB$FIELD_POSITION AS column_position,
+                i.RDB$EXPRESSION_SOURCE AS expression_source
             FROM RDB$INDICES i
-            JOIN RDB$INDEX_SEGMENTS seg ON i.RDB$INDEX_NAME = seg.RDB$INDEX_NAME
+            LEFT JOIN RDB$INDEX_SEGMENTS seg ON i.RDB$INDEX_NAME = seg.RDB$INDEX_NAME
             WHERE i.RDB$RELATION_NAME = ?
               AND i.RDB$INDEX_NAME NOT IN (
                   SELECT RDB$INDEX_NAME 
@@ -204,13 +206,17 @@ class SchemaExtractor:
         """, (table_name,))
         indexes = []
         for row in cursor.fetchall():
+            raw_expr = row[5]
+            expr_str = raw_expr.strip() if raw_expr else None
+            col_name = row[3].strip() if row[3] else None
             indexes.append(
                 Index(
                     index_name=row[0].strip(),
                     unique=bool(row[1]),
                     inactive=bool(row[2]),
-                    column_name=row[3].strip(),
-                    column_index=row[4],
+                    column_name=col_name,
+                    column_index=row[4] if row[4] is not None else 0,
+                    expression=expr_str,
                 )
             )
         return indexes
