@@ -216,11 +216,15 @@ class DataMigrator:
                 quoted_seq = pg_quote_ident(seq_name)
                 setval_arg = quoted_seq.replace("'", "''")
                 sync_query = f"""
+                    WITH max_calc AS (
+                        SELECT {greatest_expr} AS max_val
+                    )
                     SELECT setval(
                         '{setval_arg}',
-                        GREATEST((SELECT last_value FROM {quoted_seq}), {max_selects}),
-                        (SELECT is_called OR ({greatest_expr} IS NOT NULL AND {greatest_expr} >= (SELECT last_value FROM {quoted_seq})) FROM {quoted_seq})
-                    );
+                        GREATEST(s.last_value, m.max_val),
+                        s.is_called OR (m.max_val IS NOT NULL AND m.max_val >= s.last_value)
+                    )
+                    FROM {quoted_seq} s, max_calc m;
                 """
                 logger.debug(sync_query.strip())
                 pg_cur.execute(sync_query)

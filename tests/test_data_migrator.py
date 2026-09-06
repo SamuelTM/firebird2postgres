@@ -187,11 +187,14 @@ class TestDataMigrator(unittest.TestCase):
         self.assertEqual(len(sync_queries), 1)
         query = sync_queries[0]
         self.assertIn('"gen_shared_id"', query)
-        self.assertIn('SELECT last_value FROM "gen_shared_id"', query)
+        self.assertIn('WITH max_calc AS', query)
+        self.assertIn('FROM "gen_shared_id" s, max_calc m', query)
         self.assertIn('(SELECT MAX("id") FROM "tabela1")', query)
         self.assertIn('(SELECT MAX("codigo") FROM "tabela2")', query)
+        self.assertEqual(query.count('SELECT MAX("id")'), 1)
+        self.assertEqual(query.count('SELECT MAX("codigo")'), 1)
         self.assertNotIn('COALESCE', query)
         self.assertIn('IS NOT NULL', query)
-        self.assertIn('is_called', query)
+        self.assertIn('s.is_called', query)
 
 
