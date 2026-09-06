@@ -280,4 +280,83 @@ class TestTranspilerProcedures(unittest.TestCase):
         self.assertIn("INTO STRICT V_COUNT;", pg_sql)
         self.assertNotIn("EXCEPTION WHEN NO_DATA_FOUND THEN", pg_sql)
 
+    def test_for_loop_update_converted_to_set_based(self):
+        fb_sql = """
+        CREATE OR ALTER PROCEDURE SP_UPDATE_LOOP (
+            P_GRUPO INTEGER,
+            P_ID INTEGER
+        )
+        AS
+        DECLARE VARIABLE V_MARC INTEGER;
+        BEGIN
+            FOR SELECT ID_MARCACAO FROM TAGENDA WHERE ID_APAC = :P_ID INTO :V_MARC DO
+            BEGIN
+                UPDATE TAGENDA_MARCACAO
+                SET ID_GRUPO = :P_GRUPO
+                WHERE TAGENDA_MARCACAO.ID_MARCACAO = :V_MARC;
+            END
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("WHERE TAGENDA_MARCACAO.ID_MARCACAO IN (SELECT ID_MARCACAO FROM TAGENDA WHERE ID_APAC = P_ID);", pg_sql)
+        self.assertNotIn("FOR V_MARC IN", pg_sql)
+        self.assertNotIn("END LOOP;", pg_sql)
+
+    def test_for_loop_multiple_updates_converted_to_set_based(self):
+        fb_sql = """
+        CREATE OR ALTER PROCEDURE SP_MULTI_UPDATE_LOOP (
+            P_FATURA VARCHAR(20)
+        )
+        AS
+        DECLARE VARIABLE V_ID_NOTA INTEGER;
+        BEGIN
+            FOR SELECT DISTINCT ID_NOTA FROM TFATURA WHERE COD_FATURA = :P_FATURA INTO :V_ID_NOTA DO
+            BEGIN
+                UPDATE TNOTANF_SERV
+                SET ID_FATURA = NULL
+                WHERE TNOTANF_SERV.ID_NOTA = :V_ID_NOTA;
+                UPDATE TNOTANF
+                SET INATIVO = 'T'
+                WHERE TNOTANF.ID_NOTA = :V_ID_NOTA;
+            END
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("WHERE TNOTANF_SERV.ID_NOTA IN (SELECT DISTINCT ID_NOTA FROM TFATURA WHERE COD_FATURA = P_FATURA);", pg_sql)
+        self.assertIn("WHERE TNOTANF.ID_NOTA IN (SELECT DISTINCT ID_NOTA FROM TFATURA WHERE COD_FATURA = P_FATURA);", pg_sql)
+        self.assertNotIn("FOR V_ID_NOTA IN", pg_sql)
+
+    def test_for_loop_delete_converted_to_set_based(self):
+        fb_sql = """
+        CREATE OR ALTER PROCEDURE SP_DELETE_LOOP (
+            P_USER_ID INTEGER
+        )
+        AS
+        DECLARE VARIABLE V_LOG_ID INTEGER;
+        BEGIN
+            FOR SELECT ID FROM AUDIT WHERE USER_ID = :P_USER_ID INTO :V_LOG_ID DO
+                DELETE FROM LOG_ENTRIES WHERE LOG_ENTRIES.ID = :V_LOG_ID;
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("DELETE FROM LOG_ENTRIES WHERE LOG_ENTRIES.ID IN (SELECT ID FROM AUDIT WHERE USER_ID = P_USER_ID);", pg_sql)
+        self.assertNotIn("FOR V_LOG_ID IN", pg_sql)
+        self.assertNotIn("END LOOP;", pg_sql)
+
+    def test_for_loop_retains_cursor_when_var_used_in_set(self):
+        fb_sql = """
+        CREATE OR ALTER PROCEDURE SP_LOOP_VAR_IN_SET
+        AS
+        DECLARE VARIABLE V_ID INTEGER;
+        BEGIN
+            FOR SELECT ID FROM USERS INTO :V_ID DO
+            BEGIN
+                UPDATE TOTALS SET LAST_ID = :V_ID WHERE TOTALS.KEY = 1;
+            END
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("FOR V_ID IN SELECT ID FROM USERS", pg_sql)
+        self.assertIn("END LOOP;", pg_sql)
+
 
