@@ -75,6 +75,11 @@ def get_postgres_type(firebird_type: str) -> str:
     return type_mapping.get(firebird_type, firebird_type)
 
 
+def pg_quote_ident(ident: str) -> str:
+    escaped = ident.replace('"', '""')
+    return f'"{escaped}"'
+
+
 class Table:
     def __init__(self, name: str):
         self.name = name
@@ -93,18 +98,18 @@ class Table:
         """
         Returns a list of CREATE SEQUENCE statements for all identity/generator columns.
         """
-        return [f'CREATE SEQUENCE "{col.sequence_name}";'
+        return [f'CREATE SEQUENCE {pg_quote_ident(col.sequence_name)};'
                 for col in self.columns if col.sequence_name]
 
     def get_create_table_query(self) -> str:
         """
         Returns the single CREATE TABLE statement with column definitions and constraints.
         """
-        query = f'CREATE TABLE "{self.pg_name}" ('
+        query = f'CREATE TABLE {pg_quote_ident(self.pg_name)} ('
 
         for i, col in enumerate(self.columns):
-            type_decl = f'public."{col.domain_name}"' if col.domain_name else get_postgres_type(col.column_type)
-            escaped_name = f'"{col.pg_name}"'
+            type_decl = f'public.{pg_quote_ident(col.domain_name)}' if col.domain_name else get_postgres_type(col.column_type)
+            escaped_name = pg_quote_ident(col.pg_name)
 
             if col.computed_source:
                 expr = col.computed_source.strip()
@@ -114,7 +119,7 @@ class Table:
 
             if not col.computed_source:
                 if col.sequence_name:
-                    col_def += f" DEFAULT nextval('\"{col.sequence_name}\"')"
+                    col_def += f" DEFAULT nextval('{pg_quote_ident(col.sequence_name)}')"
                 elif col.default_value:
                     col_def += f' {col.default_value}'
 
@@ -146,7 +151,7 @@ class Table:
             else:
                 foreign_keys_grouped_by_name[foreign_key.key_name].append(foreign_key)
 
-        query = f'ALTER TABLE "{self.pg_name}" ADD '
+        query = f'ALTER TABLE {pg_quote_ident(self.pg_name)} ADD '
 
         for foreign_key_index, foreign_key_name in enumerate(foreign_keys_grouped_by_name):
             foreign_keys = foreign_keys_grouped_by_name[foreign_key_name]
@@ -170,15 +175,15 @@ class Table:
 
                 ordered_pairs = [pairs_by_position[pos] for pos in sorted(pairs_by_position)]
 
-                local_columns_str = ", ".join([f'"{item}"' for item, _ in ordered_pairs])
-                referenced_columns_str = ", ".join([f'"{item}"' for _, item in ordered_pairs])
+                local_columns_str = ", ".join([pg_quote_ident(item) for item, _ in ordered_pairs])
+                referenced_columns_str = ", ".join([pg_quote_ident(item) for _, item in ordered_pairs])
 
-                query += (f'CONSTRAINT "{foreign_key_name}" FOREIGN KEY ({local_columns_str}) '
-                          f'REFERENCES "{first_fk.referenced_table_name}"({referenced_columns_str}){action_clause}')
+                query += (f'CONSTRAINT {pg_quote_ident(foreign_key_name)} FOREIGN KEY ({local_columns_str}) '
+                          f'REFERENCES {pg_quote_ident(first_fk.referenced_table_name)}({referenced_columns_str}){action_clause}')
             else:
                 foreign_key = foreign_keys[0]
-                query += (f'CONSTRAINT "{foreign_key.key_name}" FOREIGN KEY ("{foreign_key.local_column_name}") '
-                          f'REFERENCES "{foreign_key.referenced_table_name}"("{foreign_key.referenced_column_name}"){action_clause}')
+                query += (f'CONSTRAINT {pg_quote_ident(foreign_key.key_name)} FOREIGN KEY ({pg_quote_ident(foreign_key.local_column_name)}) '
+                          f'REFERENCES {pg_quote_ident(foreign_key.referenced_table_name)}({pg_quote_ident(foreign_key.referenced_column_name)}){action_clause}')
 
             if foreign_key_index < len(foreign_keys_grouped_by_name) - 1:
                 query += ', ADD '
@@ -203,16 +208,16 @@ class Table:
             else:
                 unique_keys_grouped_by_name[unique_key.name][1].append(unique_key.column)
 
-        query = f'ALTER TABLE "{self.pg_name}" ADD '
+        query = f'ALTER TABLE {pg_quote_ident(self.pg_name)} ADD '
 
         for unique_key_index, unique_key_name in enumerate(unique_keys_grouped_by_name):
             is_primary_key, column_names = unique_keys_grouped_by_name[unique_key_name]
             # Column order follows the original Firebird segment positions (guaranteed by
             # the extraction ORDER BY)
 
-            columns_constraint = ', '.join([f'"{column_name}"' for column_name in column_names])
+            columns_constraint = ', '.join([pg_quote_ident(column_name) for column_name in column_names])
             constraint_type = "PRIMARY KEY" if is_primary_key else "UNIQUE"
-            query += f'CONSTRAINT "{unique_key_name}" {constraint_type} ({columns_constraint})'
+            query += f'CONSTRAINT {pg_quote_ident(unique_key_name)} {constraint_type} ({columns_constraint})'
 
             if unique_key_index < len(unique_keys_grouped_by_name) - 1:
                 query += ', ADD '
@@ -243,15 +248,15 @@ class Table:
             if first_idx.inactive:
                 continue
             if first_idx.unique:
-                query = f'CREATE UNIQUE INDEX "{index_name}" ON "{self.pg_name}" '
+                query = f'CREATE UNIQUE INDEX {pg_quote_ident(index_name)} ON {pg_quote_ident(self.pg_name)} '
             else:
-                query = f'CREATE INDEX "{index_name}" ON "{self.pg_name}" '
+                query = f'CREATE INDEX {pg_quote_ident(index_name)} ON {pg_quote_ident(self.pg_name)} '
 
             if first_idx.expression:
                 expr = first_idx.expression.strip()
                 query += f'(({expr}));'
             else:
-                column_names = ', '.join([f'"{idx.column_name}"' for idx in indexes_grouped_by_name[index_name] if idx.column_name])
+                column_names = ', '.join([pg_quote_ident(idx.column_name) for idx in indexes_grouped_by_name[index_name] if idx.column_name])
                 query += f'({column_names});'
 
             queries.append(query)
@@ -272,12 +277,13 @@ class Sequence:
         if self.current_value is None:
             raise ValueError(f"Cannot generate CREATE SEQUENCE for sequence '{self.name}': current_value is unknown (None)")
         start_val = self.current_value + 1
+        esc_name = pg_quote_ident(self.pg_name)
         if start_val < 1:
-            return f'CREATE SEQUENCE "{self.pg_name}" MINVALUE -9223372036854775807 START WITH {start_val};'
+            return f'CREATE SEQUENCE {esc_name} MINVALUE -9223372036854775807 START WITH {start_val};'
         if start_val != 1:
-            return f'CREATE SEQUENCE "{self.pg_name}" START WITH {start_val};'
-        return f'CREATE SEQUENCE "{self.pg_name}";'
+            return f'CREATE SEQUENCE {esc_name} START WITH {start_val};'
+        return f'CREATE SEQUENCE {esc_name};'
 
     def get_drop_sequence_query(self) -> str:
-        return f'DROP SEQUENCE IF EXISTS "{self.pg_name}" CASCADE;'
+        return f'DROP SEQUENCE IF EXISTS {pg_quote_ident(self.pg_name)} CASCADE;'
 

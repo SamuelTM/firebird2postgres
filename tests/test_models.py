@@ -89,6 +89,17 @@ class TestTableDdlGenerators(unittest.TestCase):
         self.assertIn('"obs" TEXT \'N/A\'', create_sql)
         self.assertIn('"status" public."dom_status" NOT NULL', create_sql)
 
+    def test_table_quotes_escaped(self):
+        table = Table('MY_"TABLE"')
+        table.columns.append(Column('COL_"A"', 'INTEGER', nullable=False, sequence_name='GEN_"SEQ"'))
+        table.columns.append(Column('COL_B', 'VARCHAR(20)', nullable=True, domain_name='dom_"type"'))
+        create_sql = table.get_create_table_query()
+        self.assertIn('CREATE TABLE "my_""table"""', create_sql)
+        self.assertIn('"col_""a""" INTEGER DEFAULT nextval(\'"gen_""seq"""\') NOT NULL', create_sql)
+        self.assertIn('"col_b" public."dom_""type"""', create_sql)
+        seqs = table.get_sequence_queries()
+        self.assertEqual(seqs[0], 'CREATE SEQUENCE "gen_""seq""";')
+
     def test_table_unique_keys_ddl(self):
         table = Table('USERS')
         table.unique_keys.append(UniqueKey('PK_USERS', column='ID', is_primary_key=True))
@@ -361,4 +372,9 @@ class TestSequenceModel(unittest.TestCase):
         seq_unknown = Sequence('GEN_UNKNOWN', current_value=None)
         with self.assertRaises(ValueError):
             seq_unknown.get_create_sequence_query()
+
+    def test_sequence_escapes_double_quotes(self):
+        seq = Sequence('GEN_"QUOTED"', current_value=5)
+        self.assertEqual(seq.get_create_sequence_query(), 'CREATE SEQUENCE "gen_""quoted""" START WITH 6;')
+        self.assertEqual(seq.get_drop_sequence_query(), 'DROP SEQUENCE IF EXISTS "gen_""quoted""" CASCADE;')
 

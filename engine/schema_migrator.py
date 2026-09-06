@@ -1,6 +1,6 @@
 import logging
 import psycopg2
-from models import Table, Sequence
+from models import Table, Sequence, pg_quote_ident
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +22,7 @@ class SchemaMigrator:
         tables being (re)created reference them.
         """
         for table in table_objs:
-            drop_query = f'DROP TABLE IF EXISTS "{table.pg_name}" CASCADE;'
+            drop_query = f'DROP TABLE IF EXISTS {pg_quote_ident(table.pg_name)} CASCADE;'
             logger.debug(drop_query)
             cursor.execute(drop_query)
 
@@ -36,7 +36,7 @@ class SchemaMigrator:
                     seq_names.add(col.sequence_name)
 
         for seq_name in sorted(seq_names):
-            drop_seq_query = f'DROP SEQUENCE IF EXISTS "{seq_name}" CASCADE;'
+            drop_seq_query = f'DROP SEQUENCE IF EXISTS {pg_quote_ident(seq_name)} CASCADE;'
             logger.debug(drop_seq_query)
             cursor.execute(drop_seq_query)
 
@@ -63,7 +63,7 @@ class SchemaMigrator:
             WHERE t.typtype = 'd' AND n.nspname = current_schema();
         """)
         for schema_name, domain_name in cursor.fetchall():
-            drop_domain_query = f'DROP DOMAIN "{schema_name}"."{domain_name}" CASCADE;'
+            drop_domain_query = f'DROP DOMAIN {pg_quote_ident(schema_name)}.{pg_quote_ident(domain_name)} CASCADE;'
             logger.debug(drop_domain_query)
             cursor.execute(drop_domain_query)
 
@@ -94,7 +94,7 @@ class SchemaMigrator:
         for table in table_objs:
             for col in table.columns:
                 if col.sequence_name and col.sequence_name not in created_seqs:
-                    query = f'CREATE SEQUENCE "{col.sequence_name}";'
+                    query = f'CREATE SEQUENCE {pg_quote_ident(col.sequence_name)};'
                     logger.debug(query)
                     cursor.execute(query)
                     created_seqs.add(col.sequence_name)
@@ -170,8 +170,8 @@ class SchemaMigrator:
         cursor = self.pg_con.cursor()
         if table_objs:
             for table in table_objs:
-                logger.debug(f'ANALYZE "{table.pg_name}";')
-                cursor.execute(f'ANALYZE "{table.pg_name}";')
+                logger.debug(f'ANALYZE {pg_quote_ident(table.pg_name)};')
+                cursor.execute(f'ANALYZE {pg_quote_ident(table.pg_name)};')
         else:
             cursor.execute("ANALYZE;")
         self.pg_con.commit()

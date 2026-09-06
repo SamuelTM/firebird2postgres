@@ -244,7 +244,7 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
         self.assertEqual(sequences[1].current_value, -1)
         self.assertEqual(
             sequences[1].get_create_sequence_query(),
-            'CREATE SEQUENCE "gen_with_\"quote\"" MINVALUE -9223372036854775807 START WITH 0;'
+            'CREATE SEQUENCE "gen_with_""quote""" MINVALUE -9223372036854775807 START WITH 0;'
         )
 
         executed_queries = [call[0][0] for call in mock_cursor.execute.call_args_list[1:]]

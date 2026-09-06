@@ -5,7 +5,7 @@ import firebirdsql
 import psycopg2
 import psycopg2.extras
 from config import get_firebird_connection, get_postgres_connection
-from models import Table
+from models import Table, pg_quote_ident
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +23,7 @@ def _import_single_table(table: Table, fb_cur, pg_cur, pg_con) -> int:
 
     # Clean existing table data (no CASCADE: constraints don't exist at this pipeline stage,
     # and CASCADE would be dangerous with concurrent workers if they did)
-    pg_cur.execute(f'TRUNCATE TABLE "{table.pg_name}";')
+    pg_cur.execute(f'TRUNCATE TABLE {pg_quote_ident(table.pg_name)};')
 
     blob_count = sum(1 for col in table.columns if 'BLOB' in col.column_type)
     batch_size = 10000
@@ -36,14 +36,14 @@ def _import_single_table(table: Table, fb_cur, pg_cur, pg_con) -> int:
     # Firebird-side keeps the original casing (quoted identifiers are case-sensitive there);
     # PostgreSQL-side uses the lowercase identifier.
     cols_to_import = [col for col in table.columns if not col.computed_source]
-    fb_column_names = [f'"{col.name}"' for col in cols_to_import]
+    fb_column_names = [pg_quote_ident(col.name) for col in cols_to_import]
     fb_columns_str = ", ".join(fb_column_names)
 
-    pg_column_names = [f'"{col.pg_name}"' for col in cols_to_import]
+    pg_column_names = [pg_quote_ident(col.pg_name) for col in cols_to_import]
     pg_columns_str = ", ".join(pg_column_names)
 
-    fb_cur.execute(f'SELECT {fb_columns_str} FROM "{table.name}"')
-    copy_sql = f'COPY "{table.pg_name}" ({pg_columns_str}) FROM STDIN WITH (FORMAT text, NULL \'\\N\')'
+    fb_cur.execute(f'SELECT {fb_columns_str} FROM {pg_quote_ident(table.name)}')
+    copy_sql = f'COPY {pg_quote_ident(table.pg_name)} ({pg_columns_str}) FROM STDIN WITH (FORMAT text, NULL \'\\N\')'
 
     total_rows = 0
     while True:
@@ -134,7 +134,7 @@ class DataMigrator:
             # the ALTER TABLE statements below would fail with InFailedSqlTransaction
             self.pg_con.rollback()
             for table in table_objs:
-                pg_cur.execute(f'ALTER TABLE "{table.pg_name}" ENABLE TRIGGER ALL;')
+                pg_cur.execute(f'ALTER TABLE {pg_quote_ident(table.pg_name)} ENABLE TRIGGER ALL;')
             self.pg_con.commit()
         except psycopg2.Error as e:
             logger.error(f"Failed to re-enable triggers: {e}. "
@@ -151,7 +151,7 @@ class DataMigrator:
 
         logger.info("Disabling triggers in PostgreSQL for a clean import...")
         for table in table_objs:
-            pg_cur.execute(f'ALTER TABLE "{table.pg_name}" DISABLE TRIGGER ALL;')
+            pg_cur.execute(f'ALTER TABLE {pg_quote_ident(table.pg_name)} DISABLE TRIGGER ALL;')
         self.pg_con.commit()
 
         # Everything between DISABLE and the finally block is guarded: triggers are always
@@ -211,13 +211,15 @@ class DataMigrator:
                         seq_to_targets.setdefault(col.sequence_name, []).append((table.pg_name, col.pg_name))
 
             for seq_name, targets in seq_to_targets.items():
-                max_selects = ", ".join(f'(SELECT MAX("{col}") FROM "{tbl}")' for tbl, col in targets)
+                max_selects = ", ".join(f'(SELECT MAX({pg_quote_ident(col)}) FROM {pg_quote_ident(tbl)})' for tbl, col in targets)
                 greatest_expr = f'GREATEST({max_selects})' if len(targets) > 1 else max_selects
+                quoted_seq = pg_quote_ident(seq_name)
+                setval_arg = quoted_seq.replace("'", "''")
                 sync_query = f"""
                     SELECT setval(
-                        '"{seq_name}"',
-                        GREATEST((SELECT last_value FROM "{seq_name}"), {max_selects}),
-                        (SELECT is_called OR ({greatest_expr} IS NOT NULL AND {greatest_expr} >= (SELECT last_value FROM "{seq_name}")) FROM "{seq_name}")
+                        '{setval_arg}',
+                        GREATEST((SELECT last_value FROM {quoted_seq}), {max_selects}),
+                        (SELECT is_called OR ({greatest_expr} IS NOT NULL AND {greatest_expr} >= (SELECT last_value FROM {quoted_seq})) FROM {quoted_seq})
                     );
                 """
                 logger.debug(sync_query.strip())
