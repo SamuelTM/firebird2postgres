@@ -311,6 +311,12 @@ class TestTranspilerProcedures(unittest.TestCase):
             BEGIN
                 SELECT (SELECT COUNT(*) FROM DST) FROM SRC INTO :V;
             END;
+            """,
+            """
+            CREATE OR ALTER PROCEDURE SP_HAVING_RDB RETURNS (V INTEGER) AS
+            BEGIN
+                SELECT COUNT(*) FROM RDB$DATABASE HAVING COUNT(*) = 0 INTO :V;
+            END;
             """
         ]
         for fb_sql in cases:

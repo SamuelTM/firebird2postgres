@@ -779,7 +779,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         Returns True if the SELECT query structurally guarantees returning exactly 1 row:
         Pure scalar evaluation without filters:
         - No FROM clause, or FROM RDB$DATABASE
-        - AND no WHERE clause
+        - AND no WHERE, GROUP BY, HAVING, MODEL, HIERARCHICAL, FIRST, or SKIP clauses.
         In these cases, NO_DATA_FOUND can never be raised in PostgreSQL, making
         BEGIN ... EXCEPTION WHEN NO_DATA_FOUND subtransactions completely unnecessary.
         """
@@ -787,8 +787,29 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         if not qb:
             return False
 
-        has_where = bool(qb.where_clause() if hasattr(qb, 'where_clause') else None)
-        if has_where:
+        # Any compound operations (UNION, INTERSECT, MINUS) disqualify single-row guarantee
+        if _find_node(select_ctx, FirebirdParser.Subquery_operation_partContext):
+            return False
+
+        # Any offset or fetch clauses disqualify
+        if hasattr(select_ctx, 'offset_clause') and select_ctx.offset_clause():
+            return False
+        if hasattr(select_ctx, 'fetch_clause') and select_ctx.fetch_clause():
+            return False
+
+        # Inside the query block, any filtering or row-modifying clause disqualifies:
+        # WHERE, GROUP BY (which includes HAVING), hierarchical query, model, FIRST, SKIP
+        if hasattr(qb, 'where_clause') and qb.where_clause():
+            return False
+        if hasattr(qb, 'group_by_clause') and qb.group_by_clause():
+            return False
+        if hasattr(qb, 'hierarchical_query_clause') and qb.hierarchical_query_clause():
+            return False
+        if hasattr(qb, 'model_clause') and qb.model_clause():
+            return False
+        if hasattr(qb, 'FIRST') and qb.FIRST():
+            return False
+        if hasattr(qb, 'SKIP_') and qb.SKIP_():
             return False
 
         from_clause = qb.from_clause() if hasattr(qb, 'from_clause') else None
