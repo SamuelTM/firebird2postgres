@@ -1,6 +1,6 @@
 import re
 from models import Table, Column, ForeignKey, UniqueKey, Index, Sequence, resolve_firebird_type, resolve_pg_domain_name
-from transpiler import FirebirdToPostgresVisitor
+from transpiler import FirebirdToPostgresVisitor, validate_immutable_expression
 
 
 class SchemaExtractor:
@@ -89,6 +89,7 @@ class SchemaExtractor:
             computed_source = column[10].strip() if column[10] else None
             if computed_source:
                 computed_source = FirebirdToPostgresVisitor.transpile_expression(computed_source)
+                validate_immutable_expression(computed_source, f"computed column '{column_name}' in table '{table_name}'")
 
             column_data_type = resolve_firebird_type(
                 field_type=field_type,
@@ -221,6 +222,7 @@ class SchemaExtractor:
             expr_str = raw_expr.strip() if raw_expr else None
             if expr_str:
                 expr_str = FirebirdToPostgresVisitor.transpile_expression(expr_str)
+                validate_immutable_expression(expr_str, f"expression index '{row[0].strip()}' in table '{table_name}'")
             col_name = row[3].strip() if row[3] else None
             indexes.append(
                 Index(

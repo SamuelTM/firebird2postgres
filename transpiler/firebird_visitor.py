@@ -67,17 +67,156 @@ _COLON_PATTERN = re.compile(
     flags=re.IGNORECASE
 )
 
-_DATEADD_TO_PATTERN = re.compile(
-    r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|"  # Group 1: strings / comments
-    r"(\bDATEADD\s*\(\s*([a-zA-Z0-9_.\'\"()+-]+)\s+([a-zA-Z]+)\s+TO\s+([^,)]+)\))",
-    flags=re.IGNORECASE
+_DATE_UNITS = (
+    'YEAR', 'YEARS', 'MONTH', 'MONTHS', 'WEEK', 'WEEKS',
+    'DAY', 'DAYS', 'HOUR', 'HOURS', 'MINUTE', 'MINUTES',
+    'SECOND', 'SECONDS', 'MILLISECOND', 'MILLISECONDS', 'MS'
+)
+_DATE_UNITS_RE = '|'.join(_DATE_UNITS)
+_TOKEN_DATE_FUNC_PATTERN = re.compile(
+    r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|(\bDATE(?:ADD|DIFF)\s*\()",
+    flags=re.IGNORECASE | re.DOTALL
 )
 
-_DATEDIFF_FROM_TO_PATTERN = re.compile(
-    r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|"  # Group 1: strings / comments
-    r"(\bDATEDIFF\s*\(\s*([a-zA-Z]+)\s+FROM\s+(.+?)\s+TO\s+([^,)]+)\))",
-    flags=re.IGNORECASE
+_NON_IMMUTABLE_PATTERN = re.compile(
+    r'(\b(CURRENT_DATE|CURRENT_TIMESTAMP|CURRENT_TIME|LOCALTIMESTAMP|LOCALTIME)\b|'
+    r'\b(NOW|RAND|RANDOM|CLOCK_TIMESTAMP|TIMEOFDAY|STATEMENT_TIMESTAMP|TRANSACTION_TIMESTAMP)\s*\(\s*\))',
+    re.IGNORECASE
 )
+_SPECIAL_DATE_LITERAL_PATTERN = re.compile(
+    r"'(NOW|TODAY|YESTERDAY|TOMORROW)'",
+    re.IGNORECASE
+)
+
+
+def validate_immutable_expression(expr: str, context: str = "expression") -> None:
+    """
+    Validates that a PostgreSQL generated column or expression index does not reference
+    volatile/stable functions like CURRENT_DATE, CURRENT_TIMESTAMP, or RANDOM().
+    """
+    m_lit = _SPECIAL_DATE_LITERAL_PATTERN.search(expr)
+    if m_lit:
+        raise ValueError(
+            f"Non-immutable date literal '{m_lit.group(0)}' in {context}: '{expr}' "
+            f"is not permitted in PostgreSQL (generated columns and expression indexes must be IMMUTABLE)."
+        )
+    clean_expr = re.sub(r"'(?:''|[^'])*'", "''", expr)
+    m = _NON_IMMUTABLE_PATTERN.search(clean_expr)
+    if m:
+        raise ValueError(
+            f"Non-immutable function or keyword '{m.group(0)}' in {context}: '{expr}' "
+            f"is not permitted in PostgreSQL (generated columns and expression indexes must be IMMUTABLE)."
+        )
+
+
+def _normalize_date_funcs(sql: str) -> str:
+    pos = 0
+    result = []
+    while pos < len(sql):
+        m = _TOKEN_DATE_FUNC_PATTERN.search(sql, pos)
+        if not m:
+            result.append(sql[pos:])
+            break
+        result.append(sql[pos:m.start()])
+        if m.group(1):
+            result.append(m.group(1))
+            pos = m.end()
+            continue
+
+        fn_match = m.group(2)
+        fn_name = fn_match.split('(')[0].strip().upper()
+        arg_start = m.end()
+        idx = arg_start
+        depth = 1
+        in_str = False
+
+        while idx < len(sql) and depth > 0:
+            ch = sql[idx]
+            if ch == "'":
+                if not in_str:
+                    in_str = True
+                elif idx + 1 < len(sql) and sql[idx + 1] == "'":
+                    idx += 1
+                else:
+                    in_str = False
+            elif not in_str:
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+            idx += 1
+
+        if depth != 0:
+            result.append(sql[m.start():idx])
+            pos = idx
+            continue
+
+        args_body = sql[arg_start:idx - 1]
+        norm_args = _normalize_date_funcs(args_body)
+        transformed = False
+
+        if fn_name == 'DATEADD':
+            d = 0
+            s_in = False
+            for i, c in enumerate(norm_args):
+                if c == "'":
+                    if not s_in:
+                        s_in = True
+                    elif i + 1 < len(norm_args) and norm_args[i + 1] == "'":
+                        pass
+                    else:
+                        s_in = False
+                elif not s_in:
+                    if c == '(':
+                        d += 1
+                    elif c == ')':
+                        d -= 1
+                    elif d == 0:
+                        tail = norm_args[i:]
+                        m_to = re.match(rf"^(\b({_DATE_UNITS_RE})\b)\s+TO\b\s*", tail, re.IGNORECASE)
+                        if m_to:
+                            unit_found = m_to.group(1).upper()
+                            num_expr = norm_args[:i].strip()
+                            date_expr = norm_args[i + m_to.end():].strip()
+                            if num_expr and date_expr:
+                                result.append(f"DATEADD({unit_found}, {num_expr}, {date_expr})")
+                                transformed = True
+                                break
+        elif fn_name == 'DATEDIFF':
+            m_from = re.match(rf"^\s*(\b({_DATE_UNITS_RE})\b)\s+FROM\b", norm_args, re.IGNORECASE)
+            if m_from:
+                unit_found = m_from.group(1).upper()
+                rest = norm_args[m_from.end():]
+                d = 0
+                s_in = False
+                for i, c in enumerate(rest):
+                    if c == "'":
+                        if not s_in:
+                            s_in = True
+                        elif i + 1 < len(rest) and rest[i + 1] == "'":
+                            pass
+                        else:
+                            s_in = False
+                    elif not s_in:
+                        if c == '(':
+                            d += 1
+                        elif c == ')':
+                            d -= 1
+                        elif d == 0:
+                            m_to = re.match(r"^\bTO\b\s*", rest[i:], re.IGNORECASE)
+                            if m_to:
+                                d1_expr = rest[:i].strip()
+                                d2_expr = rest[i + m_to.end():].strip()
+                                if d1_expr and d2_expr:
+                                    result.append(f"DATEDIFF({unit_found}, {d1_expr}, {d2_expr})")
+                                    transformed = True
+                                    break
+
+        if not transformed:
+            result.append(f"{fn_match}{norm_args})")
+        pos = idx
+
+    return "".join(result)
 
 
 def _is_time_expr(expr: str) -> bool:
@@ -458,21 +597,8 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
 
         sql = _COLON_PATTERN.sub(colon_repl, sql)
 
-        # Step 4: Normalize alternative Firebird syntax DATEADD(num unit TO date) -> DATEADD(unit, num, date)
-        def dateadd_repl(match):
-            if match.group(1):
-                return match.group(1)
-            return f"DATEADD({match.group(4)}, {match.group(3)}, {match.group(5)})"
-
-        sql = _DATEADD_TO_PATTERN.sub(dateadd_repl, sql)
-
-        # Step 5: Normalize alternative Firebird syntax DATEDIFF(unit FROM d1 TO d2) -> DATEDIFF(unit, d1, d2)
-        def datediff_repl(match):
-            if match.group(1):
-                return match.group(1)
-            return f"DATEDIFF({match.group(3)}, {match.group(4)}, {match.group(5)})"
-
-        return _DATEDIFF_FROM_TO_PATTERN.sub(datediff_repl, sql)
+        # Step 4: Normalize alternative Firebird syntax DATEADD(...) and DATEDIFF(...)
+        return _normalize_date_funcs(sql)
 
     @classmethod
     def transpile(cls, firebird_sql_string: str) -> str:
@@ -550,12 +676,13 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
             m = re.search(r'AS\s+SELECT\s+(.*)\s*;?$', view_sql, re.IGNORECASE | re.DOTALL)
             if m:
                 return m.group(1).strip().rstrip(';').strip()
+            raise RuntimeError(f"Could not extract expression from transpiled statement: {view_sql}")
         except Exception as e:
-            logger.warning(
-                "Failed to transpile Firebird expression '%s' to PostgreSQL: %s. Using original expression.",
+            logger.error(
+                "Failed to transpile Firebird expression '%s' to PostgreSQL: %s",
                 expr_clean, e
             )
-        return expr_clean
+            raise RuntimeError(f"Failed to transpile Firebird expression '{expr_clean}' to PostgreSQL: {e}") from e
 
     @staticmethod
     def _clean_sql(pg_sql: str) -> str:

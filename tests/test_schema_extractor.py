@@ -118,10 +118,9 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
             FirebirdToPostgresVisitor.transpile_expression("DATEDIFF(MILLISECOND, TIME '10:59:00.0000', TIME '10:59:00.0001')"),
             "ROUND((EXTRACT(EPOCH FROM (TIME '10:59:00.0001' - TIME '10:59:00.0000')) * 1000)::numeric, 1)",
         )
-        with self.assertLogs('transpiler.firebird_visitor', level='WARNING') as cm:
-            res = FirebirdToPostgresVisitor.transpile_expression("DATEDIFF(DAY, TIME '10:00', TIME '11:00')")
-            self.assertEqual(res, "DATEDIFF(DAY, TIME '10:00', TIME '11:00')")
-            self.assertTrue(any("cannot be used with TIME values" in log for log in cm.output))
+        with self.assertRaises(RuntimeError) as cm:
+            FirebirdToPostgresVisitor.transpile_expression("DATEDIFF(DAY, TIME '10:00', TIME '11:00')")
+        self.assertIn("cannot be used with TIME values", str(cm.exception))
         self.assertEqual(
             FirebirdToPostgresVisitor.transpile_expression("GEN_ID(GEN_SEQ, 1)"),
             "nextval('GEN_SEQ')",
@@ -131,13 +130,57 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
             "(D + (1) * INTERVAL '1 day')",
         )
         self.assertEqual(
+            FirebirdToPostgresVisitor.transpile_expression("DATEADD((N + 1) DAY TO D)"),
+            "(D + ((N + 1)) * INTERVAL '1 day')",
+        )
+        self.assertEqual(
             FirebirdToPostgresVisitor.transpile_expression("DATEDIFF(DAY FROM D1 TO D2)"),
             "(DATE(D2) - DATE(D1))",
         )
-        with self.assertLogs('transpiler.firebird_visitor', level='WARNING') as cm:
-            res = FirebirdToPostgresVisitor.transpile_expression("FOOBAR $$$ INVALID")
-            self.assertEqual(res, "FOOBAR $$$ INVALID")
-            self.assertTrue(any("Failed to transpile Firebird expression" in log for log in cm.output))
+        self.assertEqual(
+            FirebirdToPostgresVisitor.transpile_expression("DATEDIFF(DAY FROM (D1 + 1) TO (D2 - 1))"),
+            "(DATE((D2 - 1)) - DATE((D1 + 1)))",
+        )
+        with self.assertRaises(RuntimeError) as cm:
+            FirebirdToPostgresVisitor.transpile_expression("FOOBAR $$$ INVALID")
+        self.assertIn("Failed to transpile Firebird expression", str(cm.exception))
+
+    def test_validate_immutable_expression(self):
+        from transpiler import validate_immutable_expression
+
+        # Valid immutable expressions
+        validate_immutable_expression("(D + 1)")
+        validate_immutable_expression("CASE WHEN STATUS = 'CURRENT_DATE' THEN 1 ELSE 0 END")
+
+        # Non-immutable functions or literals
+        with self.assertRaises(ValueError):
+            validate_immutable_expression("CURRENT_DATE")
+        with self.assertRaises(ValueError):
+            validate_immutable_expression("CURRENT_TIMESTAMP")
+        with self.assertRaises(ValueError):
+            validate_immutable_expression("NOW()")
+        with self.assertRaises(ValueError):
+            validate_immutable_expression("RANDOM()")
+        with self.assertRaises(ValueError):
+            validate_immutable_expression("CAST('TODAY' AS DATE)")
+
+    def test_extract_columns_rejects_non_immutable_expression(self):
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [
+            ("COL1", 12, 0, 4, 1, 0, 0, None, None, "RDB$1", "CURRENT_DATE"),
+        ]
+        with self.assertRaises(ValueError) as cm:
+            SchemaExtractor._extract_columns(mock_cursor, "SALES", {"SALES"})
+        self.assertIn("computed column 'COL1' in table 'SALES'", str(cm.exception))
+
+    def test_extract_indexes_rejects_non_immutable_expression(self):
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [
+            ("IDX_NOW", 0, 0, None, 0, "CURRENT_TIMESTAMP"),
+        ]
+        with self.assertRaises(ValueError) as cm:
+            SchemaExtractor._extract_indexes(mock_cursor, "SALES")
+        self.assertIn("expression index 'IDX_NOW' in table 'SALES'", str(cm.exception))
 
 
     def test_extract_sequences_standalone_and_current_values(self):
