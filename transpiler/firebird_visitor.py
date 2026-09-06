@@ -352,15 +352,20 @@ class ASTDialectRewriter(FirebirdParserVisitor):
         args = func_arg.argument()
 
         if fn_name == 'GEN_ID' and len(args) >= 2:
-            seq_name = args[0].getText()
+            raw_seq = args[0].getText()
+            clean_seq = raw_seq.strip('\'"').lower()
+            quoted_seq = pg_quote_ident(clean_seq)
             step = args[1].getText().strip()
             if step == '1':
-                self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"nextval('{seq_name}')")
+                self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"nextval('{raw_seq}')")
             elif step == '0':
-                self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"currval('{seq_name}')")
+                self.rewriter.replaceRangeTokens(
+                    ctx.start, ctx.stop,
+                    f"(SELECT CASE WHEN is_called THEN last_value ELSE last_value - 1 END FROM {quoted_seq})"
+                )
             else:
                 self.rewriter.replaceRangeTokens(
-                    ctx.start, ctx.stop, f"setval('{seq_name}', nextval('{seq_name}') + ({step}) - 1)"
+                    ctx.start, ctx.stop, f"setval('{raw_seq}', nextval('{raw_seq}') + ({step}) - 1)"
                 )
         elif fn_name == 'IIF' and len(args) == 3:
             cond_str = self._get_tokens_text(args[0]).strip()

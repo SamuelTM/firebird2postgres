@@ -130,7 +130,7 @@ class TestTranspilerProcedures(unittest.TestCase):
         END;
         """
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
-        self.assertIn("CURR_VAL := currval('GEN_PEDIDOS');", pg_sql)
+        self.assertIn("CURR_VAL := (SELECT CASE WHEN is_called THEN last_value ELSE last_value - 1 END FROM \"gen_pedidos\");", pg_sql)
         self.assertIn("CUSTOM_STEP := setval('GEN_PEDIDOS', nextval('GEN_PEDIDOS') + (5) - 1);", pg_sql)
 
     def test_execute_procedure_to_perform(self):
