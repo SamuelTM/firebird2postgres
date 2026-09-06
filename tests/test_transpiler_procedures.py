@@ -544,6 +544,37 @@ class TestTranspilerProcedures(unittest.TestCase):
         self.assertIn('OUT_ID := V_TOTAL;', pg_sql)
         self.assertIn('RETURN NEXT;', pg_sql)
 
+    def test_variable_declarations_initializers_and_not_null(self):
+        fb_sql = """
+        CREATE PROCEDURE SP_TEST_VARS
+        AS
+        DECLARE VARIABLE N INTEGER NOT NULL DEFAULT 7;
+        DECLARE VARIABLE M INTEGER = 10;
+        DECLARE VARIABLE K INTEGER NOT NULL = 20;
+        DECLARE VARIABLE L INTEGER = 30 NOT NULL;
+        DECLARE VARIABLE P_VAR INTEGER DEFAULT 40 NOT NULL;
+        DECLARE VARIABLE S VARCHAR(100) = 'hello world';
+        DECLARE VARIABLE S2 VARCHAR(100) = 'semi;colon';
+        DECLARE VARIABLE G_ID BIGINT = GEN_ID(GEN_TEST, 1);
+        DECLARE VARIABLE C CONSTANT INTEGER = 99;
+        DECLARE VARIABLE PLAIN INTEGER;
+        BEGIN
+            N = N + M;
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn('N INTEGER NOT NULL DEFAULT 7;', pg_sql)
+        self.assertIn('M INTEGER DEFAULT 10;', pg_sql)
+        self.assertIn('K INTEGER NOT NULL DEFAULT 20;', pg_sql)
+        self.assertIn('L INTEGER NOT NULL DEFAULT 30;', pg_sql)
+        self.assertIn('P_VAR INTEGER NOT NULL DEFAULT 40;', pg_sql)
+        self.assertIn("S VARCHAR(100) DEFAULT 'hello world';", pg_sql)
+        self.assertIn("S2 VARCHAR(100) DEFAULT 'semi;colon';", pg_sql)
+        self.assertIn("G_ID BIGINT DEFAULT nextval('GEN_TEST');", pg_sql)
+        self.assertIn('C CONSTANT INTEGER DEFAULT 99;', pg_sql)
+        self.assertIn('PLAIN INTEGER;', pg_sql)
+
+
 
 
 

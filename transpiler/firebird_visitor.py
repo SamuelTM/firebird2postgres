@@ -235,6 +235,141 @@ def _normalize_date_funcs(sql: str) -> str:
     return "".join(result)
 
 
+def _normalize_variable_declarations(sql: str) -> str:
+    start_pat = re.compile(
+        r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|(\b(DECLARE\s+(?:VARIABLE\s+)?|VARIABLE\s+)([a-zA-Z0-9_$]+|\"[^\"]+\")\s+)",
+        flags=re.IGNORECASE
+    )
+    pos = 0
+    result = []
+    while pos < len(sql):
+        m = start_pat.search(sql, pos)
+        if not m:
+            result.append(sql[pos:])
+            break
+        result.append(sql[pos:m.start()])
+        if m.group(1):
+            result.append(m.group(1))
+            pos = m.end()
+            continue
+
+        decl_kw = m.group(3).strip()
+        var_name = m.group(4)
+        decl_start = m.end()
+        idx = decl_start
+        in_str = False
+        in_line_cmt = False
+        in_block_cmt = False
+
+        while idx < len(sql):
+            c = sql[idx]
+            if in_line_cmt:
+                if c == '\n':
+                    in_line_cmt = False
+            elif in_block_cmt:
+                if c == '*' and idx + 1 < len(sql) and sql[idx + 1] == '/':
+                    in_block_cmt = False
+                    idx += 1
+            elif in_str:
+                if c == "'":
+                    if idx + 1 < len(sql) and sql[idx + 1] == "'":
+                        idx += 1
+                    else:
+                        in_str = False
+            else:
+                if c == "'":
+                    in_str = True
+                elif c == '-' and idx + 1 < len(sql) and sql[idx + 1] == '-':
+                    in_line_cmt = True
+                    idx += 1
+                elif c == '/' and idx + 1 < len(sql) and sql[idx + 1] == '*':
+                    in_block_cmt = True
+                    idx += 1
+                elif c == ';':
+                    break
+            idx += 1
+
+        if idx >= len(sql):
+            result.append(sql[m.start():])
+            break
+
+        decl_body = sql[decl_start:idx].strip()
+        pos = idx + 1
+
+        d = 0
+        s_in = False
+        b_in = False
+        l_in = False
+        init_pos = None
+        init_len = 0
+        i = 0
+        while i < len(decl_body):
+            c = decl_body[i]
+            if l_in:
+                if c == '\n':
+                    l_in = False
+            elif b_in:
+                if c == '*' and i + 1 < len(decl_body) and decl_body[i + 1] == '/':
+                    b_in = False
+                    i += 1
+            elif s_in:
+                if c == "'":
+                    if i + 1 < len(decl_body) and decl_body[i + 1] == "'":
+                        i += 1
+                    else:
+                        s_in = False
+            else:
+                if c == "'":
+                    s_in = True
+                elif c == '-' and i + 1 < len(decl_body) and decl_body[i + 1] == '-':
+                    l_in = True
+                    i += 1
+                elif c == '/' and i + 1 < len(decl_body) and decl_body[i + 1] == '*':
+                    b_in = True
+                    i += 1
+                elif c == '(':
+                    d += 1
+                elif c == ')':
+                    d -= 1
+                elif d == 0:
+                    if decl_body[i:i+2] == ':=':
+                        init_pos = i
+                        init_len = 2
+                        break
+                    elif c == '=':
+                        init_pos = i
+                        init_len = 1
+                        break
+                    elif re.match(r'^\bDEFAULT\b', decl_body[i:], re.IGNORECASE):
+                        m_def = re.match(r'^\bDEFAULT\b', decl_body[i:], re.IGNORECASE)
+                        init_pos = i
+                        init_len = m_def.end()
+                        break
+            i += 1
+
+        has_not_null = False
+        if init_pos is not None:
+            type_part = decl_body[:init_pos].strip()
+            expr = decl_body[init_pos + init_len:].strip()
+            if re.search(r'\bNOT\s+NULL\s*$', expr, re.IGNORECASE):
+                has_not_null = True
+                expr = re.sub(r'\bNOT\s+NULL\s*$', '', expr, flags=re.IGNORECASE).strip()
+            if re.search(r'\bNOT\s+NULL\s*$', type_part, re.IGNORECASE):
+                has_not_null = True
+                type_part = re.sub(r'\bNOT\s+NULL\s*$', '', type_part, flags=re.IGNORECASE).strip()
+            nn_str = ' NOT NULL' if has_not_null else ''
+            result.append(f'{decl_kw} {var_name} {type_part}{nn_str} DEFAULT {expr};')
+        else:
+            type_part = decl_body.strip()
+            if re.search(r'\bNOT\s+NULL\s*$', type_part, re.IGNORECASE):
+                has_not_null = True
+                type_part = re.sub(r'\bNOT\s+NULL\s*$', '', type_part, flags=re.IGNORECASE).strip()
+            nn_str = ' NOT NULL' if has_not_null else ''
+            result.append(f'{decl_kw} {var_name} {type_part}{nn_str};')
+
+    return ''.join(result)
+
+
 def _is_time_type(type_str: str) -> bool:
     if not type_str:
         return False
@@ -696,7 +831,10 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         sql = _COLON_PATTERN.sub(colon_repl, sql)
 
         # Step 4: Normalize alternative Firebird syntax DATEADD(...) and DATEDIFF(...)
-        return _normalize_date_funcs(sql)
+        sql = _normalize_date_funcs(sql)
+
+        # Step 5: Normalize variable declarations (= initializers, DEFAULT ... NOT NULL, etc.)
+        return _normalize_variable_declarations(sql)
 
     @classmethod
     def transpile(cls, firebird_sql_string: str, symbols: dict[str, str] = None) -> str:
@@ -1208,8 +1346,17 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
 
     def visitVariable_declaration(self, ctx: FirebirdParser.Variable_declarationContext):
         var_name = ctx.identifier().getText()
+        is_const = " CONSTANT" if (hasattr(ctx, 'CONSTANT') and ctx.CONSTANT()) else ""
         type_spec = self._convert_type(self.get_raw_text(ctx.type_spec()))
-        return f"    {var_name} {type_spec};"
+        not_null = " NOT NULL" if (hasattr(ctx, 'NOT') and ctx.NOT()) else ""
+        default_part = ""
+        if ctx.default_value_part():
+            expr_node = ctx.default_value_part().expression()
+            if expr_node:
+                self.visit(expr_node)
+                expr_str = self.get_raw_text(expr_node).strip()
+                default_part = f" DEFAULT {expr_str}"
+        return f"    {var_name}{is_const} {type_spec}{not_null}{default_part};"
 
     def visitAssignment_statement(self, ctx: FirebirdParser.Assignment_statementContext):
         left = self.get_raw_text(ctx.getChild(0)).lstrip(':')
