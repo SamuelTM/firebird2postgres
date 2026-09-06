@@ -164,7 +164,37 @@ class TestDdlExporterViews(unittest.TestCase):
                 content = f.read()
             self.assertIn("[TRANSPILER FAILED] PROCEDURE PROC_BAD", content)
 
+    def test_fetch_procedure_parameters_with_defaults_and_domains(self):
+        mock_cursor = MagicMock()
+        # Mock result for RDB$PROCEDURE_PARAMETERS joined with RDB$FIELDS
+        # Tuple columns:
+        # 0: pp.RDB$PARAMETER_NAME
+        # 1: pp.RDB$PARAMETER_TYPE (0=in, 1=out)
+        # 2: pp.RDB$PARAMETER_NUMBER
+        # 3: f.RDB$FIELD_TYPE
+        # 4: f.RDB$FIELD_SUB_TYPE
+        # 5: f.RDB$FIELD_LENGTH
+        # 6: f.RDB$FIELD_PRECISION
+        # 7: f.RDB$FIELD_SCALE
+        # 8: pp.RDB$FIELD_SOURCE (domain name or system domain)
+        # 9: pp.RDB$DEFAULT_SOURCE
+        # 10: pp.RDB$NULL_FLAG
+        # 11: f.RDB$NULL_FLAG
+        # 12: f.RDB$DEFAULT_SOURCE
+        mock_cursor.fetchall.return_value = [
+            ("P_ID", 0, 0, 8, 0, 4, 0, 0, "DM_ID", "= 1", 1, 0, None),
+            ("P_NAME", 0, 1, 37, 0, 50, 0, 0, "RDB$123", "DEFAULT 'ANON'", 0, 0, None),
+            ("OUT_STATUS", 1, 2, 37, 0, 10, 0, 0, "DM_STATUS", None, 0, 0, None),
+        ]
+        in_params, out_params = DdlExporter._fetch_procedure_parameters(mock_cursor, "SP_TEST")
+        self.assertEqual(len(in_params), 2)
+        self.assertEqual(len(out_params), 1)
+        self.assertIn("P_ID DM_ID NOT NULL DEFAULT 1", in_params[0])
+        self.assertIn("P_NAME VARCHAR(50) DEFAULT 'ANON'", in_params[1])
+        self.assertIn("OUT_STATUS DM_STATUS", out_params[0])
+
 
 if __name__ == '__main__':
     unittest.main()
+
 

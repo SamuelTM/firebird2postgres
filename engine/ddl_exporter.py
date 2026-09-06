@@ -218,7 +218,12 @@ class DdlExporter:
                 f.RDB$FIELD_SUB_TYPE,
                 f.RDB$FIELD_LENGTH,
                 f.RDB$FIELD_PRECISION,
-                f.RDB$FIELD_SCALE
+                f.RDB$FIELD_SCALE,
+                pp.RDB$FIELD_SOURCE,
+                pp.RDB$DEFAULT_SOURCE,
+                pp.RDB$NULL_FLAG,
+                f.RDB$NULL_FLAG,
+                f.RDB$DEFAULT_SOURCE
             FROM RDB$PROCEDURE_PARAMETERS pp
             JOIN RDB$FIELDS f ON pp.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
             WHERE pp.RDB$PROCEDURE_NAME = ?
@@ -226,6 +231,16 @@ class DdlExporter:
         """
         cursor.execute(params_query, (proc_name,))
         params = cursor.fetchall()
+
+        def _clean_str(val):
+            if val is None:
+                return None
+            if hasattr(val, 'read'):
+                val = val.read()
+            if isinstance(val, bytes):
+                val = val.decode('utf-8', errors='replace')
+            s = str(val).strip()
+            return s if s else None
 
         input_params = []
         output_params = []
@@ -237,21 +252,43 @@ class DdlExporter:
             field_length = param[5]
             field_precision = param[6]
             field_scale = param[7]
+            field_source = _clean_str(param[8]) if len(param) > 8 else None
+            param_default = _clean_str(param[9]) if len(param) > 9 else None
+            param_null_flag = param[10] if len(param) > 10 else None
+            field_null_flag = param[11] if len(param) > 11 else None
+            field_default = _clean_str(param[12]) if len(param) > 12 else None
 
-            type_name = resolve_firebird_type(
-                field_type=field_type,
-                field_subtype=field_subtype,
-                field_length=field_length,
-                field_precision=field_precision,
-                field_scale=field_scale,
-            )
-            if type_name is None:
-                type_name = 'VARCHAR(255)'
+            # Preserve user-defined domain if not a system domain (RDB$...)
+            if field_source and not field_source.startswith('RDB$'):
+                type_name = field_source
+            else:
+                type_name = resolve_firebird_type(
+                    field_type=field_type,
+                    field_subtype=field_subtype,
+                    field_length=field_length,
+                    field_precision=field_precision,
+                    field_scale=field_scale,
+                )
+                if type_name is None:
+                    type_name = 'VARCHAR(255)'
+
+            raw_default = param_default or field_default
+            default_clause = ""
+            if raw_default:
+                if raw_default.upper().startswith('DEFAULT'):
+                    default_clause = f" {raw_default}"
+                elif raw_default.startswith('='):
+                    default_clause = f" DEFAULT {raw_default[1:].strip()}"
+                else:
+                    default_clause = f" DEFAULT {raw_default}"
+
+            is_not_null = (param_null_flag == 1) or (field_null_flag == 1)
+            not_null_clause = " NOT NULL" if is_not_null else ""
 
             if param_type_flag == 0:
-                input_params.append(f'    {param_name} {type_name}')
+                input_params.append(f'    {param_name} {type_name}{not_null_clause}{default_clause}')
             else:
-                output_params.append(f'    {param_name} {type_name}')
+                output_params.append(f'    {param_name} {type_name}{not_null_clause}')
 
         return input_params, output_params
 

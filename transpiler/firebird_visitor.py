@@ -370,6 +370,139 @@ def _normalize_variable_declarations(sql: str) -> str:
     return ''.join(result)
 
 
+def _normalize_procedure_params(sql: str) -> str:
+    proc_pat = re.compile(
+        r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|(\bCREATE\s+(?:OR\s+ALTER\s+)?PROCEDURE\s+([a-zA-Z0-9_$]+|\"[^\"]+\")\s*\()",
+        flags=re.IGNORECASE
+    )
+    pos = 0
+    result = []
+    while pos < len(sql):
+        m = proc_pat.search(sql, pos)
+        if not m:
+            result.append(sql[pos:])
+            break
+        result.append(sql[pos:m.start()])
+        if m.group(1):
+            result.append(m.group(1))
+            pos = m.end()
+            continue
+
+        result.append(m.group(2))
+        header_start = m.end()
+        idx = header_start
+        d = 1
+        in_str = False
+        in_line_cmt = False
+        in_block_cmt = False
+
+        while idx < len(sql) and d > 0:
+            c = sql[idx]
+            if in_line_cmt:
+                if c == '\n':
+                    in_line_cmt = False
+            elif in_block_cmt:
+                if c == '*' and idx + 1 < len(sql) and sql[idx + 1] == '/':
+                    in_block_cmt = False
+                    idx += 1
+            elif in_str:
+                if c == "'":
+                    if idx + 1 < len(sql) and sql[idx + 1] == "'":
+                        idx += 1
+                    else:
+                        in_str = False
+            else:
+                if c == "'":
+                    in_str = True
+                elif c == '-' and idx + 1 < len(sql) and sql[idx + 1] == '-':
+                    in_line_cmt = True
+                    idx += 1
+                elif c == '/' and idx + 1 < len(sql) and sql[idx + 1] == '*':
+                    in_block_cmt = True
+                    idx += 1
+                elif c == '(':
+                    d += 1
+                elif c == ')':
+                    d -= 1
+            idx += 1
+
+        if d > 0:
+            result.append(sql[header_start:])
+            break
+
+        params_body = sql[header_start:idx - 1]
+        pos = idx - 1
+
+        p_d = 0
+        p_in_str = False
+        p_in_line = False
+        p_in_block = False
+        parts = []
+        last_p = 0
+        for i, c in enumerate(params_body):
+            if p_in_line:
+                if c == '\n':
+                    p_in_line = False
+            elif p_in_block:
+                if c == '*' and i + 1 < len(params_body) and params_body[i + 1] == '/':
+                    p_in_block = False
+                    i += 1
+            elif p_in_str:
+                if c == "'":
+                    if i + 1 < len(params_body) and params_body[i + 1] == "'":
+                        pass
+                    else:
+                        p_in_str = False
+            else:
+                if c == "'":
+                    p_in_str = True
+                elif c == '-' and i + 1 < len(params_body) and params_body[i + 1] == '-':
+                    p_in_line = True
+                    i += 1
+                elif c == '/' and i + 1 < len(params_body) and params_body[i + 1] == '*':
+                    p_in_block = True
+                    i += 1
+                elif c in ('(', '['):
+                    p_d += 1
+                elif c in (')', ']'):
+                    p_d -= 1
+                elif c == ',' and p_d == 0:
+                    parts.append(params_body[last_p:i])
+                    last_p = i + 1
+        parts.append(params_body[last_p:])
+
+        norm_parts = []
+        for part in parts:
+            p_clean = part
+            p_clean = re.sub(r"\bNOT\s+NULL\b", "", p_clean, flags=re.IGNORECASE)
+            e_d = 0
+            e_str = False
+            eq_idx = None
+            for j, ch in enumerate(p_clean):
+                if ch == "'":
+                    if not e_str:
+                        e_str = True
+                    elif j + 1 < len(p_clean) and p_clean[j + 1] == "'":
+                        pass
+                    else:
+                        e_str = False
+                elif not e_str:
+                    if ch in ('(', '['):
+                        e_d += 1
+                    elif ch in (')', ']'):
+                        e_d -= 1
+                    elif ch == '=' and e_d == 0:
+                        eq_idx = j
+                        break
+            if eq_idx is not None and not re.search(r"\bDEFAULT\b", p_clean[:eq_idx], re.IGNORECASE):
+                p_clean = p_clean[:eq_idx] + " DEFAULT " + p_clean[eq_idx + 1:]
+            norm_parts.append(p_clean)
+
+        result.append(",".join(norm_parts))
+
+    return "".join(result)
+
+
 def _is_time_type(type_str: str) -> bool:
     if not type_str:
         return False
@@ -834,7 +967,10 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         sql = _normalize_date_funcs(sql)
 
         # Step 5: Normalize variable declarations (= initializers, DEFAULT ... NOT NULL, etc.)
-        return _normalize_variable_declarations(sql)
+        sql = _normalize_variable_declarations(sql)
+
+        # Step 6: Normalize procedure parameters (= to DEFAULT, strip NOT NULL)
+        return _normalize_procedure_params(sql)
 
     @classmethod
     def transpile(cls, firebird_sql_string: str, symbols: dict[str, str] = None) -> str:
@@ -970,12 +1106,13 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
             if hasattr(child, 'getText') and child.getText().upper() == 'RETURNS':
                 has_returns = True
             elif isinstance(child, FirebirdParser.ParameterContext):
-                param_str = self.visit(child)
                 type_spec = self._convert_type(self.get_raw_text(child.type_spec())) if child.type_spec() else "TEXT"
                 if has_returns:
-                    out_params.append(f"OUT {param_str}")
+                    param_name = child.parameter_name().getText()
+                    out_params.append(f"OUT {param_name} {type_spec}".strip())
                     out_types.append(type_spec)
                 else:
+                    param_str = self.visit(child)
                     in_params.append(param_str)
 
         all_params = in_params + out_params
@@ -1015,7 +1152,14 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         type_spec = ""
         if ctx.type_spec():
             type_spec = self._convert_type(self.get_raw_text(ctx.type_spec()))
-        return f"{param_name} {type_spec}".strip()
+        default_part = ""
+        if ctx.default_value_part():
+            expr_node = ctx.default_value_part().expression()
+            if expr_node:
+                self.visit(expr_node)
+                expr_str = self.get_raw_text(expr_node).strip()
+                default_part = f" DEFAULT {expr_str}"
+        return f"{param_name} {type_spec}{default_part}".strip()
 
     def visitCreate_trigger(self, ctx: FirebirdParser.Create_triggerContext):
         trigger_name = ctx.trigger_name().getText().strip('"')

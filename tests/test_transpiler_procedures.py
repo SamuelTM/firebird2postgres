@@ -574,6 +574,27 @@ class TestTranspilerProcedures(unittest.TestCase):
         self.assertIn('C CONSTANT INTEGER DEFAULT 99;', pg_sql)
         self.assertIn('PLAIN INTEGER;', pg_sql)
 
+    def test_procedure_with_parameter_defaults_and_domains(self):
+        fb_sql = """
+        CREATE PROCEDURE SP_PARAM_DEFAULTS (
+            P_LIMIT INTEGER DEFAULT 10,
+            P_PREFIX VARCHAR(20) = 'test',
+            P_RATE DM_TAXA NOT NULL DEFAULT 0.05
+        )
+        RETURNS (
+            OUT_COUNT INTEGER
+        )
+        AS
+        BEGIN
+            OUT_COUNT = P_LIMIT;
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn('CREATE FUNCTION "sp_param_defaults"(P_LIMIT INTEGER DEFAULT 10, '
+                      "P_PREFIX VARCHAR(20) DEFAULT 'test', "
+                      'P_RATE DM_TAXA DEFAULT 0.05, OUT OUT_COUNT INTEGER) RETURNS INTEGER', pg_sql)
+
+
 
 
 
