@@ -646,6 +646,49 @@ class TestTranspilerProcedures(unittest.TestCase):
         self.assertIn("EXIT;", pg_sql)
         self.assertNotIn("LEAVE;", pg_sql)
 
+    def test_column_and_variable_disambiguation(self):
+        fb_sql = """
+        CREATE PROCEDURE SP_GET_ID (ID INTEGER)
+        RETURNS (
+            RES INTEGER
+        )
+        AS
+        BEGIN
+            SELECT ID FROM T WHERE ID = :ID INTO :RES;
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("SELECT T.ID FROM T WHERE T.ID = ID INTO STRICT RES;", pg_sql)
+
+    def test_procedure_output_id_disambiguation(self):
+        fb_sql = """
+        CREATE PROCEDURE SP_FETCH_RECORD
+        RETURNS (
+            ID INTEGER
+        )
+        AS
+        BEGIN
+            SELECT ID FROM T INTO :ID;
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("SELECT T.ID FROM T INTO STRICT ID;", pg_sql)
+
+    def test_column_and_variable_disambiguation_with_alias(self):
+        fb_sql = """
+        CREATE PROCEDURE SP_GET_ALIASED
+        RETURNS (
+            ID INTEGER
+        )
+        AS
+        BEGIN
+            SELECT ID FROM T MY_ALIAS WHERE ID = :ID INTO :ID;
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("SELECT MY_ALIAS.ID FROM T MY_ALIAS WHERE MY_ALIAS.ID = ID INTO STRICT ID;", pg_sql)
+
+
 
 
 

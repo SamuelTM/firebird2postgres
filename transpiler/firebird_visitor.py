@@ -886,6 +886,78 @@ class ASTDialectRewriter(FirebirdParserVisitor):
             else:
                 self.rewriter.insertAfterToken(target_token, limit_clause)
 
+    def _disambiguate_scope(self, scope_node, table_qualifier: str):
+        if not scope_node or not table_qualifier or table_qualifier.upper() == 'RDB$DATABASE' or not self.symbols:
+            return
+
+        def find_unqualified_col_parts(node):
+            res = []
+            if node is None:
+                return res
+            # Do not recurse into nested subqueries
+            if isinstance(node, FirebirdParser.Query_blockContext) and node != scope_node:
+                return res
+            # Do not touch INTO clause target variables
+            if isinstance(node, FirebirdParser.Into_clauseContext):
+                return res
+            if isinstance(node, FirebirdParser.General_element_partContext):
+                res.append(node)
+            if hasattr(node, "children") and node.children:
+                for child in node.children:
+                    res.extend(find_unqualified_col_parts(child))
+            return res
+
+        for p in find_unqualified_col_parts(scope_node):
+            if hasattr(p, 'function_argument') and len(p.function_argument()) > 0:
+                continue
+            curr = p.parentCtx
+            is_qualified = False
+            while curr:
+                if isinstance(curr, FirebirdParser.General_elementContext) and len(curr.children) > 1:
+                    is_qualified = True
+                    break
+                curr = curr.parentCtx
+            if is_qualified:
+                continue
+            if hasattr(p, 'id_expression') and p.id_expression():
+                col_name = p.id_expression().getText().strip('":').lower()
+                if col_name in self.symbols:
+                    col_text = p.id_expression().getText()
+                    self.rewriter.replaceRangeTokens(
+                        p.id_expression().start,
+                        p.id_expression().stop,
+                        f"{table_qualifier}.{col_text}"
+                    )
+
+    def visitQuery_block(self, ctx: FirebirdParser.Query_blockContext):
+        self._rewrite_first_skip(ctx)
+        if ctx.from_clause() and self.symbols:
+            table_ref_list = ctx.from_clause().table_ref_list()
+            if table_ref_list and len(table_ref_list.table_ref()) == 1:
+                table_ref = table_ref_list.table_ref(0)
+                aux = table_ref.table_ref_aux()
+                if aux:
+                    table_qualifier = aux.table_alias().getText().strip() if aux.table_alias() else (
+                        aux.table_ref_aux_internal().getText().strip() if aux.table_ref_aux_internal() else ""
+                    )
+                    if table_qualifier and table_qualifier.upper() != 'RDB$DATABASE':
+                        self._disambiguate_scope(ctx, table_qualifier)
+        return self.visitChildren(ctx)
+
+    def visitUpdate_statement(self, ctx: FirebirdParser.Update_statementContext):
+        if ctx.general_table_ref() and self.symbols and ctx.where_clause():
+            table_qualifier = ctx.general_table_ref().getText().strip()
+            if table_qualifier and table_qualifier.upper() != 'RDB$DATABASE':
+                self._disambiguate_scope(ctx.where_clause(), table_qualifier)
+        return self.visitChildren(ctx)
+
+    def visitDelete_statement(self, ctx: FirebirdParser.Delete_statementContext):
+        if ctx.general_table_ref() and self.symbols and ctx.where_clause():
+            table_qualifier = ctx.general_table_ref().getText().strip()
+            if table_qualifier and table_qualifier.upper() != 'RDB$DATABASE':
+                self._disambiguate_scope(ctx.where_clause(), table_qualifier)
+        return self.visitChildren(ctx)
+
     def visitSelect_statement(self, ctx: FirebirdParser.Select_statementContext):
         self._rewrite_first_skip(ctx)
         return self.visitChildren(ctx)
