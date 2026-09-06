@@ -170,4 +170,26 @@ class TestDataMigrator(unittest.TestCase):
         # NULLs
         self.assertIn(r'\N', buf_val)
 
+    def test_sequence_synchronization_does_not_regress_and_groups_by_sequence(self):
+        t1 = Table('TABELA1')
+        t1.columns.append(Column('ID', 'INTEGER', nullable=False, sequence_name='GEN_SHARED_ID'))
+        t2 = Table('TABELA2')
+        t2.columns.append(Column('CODIGO', 'INTEGER', nullable=False, sequence_name='GEN_SHARED_ID'))
+
+        self.mock_fb_cur.fetchmany.return_value = []
+        success = self.migrator.import_data([t1, t2], max_workers=1)
+        self.assertTrue(success)
+
+        executed_queries = [call[0][0] for call in self.mock_pg_cur.execute.call_args_list]
+        sync_queries = [q for q in executed_queries if 'SELECT setval(' in q]
+
+        # Must execute exactly once for the shared sequence across both tables
+        self.assertEqual(len(sync_queries), 1)
+        query = sync_queries[0]
+        self.assertIn('"gen_shared_id"', query)
+        self.assertIn('SELECT last_value FROM "gen_shared_id"', query)
+        self.assertIn('COALESCE((SELECT MAX("id") FROM "tabela1"), 0)', query)
+        self.assertIn('COALESCE((SELECT MAX("codigo") FROM "tabela2"), 0)', query)
+        self.assertIn('is_called', query)
+
 
