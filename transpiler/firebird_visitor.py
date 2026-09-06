@@ -1015,17 +1015,20 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         return f"{decl_str}{body_str}"
 
     def visitCreate_view(self, ctx: FirebirdParser.Create_viewContext):
-        view_name = ctx.id_expression(0).getText().strip('"').lower()
+        raw_name = ctx.id_expression(0).getText().strip()
+        clean_name = raw_name[1:-1].replace('""', '"') if raw_name.startswith('"') and raw_name.endswith('"') else raw_name
+        view_name = clean_name.lower()
         select_stmt = self.get_raw_text(ctx.select_only_statement())
 
         view_opts = ""
         if ctx.view_options():
             vac = ctx.view_options().view_alias_constraint()
             if vac and vac.table_alias():
-                cols = [
-                    pg_quote_ident((ta.identifier().getText() if ta.identifier() else ta.getText()).strip('"').lower())
-                    for ta in vac.table_alias()
-                ]
+                cols = []
+                for ta in vac.table_alias():
+                    raw_col = (ta.identifier().getText() if ta.identifier() else ta.getText()).strip()
+                    clean_col = raw_col[1:-1].replace('""', '"') if raw_col.startswith('"') and raw_col.endswith('"') else raw_col
+                    cols.append(pg_quote_ident(clean_col.lower()))
                 if cols:
                     view_opts = f" ({', '.join(cols)})"
             if not view_opts:

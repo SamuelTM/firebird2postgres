@@ -102,6 +102,26 @@ class TestDdlExporterTriggers(unittest.TestCase):
             self.assertIn("Failed to read current value for generator 'GEN_FAIL'", str(cm.exception))
 
 
+class TestDdlExporterViews(unittest.TestCase):
+    def test_fetch_view_columns_preserves_quotes_and_escapes(self):
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [
+            ("Order Total",),
+            ("SELECT",),
+            ('Col "Special"',),
+            ("ID",),
+        ]
+        cols = DdlExporter._fetch_view_columns(mock_cursor, "V_TEST")
+        self.assertEqual(cols, ['"Order Total"', '"SELECT"', '"Col ""Special"""', '"ID"'])
+
+    def test_format_view_firebird_ddl(self):
+        col_names = ['"Order Total"', '"SELECT"']
+        source = "SELECT total, sel FROM orders"
+        ddl = DdlExporter._format_view_firebird_ddl("V_ORDERS", col_names, source)
+        expected = 'CREATE OR ALTER VIEW "V_ORDERS" ("Order Total", "SELECT") AS\nSELECT total, sel FROM orders\n\n'
+        self.assertEqual(ddl, expected)
+
+
 if __name__ == '__main__':
     unittest.main()
 

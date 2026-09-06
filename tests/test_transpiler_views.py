@@ -59,3 +59,13 @@ class TestTranspilerViews(unittest.TestCase):
         self.assertIn('CREATE VIEW "v_base" ("id") AS SELECT "id" FROM "t";', pg_sql)
         self.assertIn('DROP VIEW IF EXISTS "v_child" CASCADE;', pg_sql)
         self.assertIn('CREATE VIEW "v_child" ("id") AS SELECT "id" FROM "v_base";', pg_sql)
+
+    def test_view_with_columns_containing_spaces_and_keywords(self):
+        fb_sql = '''
+        CREATE OR ALTER VIEW "V_ORDERS" ("Order Total", "SELECT", "Col ""Special""") AS
+        SELECT total, sel, col FROM orders;
+        '''
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn('DROP VIEW IF EXISTS "v_orders" CASCADE;', pg_sql)
+        self.assertIn('CREATE VIEW "v_orders" ("order total", "select", "col ""special""") AS SELECT', pg_sql)
+
