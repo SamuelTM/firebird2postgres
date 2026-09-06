@@ -732,13 +732,18 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
     def _guarantees_single_row(select_ctx: ParserRuleContext) -> bool:
         """
         Returns True if the SELECT query structurally guarantees returning exactly 1 row:
-        1. No FROM clause or FROM RDB$DATABASE (scalar expressions, constants, sequence nextval).
-        2. Pure aggregate functions (COUNT, SUM, AVG, MIN, MAX) without a GROUP BY clause.
+        Pure scalar evaluation without filters:
+        - No FROM clause, or FROM RDB$DATABASE
+        - AND no WHERE clause
         In these cases, NO_DATA_FOUND can never be raised in PostgreSQL, making
         BEGIN ... EXCEPTION WHEN NO_DATA_FOUND subtransactions completely unnecessary.
         """
         qb = _find_node(select_ctx, FirebirdParser.Query_blockContext)
         if not qb:
+            return False
+
+        has_where = bool(qb.where_clause() if hasattr(qb, 'where_clause') else None)
+        if has_where:
             return False
 
         from_clause = qb.from_clause() if hasattr(qb, 'from_clause') else None
@@ -747,13 +752,6 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         if hasattr(from_clause, 'table_ref_list') and from_clause.table_ref_list():
             ref_text = from_clause.table_ref_list().getText().upper()
             if ref_text == 'RDB$DATABASE':
-                return True
-
-        has_group_by = bool(qb.group_by_clause() if hasattr(qb, 'group_by_clause') else None)
-        if not has_group_by and hasattr(qb, 'selected_list') and qb.selected_list():
-            sel_text = qb.selected_list().getText().upper()
-            agg_funcs = ('COUNT(', 'SUM(', 'AVG(', 'MIN(', 'MAX(')
-            if any(af in sel_text for af in agg_funcs):
                 return True
 
         return False

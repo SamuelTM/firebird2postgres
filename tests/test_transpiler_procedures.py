@@ -265,20 +265,39 @@ class TestTranspilerProcedures(unittest.TestCase):
         self.assertIn("INTO STRICT V_ID;", pg_sql)
         self.assertNotIn("EXCEPTION WHEN NO_DATA_FOUND THEN", pg_sql)
 
-    def test_aggregate_select_without_group_by_omits_exception_block(self):
-        fb_sql = """
-        CREATE OR ALTER PROCEDURE SP_COUNT_ACTIVE
-        RETURNS (V_COUNT INTEGER)
-        AS
-        BEGIN
-            SELECT COUNT(*) FROM CLIENTES WHERE ATIVO = 1 INTO :V_COUNT;
-            SUSPEND;
-        END;
-        """
-        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
-        self.assertIn("SELECT COUNT(*) FROM CLIENTES", pg_sql)
-        self.assertIn("INTO STRICT V_COUNT;", pg_sql)
-        self.assertNotIn("EXCEPTION WHEN NO_DATA_FOUND THEN", pg_sql)
+    def test_table_queries_and_filtered_queries_retain_exception_block(self):
+        # Queries on tables or with WHERE clauses may return 0 rows and must preserve exception handling
+        cases = [
+            """
+            CREATE OR ALTER PROCEDURE SP_COUNT_ACTIVE RETURNS (V_COUNT INTEGER) AS
+            BEGIN
+                SELECT COUNT(*) FROM CLIENTES WHERE ATIVO = 1 INTO :V_COUNT;
+                SUSPEND;
+            END;
+            """,
+            """
+            CREATE OR ALTER PROCEDURE SP_FILTERED_RDB RETURNS (V INTEGER) AS
+            BEGIN
+                SELECT 1 FROM RDB$DATABASE WHERE 1=0 INTO :V;
+            END;
+            """,
+            """
+            CREATE OR ALTER PROCEDURE SP_STRING_AGG RETURNS (V VARCHAR(20)) AS
+            BEGIN
+                SELECT 'COUNT(' FROM SRC INTO :V;
+            END;
+            """,
+            """
+            CREATE OR ALTER PROCEDURE SP_SUBQUERY_AGG RETURNS (V INTEGER) AS
+            BEGIN
+                SELECT (SELECT COUNT(*) FROM DST) FROM SRC INTO :V;
+            END;
+            """
+        ]
+        for fb_sql in cases:
+            pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+            self.assertIn("EXCEPTION WHEN NO_DATA_FOUND THEN", pg_sql)
+            self.assertIn("INTO STRICT", pg_sql)
 
     def test_for_loop_update_retains_procedural_cursor(self):
         fb_sql = """
