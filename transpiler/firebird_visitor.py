@@ -158,16 +158,18 @@ class ASTDialectRewriter(FirebirdParserVisitor):
         is_select_into = isinstance(ctx.parentCtx,
                                     (FirebirdParser.Query_blockContext, FirebirdParser.Select_statementContext))
 
-        parent = ctx.parentCtx
-        is_for_loop = False
-        while parent:
-            if isinstance(parent, FirebirdParser.Loop_statementContext):
-                if hasattr(parent, 'FOR') and parent.FOR():
-                    is_for_loop = True
-                    break
-            parent = parent.parentCtx
+        curr = ctx.parentCtx
+        is_loop_cursor = False
+        prev = ctx
+        while curr:
+            if isinstance(curr, FirebirdParser.Loop_statementContext):
+                if hasattr(curr, 'FOR') and curr.FOR():
+                    is_loop_cursor = (prev != curr.statement())
+                break
+            prev = curr
+            curr = curr.parentCtx
 
-        if is_select_into and not is_for_loop:
+        if is_select_into and not is_loop_cursor:
             for c in ctx.children:
                 if hasattr(c, 'symbol') and c.symbol.text.upper() == 'INTO':
                     self.rewriter.replaceRangeTokens(c.symbol, c.symbol, f"{c.symbol.text} STRICT")
@@ -464,8 +466,8 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
 
         # DROP first to guarantee idempotency, since changing an existing function's
         # signature (parameter types or return type) requires recreating it
-        return (f'DROP FUNCTION IF EXISTS "{proc_name}" CASCADE;\n'
-                f'CREATE FUNCTION "{proc_name}"({params_str}) {return_type} AS $$\n{decl_str}{body_str}\n'
+        return (f'DROP FUNCTION IF EXISTS {proc_name} CASCADE;\n'
+                f'CREATE FUNCTION {proc_name}({params_str}) {return_type} AS $$\n{decl_str}{body_str}\n'
                 f'$$ LANGUAGE plpgsql;')
 
     def visitParameter(self, ctx: FirebirdParser.ParameterContext):
@@ -497,7 +499,15 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         timing_upper = timing.upper()
         events_upper = events.upper()
         if "BEFORE" in timing_upper:
-            if "DELETE" in events_upper and "INSERT" not in events_upper and "UPDATE" not in events_upper:
+            has_delete = "DELETE" in events_upper
+            has_insert_or_update = "INSERT" in events_upper or "UPDATE" in events_upper
+            if has_delete and has_insert_or_update:
+                return_stmt = ("IF TG_OP = 'DELETE' THEN\n"
+                               "        RETURN OLD;\n"
+                               "    ELSE\n"
+                               "        RETURN NEW;\n"
+                               "    END IF;")
+            elif has_delete:
                 return_stmt = "RETURN OLD;"
             else:
                 return_stmt = "RETURN NEW;"

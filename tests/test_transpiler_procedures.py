@@ -15,8 +15,8 @@ class TestTranspilerProcedures(unittest.TestCase):
         END;
         """
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
-        self.assertIn('DROP FUNCTION IF EXISTS "SP_ATUALIZA_SALDO" CASCADE;', pg_sql)
-        self.assertIn('CREATE FUNCTION "SP_ATUALIZA_SALDO"(P_CONTA_ID INTEGER, P_VALOR NUMERIC(15,2)) '
+        self.assertIn('DROP FUNCTION IF EXISTS SP_ATUALIZA_SALDO CASCADE;', pg_sql)
+        self.assertIn('CREATE FUNCTION SP_ATUALIZA_SALDO(P_CONTA_ID INTEGER, P_VALOR NUMERIC(15,2)) '
                       'RETURNS void AS $$', pg_sql)
         self.assertIn("UPDATE CONTAS SET SALDO = SALDO +", pg_sql)
 
@@ -36,7 +36,7 @@ class TestTranspilerProcedures(unittest.TestCase):
         END;
         """
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
-        self.assertIn('DROP FUNCTION IF EXISTS "SP_LISTA_ATIVOS" CASCADE;', pg_sql)
+        self.assertIn('DROP FUNCTION IF EXISTS SP_LISTA_ATIVOS CASCADE;', pg_sql)
         self.assertIn("RETURNS SETOF record", pg_sql)
         self.assertIn("RETURN NEXT;", pg_sql)
 
@@ -173,7 +173,7 @@ class TestTranspilerProcedures(unittest.TestCase):
         END;
         """
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
-        self.assertIn('CREATE FUNCTION "SP_BLOB_TEST"(P_TEXTO TEXT, P_BINARIO BYTEA) RETURNS void AS $$', pg_sql)
+        self.assertIn('CREATE FUNCTION SP_BLOB_TEST(P_TEXTO TEXT, P_BINARIO BYTEA) RETURNS void AS $$', pg_sql)
         self.assertIn("INSERT INTO DADOS (DOC, ARQ) VALUES (P_TEXTO, P_BINARIO);", pg_sql)
 
     def test_update_set_qualified_columns_stripped(self):
@@ -231,3 +231,22 @@ class TestTranspilerProcedures(unittest.TestCase):
         self.assertIn("INTO STRICT V_NOME, V_VALOR", pg_sql)
         self.assertIn("EXCEPTION WHEN NO_DATA_FOUND THEN", pg_sql)
         self.assertIn("NULL;", pg_sql)
+
+    def test_singleton_select_into_inside_for_loop_has_strict(self):
+        fb_sql = """
+        CREATE OR ALTER PROCEDURE SP_LOOP_NESTED_SELECT
+        AS
+        DECLARE VARIABLE V_ID INTEGER;
+        DECLARE VARIABLE V_NOME VARCHAR(100);
+        BEGIN
+            FOR SELECT ID FROM USERS INTO :V_ID DO
+            BEGIN
+                SELECT NOME FROM DETAILS WHERE USER_ID = :V_ID INTO :V_NOME;
+            END
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("FOR V_ID IN SELECT ID FROM USERS", pg_sql)
+        self.assertIn("INTO STRICT V_NOME;", pg_sql)
+        self.assertIn("EXCEPTION WHEN NO_DATA_FOUND THEN", pg_sql)
+

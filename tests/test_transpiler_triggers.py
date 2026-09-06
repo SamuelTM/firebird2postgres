@@ -114,3 +114,18 @@ class TestTranspilerTriggers(unittest.TestCase):
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
         self.assertIn("RETURNING ID INTO V_ID;", pg_sql)
         self.assertIn("WHERE V_ID > 0", pg_sql)
+
+    def test_before_multi_event_trigger_with_delete_returns_old_or_new(self):
+        fb_sql = """
+        CREATE TRIGGER BIUD_TEST FOR TEST BEFORE INSERT OR UPDATE OR DELETE
+        AS
+        BEGIN
+            IF (DELETING) THEN
+                INSERT INTO AUDIT_LOG (ACTION) VALUES ('DEL');
+        END
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("IF TG_OP = 'DELETE' THEN", pg_sql)
+        self.assertIn("RETURN OLD;", pg_sql)
+        self.assertIn("RETURN NEW;", pg_sql)
+
