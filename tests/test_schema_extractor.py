@@ -100,8 +100,28 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
         )
         self.assertEqual(
             FirebirdToPostgresVisitor.transpile_expression("DATEDIFF(MILLISECOND, D1, D2)"),
-            "ROUND(EXTRACT(EPOCH FROM (DATE_TRUNC('milliseconds', D2::timestamp) - DATE_TRUNC('milliseconds', D1::timestamp))) * 1000)",
+            "ROUND((EXTRACT(EPOCH FROM (D2::timestamp - D1::timestamp)) * 1000)::numeric, 1)",
         )
+        self.assertEqual(
+            FirebirdToPostgresVisitor.transpile_expression("DATEDIFF(HOUR, TIME '10:59', TIME '11:00')"),
+            "ROUND(EXTRACT(EPOCH FROM (DATE_TRUNC('hour', TIME '11:00') - DATE_TRUNC('hour', TIME '10:59'))) / 3600)",
+        )
+        self.assertEqual(
+            FirebirdToPostgresVisitor.transpile_expression("DATEDIFF(MINUTE, TIME '10:59', TIME '11:00')"),
+            "ROUND(EXTRACT(EPOCH FROM (DATE_TRUNC('minute', TIME '11:00') - DATE_TRUNC('minute', TIME '10:59'))) / 60)",
+        )
+        self.assertEqual(
+            FirebirdToPostgresVisitor.transpile_expression("DATEDIFF(SECOND, TIME '10:59:00', TIME '10:59:05')"),
+            "ROUND(EXTRACT(EPOCH FROM (DATE_TRUNC('second', TIME '10:59:05') - DATE_TRUNC('second', TIME '10:59:00'))))",
+        )
+        self.assertEqual(
+            FirebirdToPostgresVisitor.transpile_expression("DATEDIFF(MILLISECOND, TIME '10:59:00.0000', TIME '10:59:00.0001')"),
+            "ROUND((EXTRACT(EPOCH FROM (TIME '10:59:00.0001' - TIME '10:59:00.0000')) * 1000)::numeric, 1)",
+        )
+        with self.assertLogs('transpiler.firebird_visitor', level='WARNING') as cm:
+            res = FirebirdToPostgresVisitor.transpile_expression("DATEDIFF(DAY, TIME '10:00', TIME '11:00')")
+            self.assertEqual(res, "DATEDIFF(DAY, TIME '10:00', TIME '11:00')")
+            self.assertTrue(any("cannot be used with TIME values" in log for log in cm.output))
         self.assertEqual(
             FirebirdToPostgresVisitor.transpile_expression("GEN_ID(GEN_SEQ, 1)"),
             "nextval('GEN_SEQ')",

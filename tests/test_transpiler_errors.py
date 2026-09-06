@@ -36,3 +36,15 @@ class TestTranspilerErrors(unittest.TestCase):
         with self.assertRaises(ValueError):
             FirebirdToPostgresVisitor.transpile(sql)
 
+    def test_datediff_day_with_time_raises_value_error(self):
+        sql = """
+        CREATE OR ALTER PROCEDURE SP_BAD_TIME_DATEDIFF
+        AS
+        DECLARE VARIABLE V_X INTEGER;
+        BEGIN
+            V_X = DATEDIFF(DAY, TIME '10:00', TIME '11:00');
+        END;
+        """
+        with self.assertRaises(ValueError):
+            FirebirdToPostgresVisitor.transpile(sql)
+
