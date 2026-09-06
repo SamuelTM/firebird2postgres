@@ -78,29 +78,37 @@ _TOKEN_DATE_FUNC_PATTERN = re.compile(
     flags=re.IGNORECASE | re.DOTALL
 )
 
+_STRIP_SQL_LITERALS_AND_COMMENTS = re.compile(
+    r"'(?:''|[^'])*'|/\*.*?\*/|--[^\n]*",
+    flags=re.DOTALL
+)
+
+_CAST_DYNAMIC_DATE_PATTERN = re.compile(
+    r"\bCAST\s*\(\s*'(NOW|TODAY|YESTERDAY|TOMORROW)'\s+AS\s+(DATE|TIMESTAMP|TIME)\b",
+    flags=re.IGNORECASE
+)
+
 _NON_IMMUTABLE_PATTERN = re.compile(
     r'(\b(CURRENT_DATE|CURRENT_TIMESTAMP|CURRENT_TIME|LOCALTIMESTAMP|LOCALTIME)\b|'
-    r'\b(NOW|RAND|RANDOM|CLOCK_TIMESTAMP|TIMEOFDAY|STATEMENT_TIMESTAMP|TRANSACTION_TIMESTAMP)\s*\(\s*\))',
-    re.IGNORECASE
-)
-_SPECIAL_DATE_LITERAL_PATTERN = re.compile(
-    r"'(NOW|TODAY|YESTERDAY|TOMORROW)'",
-    re.IGNORECASE
+    r'\b(NOW|RAND|RANDOM|CLOCK_TIMESTAMP|TIMEOFDAY|STATEMENT_TIMESTAMP|TRANSACTION_TIMESTAMP|NEXTVAL|CURRVAL|SETVAL)\s*\(\s*\))',
+    flags=re.IGNORECASE
 )
 
 
 def validate_immutable_expression(expr: str, context: str = "expression") -> None:
     """
     Validates that a PostgreSQL generated column or expression index does not reference
-    volatile/stable functions like CURRENT_DATE, CURRENT_TIMESTAMP, or RANDOM().
+    volatile/stable functions (e.g. CURRENT_DATE, RANDOM(), nextval()) or dynamic date casts.
+    Ignores plain string literals and comments to prevent false positives.
     """
-    m_lit = _SPECIAL_DATE_LITERAL_PATTERN.search(expr)
-    if m_lit:
+    m_cast = _CAST_DYNAMIC_DATE_PATTERN.search(expr)
+    if m_cast:
         raise ValueError(
-            f"Non-immutable date literal '{m_lit.group(0)}' in {context}: '{expr}' "
+            f"Non-immutable date cast '{m_cast.group(0)}' in {context}: '{expr}' "
             f"is not permitted in PostgreSQL (generated columns and expression indexes must be IMMUTABLE)."
         )
-    clean_expr = re.sub(r"'(?:''|[^'])*'", "''", expr)
+
+    clean_expr = _STRIP_SQL_LITERALS_AND_COMMENTS.sub(" ", expr)
     m = _NON_IMMUTABLE_PATTERN.search(clean_expr)
     if m:
         raise ValueError(
