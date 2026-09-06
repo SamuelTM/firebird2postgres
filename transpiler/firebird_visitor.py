@@ -155,7 +155,7 @@ class ASTDialectRewriter(FirebirdParserVisitor):
             sep_str = self._get_tokens_text(args[1]).strip() if len(args) == 2 else "','"
             self.rewriter.replaceRangeTokens(
                 ctx.start, ctx.stop,
-                f"string_agg({col_str}::text, {sep_str})"
+                f"string_agg(({col_str})::text, {sep_str})"
             )
         elif fn_name == 'DATEADD' and len(args) == 3:
             part_str = self._get_tokens_text(args[0]).strip().lower()

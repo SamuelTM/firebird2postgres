@@ -435,6 +435,7 @@ class TestTranspilerProcedures(unittest.TestCase):
             V_X = IIF(V_X > 0, IIF(V_X > 10, 100, 50), 0);
             SELECT LIST(NOME) FROM CLIENTES;
             SELECT LIST(NOME, '; ') FROM CLIENTES;
+            SELECT LIST(ID + 1, ', ') FROM CLIENTES;
             V_DT = DATEADD(DAY, 5, V_DT);
             V_DT = DATEADD(MONTH, -1, V_DT);
             V_DIFF = DATEDIFF(DAY, V_DT, CURRENT_DATE);
@@ -443,8 +444,9 @@ class TestTranspilerProcedures(unittest.TestCase):
         """
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
         self.assertIn("V_X := CASE WHEN V_X > 0 THEN CASE WHEN V_X > 10 THEN 100 ELSE 50 END ELSE 0 END;", pg_sql)
-        self.assertIn("SELECT string_agg(NOME::text, ',') FROM CLIENTES;", pg_sql)
-        self.assertIn("SELECT string_agg(NOME::text, '; ') FROM CLIENTES;", pg_sql)
+        self.assertIn("SELECT string_agg((NOME)::text, ',') FROM CLIENTES;", pg_sql)
+        self.assertIn("SELECT string_agg((NOME)::text, '; ') FROM CLIENTES;", pg_sql)
+        self.assertIn("SELECT string_agg((ID + 1)::text, ', ') FROM CLIENTES;", pg_sql)
         self.assertIn("V_DT := (V_DT + (5) * INTERVAL '1 day');", pg_sql)
         self.assertIn("V_DT := (V_DT + (-1) * INTERVAL '1 month');", pg_sql)
         self.assertIn("V_DIFF := (DATE(CURRENT_DATE) - DATE(V_DT));", pg_sql)
