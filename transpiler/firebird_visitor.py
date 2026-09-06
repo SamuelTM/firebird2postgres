@@ -514,6 +514,24 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         else:
             return_stmt = "RETURN NULL;"
 
+        # Check if the trigger is purely an auto-increment ID assignment:
+        # IF (NEW.col IS NULL) THEN NEW.col := nextval(...); END IF;
+        # Lifting this guard to WHEN (NEW."col" IS NULL) ensures PostgreSQL's C engine
+        # skips invoking the PL/pgSQL function on standard inserts where DEFAULT nextval(...)
+        # already populated the column, eliminating redundant trigger execution overhead.
+        when_clause = ""
+        if timing_upper == "BEFORE" and "INSERT" in events_upper and "DELETE" not in events_upper:
+            norm_body = " ".join(body_str.split())
+            id_match = re.match(
+                r'^BEGIN\s+IF\s*\(?\s*"?(?:new|NEW)"?\.([a-zA-Z0-9_$]+)\s+IS\s+NULL\s*\)?\s+THEN\s+'
+                r'"?(?:new|NEW)"?\.\1\s*:=\s*nextval\([^)]+\);\s*END\s+IF;\s*END;?$',
+                norm_body,
+                re.IGNORECASE
+            )
+            if id_match:
+                col_name = id_match.group(1).lower()
+                when_clause = f' WHEN (NEW."{col_name}" IS NULL)'
+
         if body_str:
             if body_str.rstrip().endswith("END;"):
                 idx = body_str.rstrip().rfind("END;")
@@ -527,7 +545,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         func_sql = f'CREATE OR REPLACE FUNCTION "{func_name}"() RETURNS TRIGGER AS $$\n{body_str}\n$$ LANGUAGE plpgsql;'
         trigger_sql = (f'DROP TRIGGER IF EXISTS "{trigger_name}" ON "{table_name.lower()}";\n'
                        f'CREATE TRIGGER "{trigger_name}" {timing} {events} ON "{table_name.lower()}" '
-                       f'FOR EACH ROW EXECUTE FUNCTION "{func_name}"();')
+                       f'FOR EACH ROW{when_clause} EXECUTE FUNCTION "{func_name}"();')
 
         return f"{func_sql}\n{trigger_sql}"
 

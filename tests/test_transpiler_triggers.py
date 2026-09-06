@@ -18,6 +18,7 @@ class TestTranspilerTriggers(unittest.TestCase):
         self.assertIn("RETURN NEW;", pg_sql)
         self.assertIn('DROP TRIGGER IF EXISTS "BI_CLIENTES" ON "clientes";', pg_sql)
         self.assertIn('CREATE TRIGGER "BI_CLIENTES" BEFORE INSERT ON "clientes"', pg_sql)
+        self.assertIn('WHEN (NEW."id" IS NULL)', pg_sql)
         self.assertIn('EXECUTE FUNCTION "BI_CLIENTES_func"()', pg_sql)
 
     def test_before_update_trigger_with_new_and_old(self):
@@ -128,4 +129,18 @@ class TestTranspilerTriggers(unittest.TestCase):
         self.assertIn("IF TG_OP = 'DELETE' THEN", pg_sql)
         self.assertIn("RETURN OLD;", pg_sql)
         self.assertIn("RETURN NEW;", pg_sql)
+
+    def test_insert_trigger_with_additional_logic_omits_when_clause(self):
+        fb_sql = """
+        CREATE TRIGGER BI_MIXED FOR CLIENTES BEFORE INSERT
+        AS
+        BEGIN
+            IF (NEW.ID IS NULL) THEN
+                NEW.ID = GEN_ID(GEN_CLIENTES_ID, 1);
+            NEW.DATA_CRIOU = CURRENT_TIMESTAMP;
+        END
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertNotIn("WHEN", pg_sql)
+        self.assertIn('CREATE TRIGGER "BI_MIXED" BEFORE INSERT ON "clientes" FOR EACH ROW EXECUTE FUNCTION "BI_MIXED_func"();', pg_sql)
 
