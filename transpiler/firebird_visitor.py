@@ -84,26 +84,105 @@ class ASTDialectRewriter(FirebirdParserVisitor):
             self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, raw.lstrip(':'))
         return self.visitChildren(ctx)
 
-    def visitGeneral_element_part(self, ctx: FirebirdParser.General_element_partContext):
-        if ctx.id_expression() and ctx.id_expression().getText().upper() == 'GEN_ID':
-            if ctx.function_argument():
-                func_arg = ctx.function_argument(0)
-                if hasattr(func_arg, 'argument'):
-                    args = func_arg.argument()
-                    if len(args) >= 2:
-                        seq_name = args[0].getText()
-                        step = args[1].getText().strip()
-                        if step == '1':
-                            self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"nextval('{seq_name}')")
-                        elif step == '0':
-                            self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"currval('{seq_name}')")
-                        else:
-                            self.rewriter.replaceRangeTokens(
-                                ctx.start, ctx.stop, f"setval('{seq_name}', nextval('{seq_name}') + ({step}) - 1)"
-                            )
-            return self.visitChildren(ctx)
+    def _get_tokens_text(self, ctx) -> str:
+        if ctx is None:
+            return ""
+        if hasattr(ctx, 'start') and hasattr(ctx, 'stop') and ctx.start and ctx.stop:
+            return self.rewriter.getText(
+                TokenStreamRewriter.DEFAULT_PROGRAM_NAME,
+                ctx.start.tokenIndex,
+                ctx.stop.tokenIndex
+            )
+        return ctx.getText()
 
-        return self.visitChildren(ctx)
+    def visitGeneral_element_part(self, ctx: FirebirdParser.General_element_partContext):
+        self.visitChildren(ctx)
+
+        if not ctx.id_expression() or not ctx.function_argument():
+            return None
+
+        fn_name = ctx.id_expression().getText().upper()
+        func_arg = ctx.function_argument(0)
+        if not hasattr(func_arg, 'argument'):
+            return None
+        args = func_arg.argument()
+
+        if fn_name == 'GEN_ID' and len(args) >= 2:
+            seq_name = args[0].getText()
+            step = args[1].getText().strip()
+            if step == '1':
+                self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"nextval('{seq_name}')")
+            elif step == '0':
+                self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"currval('{seq_name}')")
+            else:
+                self.rewriter.replaceRangeTokens(
+                    ctx.start, ctx.stop, f"setval('{seq_name}', nextval('{seq_name}') + ({step}) - 1)"
+                )
+        elif fn_name == 'IIF' and len(args) == 3:
+            cond_str = self._get_tokens_text(args[0]).strip()
+            true_str = self._get_tokens_text(args[1]).strip()
+            false_str = self._get_tokens_text(args[2]).strip()
+            self.rewriter.replaceRangeTokens(
+                ctx.start, ctx.stop,
+                f"CASE WHEN {cond_str} THEN {true_str} ELSE {false_str} END"
+            )
+        elif fn_name == 'LIST' and (1 <= len(args) <= 2):
+            col_str = self._get_tokens_text(args[0]).strip()
+            sep_str = self._get_tokens_text(args[1]).strip() if len(args) == 2 else "','"
+            self.rewriter.replaceRangeTokens(
+                ctx.start, ctx.stop,
+                f"string_agg({col_str}::text, {sep_str})"
+            )
+        elif fn_name == 'DATEADD' and len(args) == 3:
+            part_str = self._get_tokens_text(args[0]).strip().lower()
+            num_str = self._get_tokens_text(args[1]).strip()
+            date_str = self._get_tokens_text(args[2]).strip()
+            self.rewriter.replaceRangeTokens(
+                ctx.start, ctx.stop,
+                f"({date_str} + ({num_str}) * INTERVAL '1 {part_str}')"
+            )
+        elif fn_name == 'DATEDIFF' and len(args) == 3:
+            part_str = self._get_tokens_text(args[0]).strip().lower()
+            d1_str = self._get_tokens_text(args[1]).strip()
+            d2_str = self._get_tokens_text(args[2]).strip()
+            if part_str in ('day', 'days'):
+                self.rewriter.replaceRangeTokens(
+                    ctx.start, ctx.stop,
+                    f"(DATE({d2_str}) - DATE({d1_str}))"
+                )
+            elif part_str in ('year', 'years'):
+                self.rewriter.replaceRangeTokens(
+                    ctx.start, ctx.stop,
+                    f"(EXTRACT(YEAR FROM {d2_str}::timestamp) - EXTRACT(YEAR FROM {d1_str}::timestamp))"
+                )
+            elif part_str in ('month', 'months'):
+                self.rewriter.replaceRangeTokens(
+                    ctx.start, ctx.stop,
+                    f"((EXTRACT(YEAR FROM {d2_str}::timestamp) - EXTRACT(YEAR FROM {d1_str}::timestamp)) * 12 + "
+                    f"EXTRACT(MONTH FROM {d2_str}::timestamp) - EXTRACT(MONTH FROM {d1_str}::timestamp))"
+                )
+            elif part_str in ('hour', 'hours'):
+                self.rewriter.replaceRangeTokens(
+                    ctx.start, ctx.stop,
+                    f"FLOOR(EXTRACT(EPOCH FROM ({d2_str}::timestamp - {d1_str}::timestamp)) / 3600)"
+                )
+            elif part_str in ('minute', 'minutes'):
+                self.rewriter.replaceRangeTokens(
+                    ctx.start, ctx.stop,
+                    f"FLOOR(EXTRACT(EPOCH FROM ({d2_str}::timestamp - {d1_str}::timestamp)) / 60)"
+                )
+            elif part_str in ('second', 'seconds'):
+                self.rewriter.replaceRangeTokens(
+                    ctx.start, ctx.stop,
+                    f"FLOOR(EXTRACT(EPOCH FROM ({d2_str}::timestamp - {d1_str}::timestamp)))"
+                )
+            else:
+                self.rewriter.replaceRangeTokens(
+                    ctx.start, ctx.stop,
+                    f"(DATE({d2_str}) - DATE({d1_str}))"
+                )
+
+        return None
 
     def visitUnary_expression(self, ctx: FirebirdParser.Unary_expressionContext):
         raw = ctx.getText().upper()
