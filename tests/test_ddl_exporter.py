@@ -1,0 +1,55 @@
+import os
+import tempfile
+import unittest
+from unittest.mock import MagicMock
+
+from engine.ddl_exporter import DdlExporter
+
+
+class TestDdlExporterTriggers(unittest.TestCase):
+    def test_export_firebird_triggers_preserves_execution_sequence(self):
+        # Firebird trigger data:
+        # Trigger 1: Z_CALCULA with sequence 0
+        # Trigger 2: A_VALIDA with sequence 10
+        # In Firebird, Z_CALCULA executes BEFORE A_VALIDA due to sequence (0 < 10).
+        # In PostgreSQL, triggers execute alphabetically by trigger name.
+        # Exporting with trg_{seq:05d}_{name} guarantees PostgreSQL executes them in sequence.
+        mock_fb_con = MagicMock()
+        mock_cursor = MagicMock()
+        mock_fb_con.cursor.return_value = mock_cursor
+
+        mock_cursor.fetchall.return_value = [
+            ("Z_CALCULA", "PEDIDOS", 1, "AS BEGIN NEW.TOTAL = 100; END;", 0),
+            ("A_VALIDA", "PEDIDOS", 1, "AS BEGIN IF (NEW.TOTAL < 0) THEN EXCEPTION; END;", 10),
+        ]
+
+        exporter = DdlExporter(mock_fb_con)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fb_out = os.path.join(tmpdir, "fb_triggers.sql")
+            pg_out = os.path.join(tmpdir, "pg_triggers.sql")
+
+            exporter.export_firebird_triggers(output_file=fb_out, converted_file=pg_out)
+
+            with open(fb_out, "r", encoding="utf-8") as f:
+                fb_content = f.read()
+            with open(pg_out, "r", encoding="utf-8") as f:
+                pg_content = f.read()
+
+            # Firebird dump retains original names
+            self.assertIn("CREATE TRIGGER Z_CALCULA FOR PEDIDOS", fb_content)
+            self.assertIn("CREATE TRIGGER A_VALIDA FOR PEDIDOS", fb_content)
+
+            # PostgreSQL dump uses sequence-prefixed names
+            self.assertIn('CREATE TRIGGER "trg_00000_z_calcula"', pg_content)
+            self.assertIn('CREATE OR REPLACE FUNCTION "trg_00000_z_calcula_func"()', pg_content)
+            self.assertIn('CREATE TRIGGER "trg_00010_a_valida"', pg_content)
+            self.assertIn('CREATE OR REPLACE FUNCTION "trg_00010_a_valida_func"()', pg_content)
+
+            # Alphabetical ordering in PostgreSQL matches execution order:
+            # "trg_00000_z_calcula" < "trg_00010_a_valida"
+            self.assertLess("trg_00000_z_calcula", "trg_00010_a_valida")
+
+
+if __name__ == '__main__':
+    unittest.main()

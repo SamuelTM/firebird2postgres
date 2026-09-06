@@ -14,15 +14,15 @@ def _ensure_parent_dir(file_path: str):
         os.makedirs(directory, exist_ok=True)
 
 
-def _transpile_worker(item: tuple[str, str]) -> tuple[str | None, str | None]:
+def _transpile_worker(item: tuple) -> tuple[str | None, str | None]:
     """
     Worker function for multiprocessing pool.
-    Takes (item_name, fb_sql) and returns (pg_sql, error_msg).
+    Takes (item_name, fb_sql) or (item_name, fb_sql, transpile_sql) and returns (pg_sql, error_msg).
     Avoids returning fb_sql across IPC to minimize pickle overhead.
     """
-    _, fb_sql = item
+    sql_to_transpile = item[2] if len(item) > 2 else item[1]
     try:
-        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        pg_sql = FirebirdToPostgresVisitor.transpile(sql_to_transpile)
         return pg_sql, None
     except Exception as e:
         return None, str(e)
@@ -72,7 +72,9 @@ class DdlExporter:
             f.write(firebird_header)
             conv_f.write(postgres_header)
 
-            for (item_name, fb_sql), (pg_sql, err) in zip(items, results):
+            for item, (pg_sql, err) in zip(items, results):
+                item_name = item[0]
+                fb_sql = item[1]
                 if per_item_separator:
                     separator = (f"-- ----------------------------------------\n"
                                  f"-- {object_type.title()}: {item_name}\n"
@@ -104,7 +106,7 @@ class DdlExporter:
         fb_cursor = self.fb_con.cursor()
 
         query = """
-            SELECT RDB$TRIGGER_NAME, RDB$RELATION_NAME, RDB$TRIGGER_TYPE, RDB$TRIGGER_SOURCE
+            SELECT RDB$TRIGGER_NAME, RDB$RELATION_NAME, RDB$TRIGGER_TYPE, RDB$TRIGGER_SOURCE, RDB$TRIGGER_SEQUENCE
             FROM RDB$TRIGGERS
             WHERE RDB$SYSTEM_FLAG = 0
               AND RDB$TRIGGER_SOURCE IS NOT NULL
@@ -120,9 +122,12 @@ class DdlExporter:
             relation_name = trigger[1].strip() if trigger[1] else 'UNKNOWN'
             trigger_type = trigger[2]
             source = trigger[3]
+            trigger_sequence = trigger[4] if trigger[4] is not None else 0
 
             fb_sql = self._format_trigger_firebird_ddl(trigger_name, relation_name, trigger_type, source)
-            items.append((trigger_name, fb_sql))
+            pg_trg_name = f"trg_{trigger_sequence:05d}_{trigger_name.lower()}"
+            transpile_sql = self._format_trigger_firebird_ddl(pg_trg_name, relation_name, trigger_type, source)
+            items.append((trigger_name, fb_sql, transpile_sql))
 
         self._export_transpiled_ddl(
             items,
