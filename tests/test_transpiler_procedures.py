@@ -613,6 +613,40 @@ class TestTranspilerProcedures(unittest.TestCase):
         self.assertIn('"count" := "param" + 1;', pg_sql)
         self.assertIn('"result" := "count";', pg_sql)
 
+    def test_procedure_exit_translates_to_return(self):
+        fb_sql = """
+        CREATE PROCEDURE SP_TEST_EXIT (P_VAL INTEGER)
+        AS
+        BEGIN
+            IF (P_VAL < 0) THEN
+                EXIT;
+            EXIT WHEN (P_VAL = 0);
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("RETURN;", pg_sql)
+        self.assertIn("IF (P_VAL = 0) THEN RETURN; END IF;", pg_sql)
+        self.assertNotIn("EXIT;", pg_sql)
+
+    def test_procedure_leave_translates_to_exit(self):
+        fb_sql = """
+        CREATE PROCEDURE SP_TEST_LEAVE
+        AS
+        DECLARE VARIABLE I INTEGER = 0;
+        BEGIN
+            WHILE (I < 10) DO
+            BEGIN
+                IF (I = 5) THEN
+                    LEAVE;
+                I = I + 1;
+            END
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("EXIT;", pg_sql)
+        self.assertNotIn("LEAVE;", pg_sql)
+
+
 
 
 

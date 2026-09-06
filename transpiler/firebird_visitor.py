@@ -555,6 +555,8 @@ class ASTDialectRewriter(FirebirdParserVisitor):
         self.rewriter = rewriter
         self.handled_qbs = set()
         self.symbols: dict[str, str] = {k.strip('":').lower(): v.upper() for k, v in symbols.items()} if symbols else {}
+        self.is_trigger = False
+        self.trigger_return = "RETURN NEW"
 
     def visitCreate_procedure_body(self, ctx: FirebirdParser.Create_procedure_bodyContext):
         old_symbols = self.symbols.copy()
@@ -565,10 +567,36 @@ class ASTDialectRewriter(FirebirdParserVisitor):
 
     def visitCreate_trigger(self, ctx: FirebirdParser.Create_triggerContext):
         old_symbols = self.symbols.copy()
+        old_is_trigger = self.is_trigger
+        old_trigger_return = self.trigger_return
+        self.is_trigger = True
+
+        simple_dml = ctx.simple_dml_trigger()
+        timing = "BEFORE"
+        events = "INSERT"
+        if simple_dml:
+            timing_node = simple_dml.getChild(0)
+            timing = timing_node.getText()
+            events = self._get_tokens_text(simple_dml.dml_event_clause())
+
+        timing_upper = timing.upper()
+        events_upper = events.upper()
+        if "BEFORE" in timing_upper:
+            if "DELETE" in events_upper and ("INSERT" in events_upper or "UPDATE" in events_upper):
+                self.trigger_return = "IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;"
+            elif "DELETE" in events_upper:
+                self.trigger_return = "RETURN OLD"
+            else:
+                self.trigger_return = "RETURN NEW"
+        else:
+            self.trigger_return = "RETURN NULL"
+
         try:
             return self.visitChildren(ctx)
         finally:
             self.symbols = old_symbols
+            self.is_trigger = old_is_trigger
+            self.trigger_return = old_trigger_return
 
     def visitParameter(self, ctx: FirebirdParser.ParameterContext):
         if ctx.parameter_name() and ctx.type_spec():
@@ -763,8 +791,18 @@ class ASTDialectRewriter(FirebirdParserVisitor):
         return self.visitChildren(ctx)
 
     def visitExit_statement(self, ctx: FirebirdParser.Exit_statementContext):
-        if ctx.getChild(0).getText().upper() == 'LEAVE':
+        first_tok = ctx.getChild(0).getText().upper()
+        if first_tok == 'LEAVE':
             self.rewriter.replaceRangeTokens(ctx.start, ctx.start, 'EXIT')
+        elif first_tok == 'EXIT':
+            # In Firebird, EXIT without a label exits the current routine (procedure or trigger)
+            if not ctx.label_name():
+                ret = self.trigger_return if self.is_trigger else "RETURN"
+                if ctx.condition():
+                    cond = self._get_tokens_text(ctx.condition())
+                    self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"IF {cond} THEN {ret}; END IF")
+                else:
+                    self.rewriter.replaceRangeTokens(ctx.start, ctx.start, ret)
         return self.visitChildren(ctx)
 
     def visitFrom_clause(self, ctx: FirebirdParser.From_clauseContext):
