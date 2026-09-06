@@ -7410,6 +7410,7 @@ native_datatype_element
     | DEC
     | INTEGER
     | INT
+    | BIGINT
     | NUMERIC
     | SMALLINT
     | NUMBER
@@ -7680,6 +7681,7 @@ regular_id
     | BACKINGFILE
     | BATCH
     | BINARY_INTEGER
+    | BIGINT
     | BOOLEAN
     | C_LETTER
     | CHAR

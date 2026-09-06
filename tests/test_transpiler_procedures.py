@@ -484,5 +484,25 @@ class TestTranspilerProcedures(unittest.TestCase):
             FirebirdToPostgresVisitor.transpile(fb_sql)
         self.assertIn("cannot be used with TIME values", str(cm.exception))
 
+    def test_procedure_with_bigint_parameters_returns_and_variables(self):
+        fb_sql = """
+        CREATE PROCEDURE SP_BIGINT_OPS (IN_ID BIGINT)
+        RETURNS (OUT_ID BIGINT)
+        AS
+        DECLARE VARIABLE V_TOTAL BIGINT;
+        BEGIN
+            V_TOTAL = :IN_ID * 2;
+            OUT_ID = :V_TOTAL;
+            SUSPEND;
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn('CREATE FUNCTION "sp_bigint_ops"(IN_ID BIGINT, OUT OUT_ID BIGINT) RETURNS SETOF BIGINT', pg_sql)
+        self.assertIn('V_TOTAL BIGINT;', pg_sql)
+        self.assertIn('V_TOTAL := IN_ID * 2;', pg_sql)
+        self.assertIn('OUT_ID := V_TOTAL;', pg_sql)
+        self.assertIn('RETURN NEXT;', pg_sql)
+
+
 
 
