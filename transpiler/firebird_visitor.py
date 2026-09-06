@@ -856,123 +856,6 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         right = self.get_raw_text(ctx.expression())
         return f"{left} := {right};"
 
-    def _try_convert_loop_to_set_based(self, stmt_ctx: ParserRuleContext, loop_var: str, select_sql: str) -> str | None:
-        """
-        Attempts to transpile a procedural cursor loop:
-            FOR var IN SELECT col FROM ... LOOP
-                UPDATE target SET ... WHERE col = var;
-            END LOOP;
-        into a set-based statement:
-            UPDATE target SET ... WHERE col IN (SELECT col FROM ...);
-
-        Safety requirements:
-        1. Single cursor variable.
-        2. Body consists solely of UPDATE or DELETE statements with no exception handling.
-        3. loop_var is NOT referenced in the UPDATE SET clause (values to update are independent of iteration).
-        4. loop_var appears exactly once in the statement, inside an equality condition in the WHERE clause:
-           col = loop_var or loop_var = col.
-        """
-        body_ctx = stmt_ctx.body() if hasattr(stmt_ctx, 'body') and stmt_ctx.body() else None
-        if not body_ctx and isinstance(stmt_ctx, FirebirdParser.StatementContext):
-            child = stmt_ctx.getChild(0)
-            if isinstance(child, FirebirdParser.BodyContext):
-                body_ctx = child
-
-        if body_ctx:
-            if hasattr(body_ctx, 'exception_handler') and body_ctx.exception_handler():
-                return None
-            stmt_contexts = []
-            if body_ctx.seq_of_statements() and body_ctx.seq_of_statements().children:
-                for child in body_ctx.seq_of_statements().children:
-                    if isinstance(child, FirebirdParser.StatementContext):
-                        stmt_contexts.append(child)
-            if not stmt_contexts:
-                return None
-        else:
-            if isinstance(stmt_ctx, FirebirdParser.StatementContext):
-                child = stmt_ctx.getChild(0)
-                if isinstance(child, FirebirdParser.BlockContext):
-                    return None
-            stmt_contexts = [stmt_ctx]
-
-        converted_items = []
-        for i, s_ctx in enumerate(stmt_contexts):
-            if i > 0 and stmt_contexts[i - 1].stop and s_ctx.start:
-                inter_comments = self._get_comments_in_range(
-                    stmt_contexts[i - 1].stop.tokenIndex + 1,
-                    s_ctx.start.tokenIndex - 1
-                )
-                for c in inter_comments:
-                    converted_items.append(c)
-
-            converted = self._convert_stmt_to_set_based(s_ctx, loop_var, select_sql)
-            if converted is None:
-                return None
-            converted_items.append(converted)
-
-        return "\n    ".join(converted_items)
-
-    def _convert_stmt_to_set_based(self, s_ctx: ParserRuleContext, loop_var: str, select_sql: str) -> str | None:
-        update_ctx = _find_node(s_ctx, FirebirdParser.Update_statementContext)
-        delete_ctx = _find_node(s_ctx, FirebirdParser.Delete_statementContext)
-
-        if not update_ctx and not delete_ctx:
-            return None
-
-        target_dml = update_ctx or delete_ctx
-        if hasattr(target_dml, 'error_logging_clause') and target_dml.error_logging_clause():
-            return None
-        if hasattr(target_dml, 'static_returning_clause') and target_dml.static_returning_clause():
-            return None
-
-        if update_ctx:
-            set_clause = update_ctx.update_set_clause()
-            if not set_clause:
-                return None
-            set_text = self.get_raw_text(set_clause)
-            if re.search(rf':?\b{re.escape(loop_var)}\b', set_text, re.IGNORECASE):
-                return None
-
-        where_ctx = target_dml.where_clause()
-        if not where_ctx:
-            return None
-        where_text = self.get_raw_text(where_ctx)
-        if 'CURRENT OF' in where_text.upper():
-            return None
-
-        stmt_text = self.get_raw_text(s_ctx).strip()
-        var_pattern = rf':?\b{re.escape(loop_var)}\b'
-        matches = list(re.finditer(var_pattern, stmt_text, re.IGNORECASE))
-        if len(matches) != 1:
-            return None
-
-        col_ident = r'(?:[a-zA-Z0-9_$]+|".+?")(?:\.(?:[a-zA-Z0-9_$]+|".+?"))*'
-        eq_pattern_a = rf'({col_ident})\s*=\s*:?\b{re.escape(loop_var)}\b'
-        eq_pattern_b = rf':?\b{re.escape(loop_var)}\b\s*=\s*({col_ident})'
-
-        match_a = re.search(eq_pattern_a, stmt_text, re.IGNORECASE)
-        match_b = re.search(eq_pattern_b, stmt_text, re.IGNORECASE)
-
-        if match_a:
-            col_expr = match_a.group(1).strip()
-            start, end = match_a.span()
-        elif match_b:
-            col_expr = match_b.group(1).strip()
-            start, end = match_b.span()
-        else:
-            return None
-
-        col_upper = col_expr.upper()
-        if col_upper in ('AND', 'OR', 'NOT', 'WHERE', 'SELECT', 'FROM', 'SET', 'UPDATE', 'DELETE', 'NULL', 'TRUE', 'FALSE'):
-            return None
-        if col_expr.isdigit():
-            return None
-
-        converted = stmt_text[:start] + f"{col_expr} IN ({select_sql})" + stmt_text[end:]
-        if not converted.endswith(';'):
-            converted += ';'
-        return converted
-
     def visitLoop_statement(self, ctx: FirebirdParser.Loop_statementContext):
         # Case 1: FOR EXECUTE STATEMENT expression into_clause? DO statement
         if hasattr(ctx, 'EXECUTE') and ctx.EXECUTE():
@@ -992,6 +875,10 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
             comment_str = ('\n    ' + '\n    '.join(loop_comments) + '\n') if loop_comments else ' '
 
             body_sql = self.visit(ctx.statement())
+            if body_sql:
+                body_sql = body_sql.strip()
+                if not body_sql.endswith(';'):
+                    body_sql += ';'
             body_lines = body_sql.split('\n')
             indented_body = "\n".join(f"    {line}" if line.strip() else line for line in body_lines)
             return f"FOR {target} IN EXECUTE {expr}{comment_str}LOOP\n{indented_body}\nEND LOOP;"
@@ -1016,15 +903,11 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
                 if end_header_token and ctx.statement().start else []
             comment_str = ('\n    ' + '\n    '.join(loop_comments) + '\n') if loop_comments else ' '
 
-            # Optimization 2.2: Convert procedural single-variable loops containing purely
-            # UPDATE / DELETE operations into set-based statements using WHERE col IN (SELECT ...)
-            if len(into_vars) == 1 and ctx.statement():
-                set_based = self._try_convert_loop_to_set_based(ctx.statement(), into_vars[0], select_sql)
-                if set_based:
-                    comment_prefix = "\n    ".join(loop_comments) + "\n    " if loop_comments else ""
-                    return comment_prefix + set_based
-
             body_sql = self.visit(ctx.statement())
+            if body_sql:
+                body_sql = body_sql.strip()
+                if not body_sql.endswith(';'):
+                    body_sql += ';'
 
             # Indent body_sql properly
             body_lines = body_sql.split('\n')
@@ -1042,6 +925,10 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
             comment_str = ('\n    ' + '\n    '.join(loop_comments) + '\n') if loop_comments else ' '
 
             body_sql = self.visit(ctx.statement())
+            if body_sql:
+                body_sql = body_sql.strip()
+                if not body_sql.endswith(';'):
+                    body_sql += ';'
             body_lines = body_sql.split('\n')
             indented_body = "\n".join(f"    {line}" if line.strip() else line for line in body_lines)
             return f"WHILE {cond}{comment_str}LOOP\n{indented_body}\nEND LOOP;"

@@ -280,7 +280,7 @@ class TestTranspilerProcedures(unittest.TestCase):
         self.assertIn("INTO STRICT V_COUNT;", pg_sql)
         self.assertNotIn("EXCEPTION WHEN NO_DATA_FOUND THEN", pg_sql)
 
-    def test_for_loop_update_converted_to_set_based(self):
+    def test_for_loop_update_retains_procedural_cursor(self):
         fb_sql = """
         CREATE OR ALTER PROCEDURE SP_UPDATE_LOOP (
             P_GRUPO INTEGER,
@@ -298,11 +298,11 @@ class TestTranspilerProcedures(unittest.TestCase):
         END;
         """
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
-        self.assertIn("WHERE TAGENDA_MARCACAO.ID_MARCACAO IN (SELECT ID_MARCACAO FROM TAGENDA WHERE ID_APAC = P_ID);", pg_sql)
-        self.assertNotIn("FOR V_MARC IN", pg_sql)
-        self.assertNotIn("END LOOP;", pg_sql)
+        self.assertIn("FOR V_MARC IN SELECT ID_MARCACAO FROM TAGENDA WHERE ID_APAC = P_ID LOOP", pg_sql)
+        self.assertIn("WHERE TAGENDA_MARCACAO.ID_MARCACAO = V_MARC;", pg_sql)
+        self.assertIn("END LOOP;", pg_sql)
 
-    def test_for_loop_multiple_updates_converted_to_set_based(self):
+    def test_for_loop_multiple_updates_retains_procedural_cursor(self):
         fb_sql = """
         CREATE OR ALTER PROCEDURE SP_MULTI_UPDATE_LOOP (
             P_FATURA VARCHAR(20)
@@ -322,11 +322,12 @@ class TestTranspilerProcedures(unittest.TestCase):
         END;
         """
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
-        self.assertIn("WHERE TNOTANF_SERV.ID_NOTA IN (SELECT DISTINCT ID_NOTA FROM TFATURA WHERE COD_FATURA = P_FATURA);", pg_sql)
-        self.assertIn("WHERE TNOTANF.ID_NOTA IN (SELECT DISTINCT ID_NOTA FROM TFATURA WHERE COD_FATURA = P_FATURA);", pg_sql)
-        self.assertNotIn("FOR V_ID_NOTA IN", pg_sql)
+        self.assertIn("FOR V_ID_NOTA IN SELECT DISTINCT ID_NOTA FROM TFATURA WHERE COD_FATURA = P_FATURA LOOP", pg_sql)
+        self.assertIn("WHERE TNOTANF_SERV.ID_NOTA = V_ID_NOTA;", pg_sql)
+        self.assertIn("WHERE TNOTANF.ID_NOTA = V_ID_NOTA;", pg_sql)
+        self.assertIn("END LOOP;", pg_sql)
 
-    def test_for_loop_delete_converted_to_set_based(self):
+    def test_for_loop_delete_retains_procedural_cursor(self):
         fb_sql = """
         CREATE OR ALTER PROCEDURE SP_DELETE_LOOP (
             P_USER_ID INTEGER
@@ -339,9 +340,9 @@ class TestTranspilerProcedures(unittest.TestCase):
         END;
         """
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
-        self.assertIn("DELETE FROM LOG_ENTRIES WHERE LOG_ENTRIES.ID IN (SELECT ID FROM AUDIT WHERE USER_ID = P_USER_ID);", pg_sql)
-        self.assertNotIn("FOR V_LOG_ID IN", pg_sql)
-        self.assertNotIn("END LOOP;", pg_sql)
+        self.assertIn("FOR V_LOG_ID IN SELECT ID FROM AUDIT WHERE USER_ID = P_USER_ID LOOP", pg_sql)
+        self.assertIn("DELETE FROM LOG_ENTRIES WHERE LOG_ENTRIES.ID = V_LOG_ID;", pg_sql)
+        self.assertIn("END LOOP;", pg_sql)
 
     def test_for_loop_retains_cursor_when_var_used_in_set(self):
         fb_sql = """
@@ -357,6 +358,26 @@ class TestTranspilerProcedures(unittest.TestCase):
         """
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
         self.assertIn("FOR V_ID IN SELECT ID FROM USERS", pg_sql)
+        self.assertIn("END LOOP;", pg_sql)
+
+    def test_for_loop_with_nested_if_and_dml(self):
+        fb_sql = """
+        CREATE OR ALTER PROCEDURE SP_LOOP_NESTED_IF
+        AS
+        DECLARE VARIABLE V_ID INTEGER;
+        BEGIN
+            FOR SELECT ID FROM USERS INTO :V_ID DO
+            BEGIN
+                IF (V_ID > 10) THEN
+                    UPDATE USERS SET STATUS = 1 WHERE USERS.ID = :V_ID;
+            END
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("FOR V_ID IN SELECT ID FROM USERS LOOP", pg_sql)
+        self.assertIn("IF (V_ID > 10) THEN", pg_sql)
+        self.assertIn("UPDATE USERS SET STATUS = 1 WHERE USERS.ID = V_ID;", pg_sql)
+        self.assertIn("END IF;", pg_sql)
         self.assertIn("END LOOP;", pg_sql)
 
     def test_firebird_builtins_iif_list_dateadd_datediff(self):
