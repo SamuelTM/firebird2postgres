@@ -141,6 +141,29 @@ class TestDdlExporterViews(unittest.TestCase):
         ordered = DdlExporter._resolve_view_dependency_order(mock_cursor, {"A_LEAF", "M_MID", "Z_ROOT"})
         self.assertEqual(ordered, ["Z_ROOT", "M_MID", "A_LEAF"])
 
+    def test_export_transpiled_ddl_raises_and_saves_diagnostics_on_failure(self):
+        items = [
+            ("PROC_GOOD", "CREATE PROCEDURE PROC_GOOD AS BEGIN DUMMY = 1; END;"),
+            ("PROC_BAD", "CREATE PROCEDURE PROC_BAD AS BEGIN INVALID SYNTAX ???; END;"),
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_file = os.path.join(tmpdir, "out.sql")
+            conv_file = os.path.join(tmpdir, "conv.sql")
+            with self.assertRaises(RuntimeError) as cm:
+                DdlExporter._export_transpiled_ddl(
+                    items=items,
+                    output_file=out_file,
+                    converted_file=conv_file,
+                    object_type="PROCEDURE",
+                    firebird_header="-- FB HEADER\n",
+                    postgres_header="-- PG HEADER\n",
+                )
+            self.assertIn("Transpilation failed for 1 procedure(s)", str(cm.exception))
+            self.assertIn("PROC_BAD", str(cm.exception))
+            with open(conv_file, "r", encoding="utf-8") as f:
+                content = f.read()
+            self.assertIn("[TRANSPILER FAILED] PROCEDURE PROC_BAD", content)
+
 
 if __name__ == '__main__':
     unittest.main()

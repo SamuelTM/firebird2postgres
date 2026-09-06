@@ -75,6 +75,7 @@ class DdlExporter:
         _ensure_parent_dir(output_file)
         _ensure_parent_dir(converted_file)
 
+        failed_items = []
         with open(output_file, 'w', encoding='utf-8') as f, open(converted_file, 'w', encoding='utf-8') as conv_f:
             f.write(firebird_header)
             conv_f.write(postgres_header)
@@ -97,8 +98,19 @@ class DdlExporter:
                     logger.error(f"Failed to transpile {object_type.lower()} {item_name}: {err}")
                     conv_f.write(f"-- [TRANSPILER FAILED] {object_type} {item_name}\n")
                     conv_f.write(fb_sql)
+                    failed_items.append((item_name, err))
 
         logger.info(f"Exported {len(items)} {object_type.lower()}s to '{output_file}' and '{converted_file}'")
+
+        if failed_items:
+            failures_summary = ", ".join(f"'{name}' ({err})" for name, err in failed_items[:5])
+            if len(failed_items) > 5:
+                failures_summary += f" ... and {len(failed_items) - 5} more"
+            raise RuntimeError(
+                f"Transpilation failed for {len(failed_items)} {object_type.lower()}(s): {failures_summary}. "
+                f"Aborting migration before modifying target database. "
+                f"See '{converted_file}' for diagnostic details."
+            )
 
     def export_firebird_triggers(self, output_file: str = None,
                                  converted_file: str = None,
