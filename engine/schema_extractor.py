@@ -1,5 +1,5 @@
 import re
-from models import Table, Column, ForeignKey, UniqueKey, Index, Sequence, resolve_firebird_type, resolve_pg_domain_name
+from models import Table, Column, ForeignKey, UniqueKey, Index, Sequence, CheckConstraint, resolve_firebird_type, resolve_pg_domain_name
 from transpiler import FirebirdToPostgresVisitor, validate_immutable_expression
 
 
@@ -28,6 +28,7 @@ class SchemaExtractor:
             table_obj.unique_keys = self._extract_unique_keys(fb_cursor, table_name)
             col_symbols = {col.name.lower(): col.column_type for col in table_obj.columns}
             table_obj.indexes = self._extract_indexes(fb_cursor, table_name, symbols=col_symbols)
+            table_obj.check_constraints = self._extract_check_constraints(fb_cursor, table_name, symbols=col_symbols)
             table_objs.append(table_obj)
 
         self._bind_sequence_generators(fb_cursor, table_objs)
@@ -247,6 +248,52 @@ class SchemaExtractor:
                 )
             )
         return indexes
+
+    @staticmethod
+    def _extract_check_constraints(cursor, table_name: str, symbols: dict[str, str] = None) -> list[CheckConstraint]:
+        """
+        Extracts table-level CHECK constraints from Firebird system catalog,
+        transpiling their expressions to PostgreSQL.
+        Distinguishes table checks from domain checks (domain checks are on RDB$FIELDS).
+        """
+        query = """
+            SELECT DISTINCT
+                rc.RDB$CONSTRAINT_NAME,
+                t.RDB$TRIGGER_SOURCE
+            FROM RDB$RELATION_CONSTRAINTS rc
+            JOIN RDB$CHECK_CONSTRAINTS cc ON cc.RDB$CONSTRAINT_NAME = rc.RDB$CONSTRAINT_NAME
+            JOIN RDB$TRIGGERS t ON t.RDB$TRIGGER_NAME = cc.RDB$TRIGGER_NAME
+            WHERE rc.RDB$RELATION_NAME = ?
+              AND rc.RDB$CONSTRAINT_TYPE = 'CHECK'
+              AND t.RDB$TRIGGER_SOURCE IS NOT NULL
+            ORDER BY rc.RDB$CONSTRAINT_NAME;
+        """
+        cursor.execute(query, (table_name,))
+        rows = cursor.fetchall()
+        checks: list[CheckConstraint] = []
+        seen = set()
+        for row in rows:
+            cname = row[0].strip() if row[0] else None
+            source = row[1].strip() if row[1] else None
+            if not cname or not source or cname in seen:
+                continue
+            seen.add(cname)
+
+            # Strip CHECK keyword and outer parentheses if present
+            m = re.match(r'^\s*CHECK\s*\((.*)\)\s*$', source, re.IGNORECASE | re.DOTALL)
+            if m:
+                inner_expr = m.group(1).strip()
+            else:
+                m2 = re.match(r'^\s*CHECK\s+(.*)$', source, re.IGNORECASE | re.DOTALL)
+                inner_expr = m2.group(1).strip() if m2 else source
+
+            try:
+                pg_expr = FirebirdToPostgresVisitor.transpile_expression(inner_expr, symbols=symbols)
+            except Exception:
+                pg_expr = inner_expr
+
+            checks.append(CheckConstraint(name=cname, expression=pg_expr))
+        return checks
 
     @staticmethod
     def _bind_sequence_generators(cursor, table_objs: list[Table]) -> None:

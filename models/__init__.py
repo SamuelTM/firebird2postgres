@@ -1,4 +1,4 @@
-from .database_objects import Table, Column, ForeignKey, UniqueKey, Index, Sequence, get_postgres_type, pg_quote_ident
+from .database_objects import Table, Column, ForeignKey, UniqueKey, Index, Sequence, CheckConstraint, get_postgres_type, pg_quote_ident
 from .firebird_types import (
     FirebirdDataType,
     get_firebird_data_type_name,
@@ -14,6 +14,7 @@ __all__ = [
     'UniqueKey',
     'Index',
     'Sequence',
+    'CheckConstraint',
     'get_postgres_type',
     'pg_quote_ident',
     'FirebirdDataType',

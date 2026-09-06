@@ -308,6 +308,19 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
             SchemaExtractor._extract_sequences(mock_cursor)
         self.assertIn("no value returned", str(cm.exception))
 
+    def test_extract_check_constraints(self):
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [
+            ("CHK_QUANTIDADE", "CHECK (QUANTIDADE > 0)"),
+            ("CHK_VALOR", "VALOR >= 0"),
+        ]
+        checks = SchemaExtractor._extract_check_constraints(mock_cursor, "ITENS")
+        self.assertEqual(len(checks), 2)
+        self.assertEqual(checks[0].name, "chk_quantidade")
+        self.assertEqual(checks[0].expression, "QUANTIDADE > 0")
+        self.assertEqual(checks[1].name, "chk_valor")
+        self.assertEqual(checks[1].expression, "VALOR >= 0")
+
 
 if __name__ == '__main__':
     unittest.main()

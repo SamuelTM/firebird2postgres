@@ -136,8 +136,14 @@ class SchemaMigrator:
                     logger.debug(fk_query)
                     cursor.execute(fk_query)
 
+            for table in table_objs:
+                chk_query = table.get_check_constraints_query()
+                if chk_query:
+                    logger.debug(chk_query)
+                    cursor.execute(chk_query)
+
             self.pg_con.commit()
-            logger.info("Constraints (PK, UK, FK) and indexes created successfully.")
+            logger.info("Constraints (PK, UK, FK, CHECK) and indexes created successfully.")
         except Exception:
             # Discard the partial constraints transaction explicitly: without this rollback
             # the connection stays aborted and every following statement fails with

@@ -384,3 +384,17 @@ class TestSequenceModel(unittest.TestCase):
         self.assertEqual(seq.get_create_sequence_query(), 'CREATE SEQUENCE "gen_""quoted""" START WITH 6;')
         self.assertEqual(seq.get_drop_sequence_query(), 'DROP SEQUENCE IF EXISTS "gen_""quoted""" CASCADE;')
 
+    def test_check_constraint_query(self):
+        from models import CheckConstraint
+        table = Table('ITENS')
+        self.assertIsNone(table.get_check_constraints_query())
+
+        table.check_constraints.append(CheckConstraint('CHK_QTD', 'quantidade > 0'))
+        table.check_constraints.append(CheckConstraint('CHK_PRECO', 'preco >= 0'))
+        query = table.get_check_constraints_query()
+        self.assertEqual(
+            query,
+            'ALTER TABLE "itens" ADD CONSTRAINT "chk_qtd" CHECK (quantidade > 0), ADD CONSTRAINT "chk_preco" CHECK (preco >= 0);'
+        )
+
+

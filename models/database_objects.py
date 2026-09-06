@@ -55,6 +55,16 @@ class Index:
         self.expression = expression.strip() if expression else None
 
 
+class CheckConstraint:
+    def __init__(self, name: str, expression: str):
+        # PostgreSQL-side only identifiers, normalized to lowercase
+        self.name = name.lower()
+        self.expression = expression.strip()
+
+    def __str__(self):
+        return f'[CHECK CONSTRAINT] Name: {self.name} - Expression: {self.expression}'
+
+
 def get_postgres_type(firebird_type: str) -> str:
     type_mapping = {
         'SMALLINT': 'SMALLINT',
@@ -87,6 +97,7 @@ class Table:
         self.foreign_keys: list[ForeignKey] = []
         self.unique_keys: list[UniqueKey] = []
         self.indexes: list[Index] = []
+        self.check_constraints: list[CheckConstraint] = []
 
     @property
     def pg_name(self) -> str:
@@ -263,6 +274,19 @@ class Table:
             queries.append(query)
 
         return queries
+
+    def get_check_constraints_query(self) -> str | None:
+        """
+        Returns an ALTER TABLE statement adding all table-level CHECK constraints.
+        """
+        if not self.check_constraints:
+            return None
+
+        constraints = [
+            f'CONSTRAINT {pg_quote_ident(chk.name)} CHECK ({chk.expression})'
+            for chk in self.check_constraints
+        ]
+        return f'ALTER TABLE {pg_quote_ident(self.pg_name)} ADD ' + ', ADD '.join(constraints) + ';'
 
 
 class Sequence:
