@@ -57,6 +57,21 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
         self.assertFalse(columns[0].nullable)
         self.assertEqual(columns[0].computed_source, "CASE WHEN STATUS = 1 THEN 100 ELSE 0 END")
 
+    def test_extract_columns_passes_symbols_for_time_expressions(self):
+        mock_cursor = MagicMock()
+        # column tuple: name, type, subtype, length, null_flag, prec, scale, col_def, dom_def, fld_src, comp_src
+        # Firebird type 13 = TIME
+        mock_cursor.fetchall.return_value = [
+            ("START_TIME", 13, 0, 4, 1, None, None, None, None, "RDB$1", None),
+            ("END_TIME", 13, 0, 4, 1, None, None, None, None, "RDB$2", None),
+            ("DURATION", 8, 0, 4, 1, None, None, None, None, "RDB$3", "DATEDIFF(HOUR, START_TIME, END_TIME)"),
+        ]
+
+        columns = SchemaExtractor._extract_columns(mock_cursor, "SHIFTS", {"SHIFTS"})
+        self.assertEqual(len(columns), 3)
+        self.assertNotIn("::timestamp", columns[2].computed_source)
+        self.assertIn("DATE_TRUNC('hour', END_TIME)", columns[2].computed_source)
+
     def test_extract_indexes_transpiles_expression(self):
         mock_cursor = MagicMock()
         # index tuple: index_name, unique, inactive, col_name, col_pos, expr_source
@@ -67,6 +82,18 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
         indexes = SchemaExtractor._extract_indexes(mock_cursor, "SALES")
         self.assertEqual(len(indexes), 1)
         self.assertEqual(indexes[0].expression, "(DT + (5) * INTERVAL '1 day')")
+
+    def test_extract_indexes_passes_symbols_for_time_expressions(self):
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [
+            ("IDX_TIME_DIFF", 0, 0, None, 0, "DATEDIFF(MINUTE, START_TIME, END_TIME)"),
+        ]
+
+        symbols = {"start_time": "TIME", "end_time": "TIME"}
+        indexes = SchemaExtractor._extract_indexes(mock_cursor, "SHIFTS", symbols=symbols)
+        self.assertEqual(len(indexes), 1)
+        self.assertNotIn("::timestamp", indexes[0].expression)
+        self.assertIn("DATE_TRUNC('minute', END_TIME)", indexes[0].expression)
 
     def test_transpile_expression_functions(self):
         from transpiler import FirebirdToPostgresVisitor

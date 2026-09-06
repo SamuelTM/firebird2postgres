@@ -26,7 +26,8 @@ class SchemaExtractor:
             table_obj.columns = self._extract_columns(fb_cursor, table_name, relation_names)
             table_obj.foreign_keys = self._extract_foreign_keys(fb_cursor, table_name)
             table_obj.unique_keys = self._extract_unique_keys(fb_cursor, table_name)
-            table_obj.indexes = self._extract_indexes(fb_cursor, table_name)
+            col_symbols = {col.name.lower(): col.column_type for col in table_obj.columns}
+            table_obj.indexes = self._extract_indexes(fb_cursor, table_name, symbols=col_symbols)
             table_objs.append(table_obj)
 
         self._bind_sequence_generators(fb_cursor, table_objs)
@@ -74,8 +75,19 @@ class SchemaExtractor:
             WHERE rf.RDB$RELATION_NAME = ?
             ORDER BY rf.RDB$FIELD_POSITION;
         """, (table_name,))
+        raw_rows = cursor.fetchall()
+        symbols = {
+            row[0].strip().lower(): resolve_firebird_type(
+                field_type=row[1],
+                field_subtype=row[2],
+                field_length=row[3],
+                field_precision=row[5],
+                field_scale=row[6],
+            )
+            for row in raw_rows
+        }
         columns = []
-        for column in cursor.fetchall():
+        for column in raw_rows:
             column_name = column[0].strip()
             field_type = column[1]
             field_subtype = column[2]
@@ -88,10 +100,10 @@ class SchemaExtractor:
             field_source = column[9].strip() if column[9] else None
             computed_source = column[10].strip() if column[10] else None
             if computed_source:
-                computed_source = FirebirdToPostgresVisitor.transpile_expression(computed_source)
+                computed_source = FirebirdToPostgresVisitor.transpile_expression(computed_source, symbols=symbols)
                 validate_immutable_expression(computed_source, f"computed column '{column_name}' in table '{table_name}'")
 
-            column_data_type = resolve_firebird_type(
+            column_data_type = symbols.get(column_name.lower()) or resolve_firebird_type(
                 field_type=field_type,
                 field_subtype=field_subtype,
                 field_length=field_length,
@@ -192,7 +204,7 @@ class SchemaExtractor:
         return unique_keys
 
     @staticmethod
-    def _extract_indexes(cursor, table_name: str) -> list[Index]:
+    def _extract_indexes(cursor, table_name: str, symbols: dict[str, str] = None) -> list[Index]:
         """
         Extracts user-defined secondary indexes for a given table (excluding PK/UQ indexes),
         supporting both standard column-segment indexes and expression-based indexes (COMPUTED BY).
@@ -221,7 +233,7 @@ class SchemaExtractor:
             raw_expr = row[5]
             expr_str = raw_expr.strip() if raw_expr else None
             if expr_str:
-                expr_str = FirebirdToPostgresVisitor.transpile_expression(expr_str)
+                expr_str = FirebirdToPostgresVisitor.transpile_expression(expr_str, symbols=symbols)
                 validate_immutable_expression(expr_str, f"expression index '{row[0].strip()}' in table '{table_name}'")
             col_name = row[3].strip() if row[3] else None
             indexes.append(
