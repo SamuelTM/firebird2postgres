@@ -219,15 +219,34 @@ def _normalize_date_funcs(sql: str) -> str:
     return "".join(result)
 
 
-def _is_time_expr(expr: str) -> bool:
+def _is_time_type(type_str: str) -> bool:
+    if not type_str:
+        return False
+    u = type_str.strip().upper()
+    return ('TIME' in u) and ('TIMESTAMP' not in u)
+
+
+def _is_time_expr(expr: str, symbols: dict[str, str] = None) -> bool:
     s = expr.strip().strip("()").strip()
     upper = s.upper()
-    return (
+    if (
         upper.startswith("TIME ")
         or upper.startswith("TIME'")
         or upper in ("CURRENT_TIME", "LOCALTIME")
         or bool(re.search(r'\bAS\s+TIME\b', upper))
-    )
+    ):
+        return True
+
+    if symbols:
+        clean = s.lstrip(':').strip('"').lower()
+        if _is_time_type(symbols.get(clean, '')):
+            return True
+        if '.' in clean:
+            col_part = clean.split('.')[-1].strip('"')
+            if _is_time_type(symbols.get(col_part, '')) or _is_time_type(symbols.get(clean, '')):
+                return True
+
+    return False
 
 
 class ASTDialectRewriter(FirebirdParserVisitor):
@@ -238,10 +257,45 @@ class ASTDialectRewriter(FirebirdParserVisitor):
     are performed in semantic context, leaving string literals and comments 100% untouched.
     """
 
-    def __init__(self, rewriter: TokenStreamRewriter):
+    def __init__(self, rewriter: TokenStreamRewriter, symbols: dict[str, str] = None):
         super().__init__()
         self.rewriter = rewriter
         self.handled_qbs = set()
+        self.symbols: dict[str, str] = {k.strip('":').lower(): v.upper() for k, v in symbols.items()} if symbols else {}
+
+    def visitCreate_procedure_body(self, ctx: FirebirdParser.Create_procedure_bodyContext):
+        old_symbols = self.symbols.copy()
+        try:
+            return self.visitChildren(ctx)
+        finally:
+            self.symbols = old_symbols
+
+    def visitCreate_trigger(self, ctx: FirebirdParser.Create_triggerContext):
+        old_symbols = self.symbols.copy()
+        try:
+            return self.visitChildren(ctx)
+        finally:
+            self.symbols = old_symbols
+
+    def visitParameter(self, ctx: FirebirdParser.ParameterContext):
+        if ctx.parameter_name() and ctx.type_spec():
+            name = ctx.parameter_name().getText().strip('":').lower()
+            self.symbols[name] = ctx.type_spec().getText().upper()
+        return self.visitChildren(ctx)
+
+    def visitVariable_declaration(self, ctx: FirebirdParser.Variable_declarationContext):
+        if ctx.identifier() and ctx.type_spec():
+            name = ctx.identifier().getText().strip('":').lower()
+            self.symbols[name] = ctx.type_spec().getText().upper()
+        return self.visitChildren(ctx)
+
+    def visitColumn_definition(self, ctx: FirebirdParser.Column_definitionContext):
+        if ctx.column_name():
+            name = ctx.column_name().getText().strip('":').lower()
+            type_ctx = ctx.datatype() or ctx.type_name()
+            if type_ctx:
+                self.symbols[name] = type_ctx.getText().upper()
+        return self.visitChildren(ctx)
 
     def visitBind_variable(self, ctx: FirebirdParser.Bind_variableContext):
         raw = ctx.getText()
@@ -319,7 +373,7 @@ class ASTDialectRewriter(FirebirdParserVisitor):
             part_str = self._get_tokens_text(args[0]).strip().strip("'\"").lower()
             d1_str = self._get_tokens_text(args[1]).strip()
             d2_str = self._get_tokens_text(args[2]).strip()
-            is_time = _is_time_expr(d1_str) or _is_time_expr(d2_str)
+            is_time = _is_time_expr(d1_str, self.symbols) or _is_time_expr(d2_str, self.symbols)
             cast = "" if is_time else "::timestamp"
 
             if is_time and part_str in ('day', 'days', 'week', 'weeks', 'month', 'months', 'year', 'years'):
@@ -601,7 +655,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         return _normalize_date_funcs(sql)
 
     @classmethod
-    def transpile(cls, firebird_sql_string: str) -> str:
+    def transpile(cls, firebird_sql_string: str, symbols: dict[str, str] = None) -> str:
         """
         Parses Firebird SQL using Two-Stage Parsing (SLL -> LL), traverses the AST with the visitor,
         and applies dialect token rewriting to produce clean PostgreSQL SQL.
@@ -649,7 +703,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         rewriter = TokenStreamRewriter(stream)
 
         # Pass 1: Semantic token rewriting on AST
-        dialect_rewriter = ASTDialectRewriter(rewriter)
+        dialect_rewriter = ASTDialectRewriter(rewriter, symbols=symbols)
         dialect_rewriter.visit(tree)
 
         # Pass 2: High-level PL/pgSQL structure visitor
@@ -662,7 +716,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         return pg_sql
 
     @classmethod
-    def transpile_expression(cls, expr: str) -> str:
+    def transpile_expression(cls, expr: str, symbols: dict[str, str] = None) -> str:
         """
         Transpiles a standalone Firebird SQL scalar expression (e.g. computed column, expression index)
         to PostgreSQL SQL, rewriting built-ins like IIF, DATEADD, DATEDIFF, LIST, GEN_ID.
@@ -672,7 +726,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         expr_clean = expr.strip()
         dummy_sql = f'CREATE VIEW "__v__" AS SELECT {expr_clean} FROM RDB$DATABASE;'
         try:
-            view_sql = cls.transpile(dummy_sql)
+            view_sql = cls.transpile(dummy_sql, symbols=symbols)
             m = re.search(r'AS\s+SELECT\s+(.*)\s*;?$', view_sql, re.IGNORECASE | re.DOTALL)
             if m:
                 return m.group(1).strip().rstrip(';').strip()

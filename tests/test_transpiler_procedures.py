@@ -452,5 +452,37 @@ class TestTranspilerProcedures(unittest.TestCase):
         self.assertIn("V_DIFF := (DATE(CURRENT_DATE) - DATE(V_DT));", pg_sql)
         self.assertIn("V_DIFF := ROUND(EXTRACT(EPOCH FROM (DATE_TRUNC('hour', CURRENT_TIMESTAMP::timestamp) - DATE_TRUNC('hour', V_DT::timestamp))) / 3600);", pg_sql)
 
+    def test_datediff_with_time_parameters_and_variables(self):
+        fb_sql = """
+        CREATE PROCEDURE SP_CALC_TIME (T1 TIME, T2 TIME)
+        RETURNS (DIFF_H INTEGER, DIFF_MS NUMERIC(18, 1))
+        AS
+        DECLARE VARIABLE V_START TIME;
+        DECLARE VARIABLE V_END TIME;
+        BEGIN
+            DIFF_H = DATEDIFF(HOUR, T1, T2);
+            DIFF_MS = DATEDIFF(MILLISECOND, V_START, V_END);
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("DATE_TRUNC('hour', T2) - DATE_TRUNC('hour', T1)", pg_sql)
+        self.assertNotIn("T2::timestamp", pg_sql)
+        self.assertNotIn("T1::timestamp", pg_sql)
+        self.assertIn("(V_END - V_START)", pg_sql)
+        self.assertNotIn("V_END::timestamp", pg_sql)
+        self.assertNotIn("V_START::timestamp", pg_sql)
+
+    def test_datediff_day_with_time_parameter_raises(self):
+        fb_sql = """
+        CREATE PROCEDURE SP_INVALID_TIME (T1 TIME, T2 TIME)
+        AS
+        BEGIN
+            DELETE FROM T WHERE DATEDIFF(DAY, T1, T2) > 0;
+        END;
+        """
+        with self.assertRaises(ValueError) as cm:
+            FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("cannot be used with TIME values", str(cm.exception))
+
 
 
