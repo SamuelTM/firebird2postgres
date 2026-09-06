@@ -98,7 +98,16 @@ class ASTDialectRewriter(FirebirdParserVisitor):
     def visitGeneral_element_part(self, ctx: FirebirdParser.General_element_partContext):
         self.visitChildren(ctx)
 
-        if not ctx.id_expression() or not ctx.function_argument():
+        if not ctx.id_expression():
+            return None
+
+        if not ctx.function_argument():
+            ident = ctx.id_expression().getText().upper()
+            if ident in ('INSERTING', 'UPDATING', 'DELETING'):
+                parent = ctx.parentCtx
+                if isinstance(parent, FirebirdParser.General_elementContext) and len(parent.children) == 1:
+                    op = {'INSERTING': 'INSERT', 'UPDATING': 'UPDATE', 'DELETING': 'DELETE'}[ident]
+                    self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"TG_OP = '{op}'")
             return None
 
         fn_name = ctx.id_expression().getText().upper()
@@ -792,6 +801,8 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         return f"{decl_str}{body_str}"
 
     def visitIf_statement(self, ctx: FirebirdParser.If_statementContext):
+        if ctx.condition():
+            self.visit(ctx.condition())
         cond = self.get_raw_text(ctx.condition())
         then_stmt = self.visit(ctx.statement(0))
         if then_stmt:
@@ -851,6 +862,8 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
 
     def visitAssignment_statement(self, ctx: FirebirdParser.Assignment_statementContext):
         left = self.get_raw_text(ctx.getChild(0)).lstrip(':')
+        if ctx.expression():
+            self.visit(ctx.expression())
         right = self.get_raw_text(ctx.expression())
         return f"{left} := {right};"
 
@@ -915,6 +928,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
 
         # Case 3: WHILE condition DO statement
         if ctx.condition():
+            self.visit(ctx.condition())
             cond = self.get_raw_text(ctx.condition())
             end_header_token = ctx.condition().stop
             loop_comments = self._get_comments_in_range(end_header_token.tokenIndex + 1,

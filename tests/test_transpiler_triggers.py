@@ -126,9 +126,29 @@ class TestTranspilerTriggers(unittest.TestCase):
         END
         """
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
-        self.assertIn("IF TG_OP = 'DELETE' THEN", pg_sql)
-        self.assertIn("RETURN OLD;", pg_sql)
-        self.assertIn("RETURN NEW;", pg_sql)
+        self.assertIn("IF (TG_OP = 'DELETE') THEN", pg_sql)
+        self.assertIn("IF TG_OP = 'DELETE' THEN\n        RETURN OLD;\n    ELSE\n        RETURN NEW;\n    END IF;", pg_sql)
+
+    def test_trigger_event_predicates_inserting_updating_deleting(self):
+        fb_sql = """
+        CREATE TRIGGER TRG_AUDIT FOR CLIENTES AFTER INSERT OR UPDATE OR DELETE
+        AS
+        BEGIN
+            IF (INSERTING) THEN
+                INSERT INTO AUDIT (EVENT) VALUES ('INS');
+            IF (UPDATING AND OLD.NOME <> NEW.NOME) THEN
+                INSERT INTO AUDIT (EVENT) VALUES ('UPD');
+            IF (DELETING) THEN
+                INSERT INTO AUDIT (EVENT) VALUES ('DEL');
+            IF (NEW.DELETING = 1) THEN
+                INSERT INTO AUDIT (EVENT) VALUES ('COL_PRESERVED');
+        END
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("IF (TG_OP = 'INSERT') THEN", pg_sql)
+        self.assertIn("IF (TG_OP = 'UPDATE' AND OLD.NOME <> NEW.NOME) THEN", pg_sql)
+        self.assertIn("IF (TG_OP = 'DELETE') THEN", pg_sql)
+        self.assertIn("IF (NEW.DELETING = 1) THEN", pg_sql)
 
     def test_insert_trigger_with_additional_logic_omits_when_clause(self):
         fb_sql = """
