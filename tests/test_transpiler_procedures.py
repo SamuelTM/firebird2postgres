@@ -121,17 +121,19 @@ class TestTranspilerProcedures(unittest.TestCase):
     def test_gen_id_currval_and_setval(self):
         fb_sql = """
         CREATE OR ALTER PROCEDURE SP_TEST_GEN
-        RETURNS (CURR_VAL INTEGER, CUSTOM_STEP INTEGER)
+        RETURNS (CURR_VAL INTEGER, CUSTOM_STEP INTEGER, STEP_TWO INTEGER)
         AS
         BEGIN
             CURR_VAL = GEN_ID(GEN_PEDIDOS, 0);
             CUSTOM_STEP = GEN_ID(GEN_PEDIDOS, 5);
+            STEP_TWO = GEN_ID(GEN_PEDIDOS, 2);
             SUSPEND;
         END;
         """
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
         self.assertIn("CURR_VAL := (SELECT CASE WHEN is_called THEN last_value ELSE last_value - 1 END FROM \"gen_pedidos\");", pg_sql)
-        self.assertIn("CUSTOM_STEP := setval('GEN_PEDIDOS', nextval('GEN_PEDIDOS') + (5) - 1);", pg_sql)
+        self.assertIn("CUSTOM_STEP := (SELECT max(nextval('GEN_PEDIDOS')) FROM generate_series(1, 5));", pg_sql)
+        self.assertIn("STEP_TWO := (SELECT max(nextval('GEN_PEDIDOS')) FROM generate_series(1, 2));", pg_sql)
 
     def test_execute_procedure_to_perform(self):
         fb_sql = """

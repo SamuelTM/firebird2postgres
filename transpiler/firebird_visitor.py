@@ -364,8 +364,10 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                     f"(SELECT CASE WHEN is_called THEN last_value ELSE last_value - 1 END FROM {quoted_seq})"
                 )
             else:
+                series_arg = step if step.isdigit() else f"({step})::bigint"
                 self.rewriter.replaceRangeTokens(
-                    ctx.start, ctx.stop, f"setval('{raw_seq}', nextval('{raw_seq}') + ({step}) - 1)"
+                    ctx.start, ctx.stop,
+                    f"(SELECT max(nextval('{raw_seq}')) FROM generate_series(1, {series_arg}))"
                 )
         elif fn_name == 'IIF' and len(args) == 3:
             cond_str = self._get_tokens_text(args[0]).strip()
