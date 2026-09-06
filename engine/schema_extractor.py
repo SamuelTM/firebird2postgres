@@ -1,5 +1,6 @@
 import re
 from models import Table, Column, ForeignKey, UniqueKey, Index, resolve_firebird_type, resolve_pg_domain_name
+from transpiler import FirebirdToPostgresVisitor
 
 
 class SchemaExtractor:
@@ -78,6 +79,8 @@ class SchemaExtractor:
             domain_default = column[8].strip() if column[8] else None
             field_source = column[9].strip() if column[9] else None
             computed_source = column[10].strip() if column[10] else None
+            if computed_source:
+                computed_source = FirebirdToPostgresVisitor.transpile_expression(computed_source)
 
             column_data_type = resolve_firebird_type(
                 field_type=field_type,
@@ -208,6 +211,8 @@ class SchemaExtractor:
         for row in cursor.fetchall():
             raw_expr = row[5]
             expr_str = raw_expr.strip() if raw_expr else None
+            if expr_str:
+                expr_str = FirebirdToPostgresVisitor.transpile_expression(expr_str)
             col_name = row[3].strip() if row[3] else None
             indexes.append(
                 Index(

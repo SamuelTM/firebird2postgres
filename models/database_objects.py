@@ -103,22 +103,16 @@ class Table:
         query = f'CREATE TABLE "{self.pg_name}" ('
 
         for i, col in enumerate(self.columns):
-            converted_type = get_postgres_type(col.column_type)
+            type_decl = f'public."{col.domain_name}"' if col.domain_name else get_postgres_type(col.column_type)
             escaped_name = f'"{col.pg_name}"'
 
             if col.computed_source:
                 expr = col.computed_source
                 if not expr.startswith('(') or not expr.endswith(')'):
                     expr = f"({expr})"
-                col_def = f'{escaped_name} {converted_type} GENERATED ALWAYS AS {expr} STORED'
-            elif col.domain_name:
-                # Column declared with a user domain: reference it (schema-qualified, lowercase)
-                # to preserve the original semantics and bypass pg_catalog name shadowing
-                col_def = f'{escaped_name} public."{col.domain_name}"'
+                col_def = f'{escaped_name} {type_decl} GENERATED ALWAYS AS {expr} STORED'
             else:
-                # column_type is already a complete type declaration (e.g. VARCHAR(80),
-                # NUMERIC(10,2)) resolved by firebird_types.resolve_firebird_type
-                col_def = f'{escaped_name} {converted_type}'
+                col_def = f'{escaped_name} {type_decl}'
 
             if not col.computed_source:
                 if col.sequence_name:
@@ -126,8 +120,8 @@ class Table:
                 elif col.default_value:
                     col_def += f' {col.default_value}'
 
-                if not col.nullable:
-                    col_def += ' NOT NULL'
+            if not col.nullable:
+                col_def += ' NOT NULL'
 
             query += col_def
 

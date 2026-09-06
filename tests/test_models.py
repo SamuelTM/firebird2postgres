@@ -189,9 +189,11 @@ class TestTableDdlGenerators(unittest.TestCase):
         table.columns.append(Column('QTD', 'INTEGER', nullable=False))
         table.columns.append(Column('PRECO', 'NUMERIC(15,2)', nullable=False))
         table.columns.append(Column('TOTAL', 'NUMERIC(15,2)', nullable=True, computed_source='QTD * PRECO'))
+        table.columns.append(Column('TOTAL_LIQUIDO', 'NUMERIC(15,2)', nullable=False, domain_name='dom_moeda', computed_source='QTD * PRECO * 0.9'))
 
         create_sql = table.get_create_table_query()
         self.assertIn('"total" NUMERIC(15,2) GENERATED ALWAYS AS (QTD * PRECO) STORED', create_sql)
+        self.assertIn('"total_liquido" public."dom_moeda" GENERATED ALWAYS AS (QTD * PRECO * 0.9) STORED NOT NULL', create_sql)
 
     def test_table_indexes_ddl(self):
         table = Table('PRODUCTS')

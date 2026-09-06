@@ -470,6 +470,25 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
 
         return pg_sql
 
+    @classmethod
+    def transpile_expression(cls, expr: str) -> str:
+        """
+        Transpiles a standalone Firebird SQL scalar expression (e.g. computed column, expression index)
+        to PostgreSQL SQL, rewriting built-ins like IIF, DATEADD, DATEDIFF, LIST, GEN_ID.
+        """
+        if not expr:
+            return ""
+        expr_clean = expr.strip()
+        dummy_sql = f'CREATE VIEW "__v__" AS SELECT {expr_clean} FROM RDB$DATABASE;'
+        try:
+            view_sql = cls.transpile(dummy_sql)
+            m = re.search(r'AS\s+SELECT\s+(.*)\s*;?$', view_sql, re.IGNORECASE | re.DOTALL)
+            if m:
+                return m.group(1).strip().rstrip(';').strip()
+        except Exception:
+            pass
+        return expr_clean
+
     @staticmethod
     def _clean_sql(pg_sql: str) -> str:
         """
