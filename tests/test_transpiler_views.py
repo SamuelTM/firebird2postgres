@@ -9,8 +9,8 @@ class TestTranspilerViews(unittest.TestCase):
         SELECT C.ID, C.NOME FROM CLIENTES C WHERE C.ATIVO = 1;
         """
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
-        self.assertIn('DROP VIEW IF EXISTS "VW_CLIENTES_ATIVOS" CASCADE;', pg_sql)
-        self.assertIn('CREATE VIEW "VW_CLIENTES_ATIVOS" (ID, NOME) AS SELECT', pg_sql)
+        self.assertIn('DROP VIEW IF EXISTS "vw_clientes_ativos" CASCADE;', pg_sql)
+        self.assertIn('CREATE VIEW "vw_clientes_ativos" ("id", "nome") AS SELECT', pg_sql)
         self.assertIn('FROM CLIENTES C', pg_sql)
 
     def test_view_with_joins(self):
@@ -21,8 +21,8 @@ class TestTranspilerViews(unittest.TestCase):
         JOIN CLIENTES C ON P.CLIENTE_ID = C.ID;
         """
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
-        self.assertIn('DROP VIEW IF EXISTS "VW_PEDIDOS_CLIENTES" CASCADE;', pg_sql)
-        self.assertIn('CREATE VIEW "VW_PEDIDOS_CLIENTES" AS SELECT', pg_sql)
+        self.assertIn('DROP VIEW IF EXISTS "vw_pedidos_clientes" CASCADE;', pg_sql)
+        self.assertIn('CREATE VIEW "vw_pedidos_clientes" AS SELECT', pg_sql)
         self.assertIn('JOIN CLIENTES C', pg_sql)
 
     def test_view_with_column_expressions_and_aliases(self):
@@ -34,6 +34,17 @@ class TestTranspilerViews(unittest.TestCase):
         GROUP BY C.ID, C.NOME;
         """
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
-        self.assertIn('DROP VIEW IF EXISTS "VW_RESUMO_FINANCEIRO" CASCADE;', pg_sql)
-        self.assertIn('CREATE VIEW "VW_RESUMO_FINANCEIRO" AS SELECT', pg_sql)
+        self.assertIn('DROP VIEW IF EXISTS "vw_resumo_financeiro" CASCADE;', pg_sql)
+        self.assertIn('CREATE VIEW "vw_resumo_financeiro" AS SELECT', pg_sql)
         self.assertIn('LEFT JOIN PEDIDOS P', pg_sql)
+
+    def test_chained_views_with_unquoted_and_quoted_references(self):
+        fb_sql = """
+        CREATE VIEW "V_BASE" ("ID") AS SELECT ID FROM T;
+        CREATE VIEW "V_CHILD" ("ID") AS SELECT ID FROM V_BASE;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn('DROP VIEW IF EXISTS "v_base" CASCADE;', pg_sql)
+        self.assertIn('CREATE VIEW "v_base" ("id") AS SELECT ID FROM T;', pg_sql)
+        self.assertIn('DROP VIEW IF EXISTS "v_child" CASCADE;', pg_sql)
+        self.assertIn('CREATE VIEW "v_child" ("id") AS SELECT ID FROM V_BASE;', pg_sql)

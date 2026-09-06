@@ -308,7 +308,7 @@ class DdlExporter:
             ORDER BY RDB$FIELD_POSITION;
         """
         cursor.execute(columns_query, (view_name,))
-        return [f'"{col[0].strip()}"' for col in cursor.fetchall() if col[0]]
+        return [col[0].strip() for col in cursor.fetchall() if col[0]]
 
     @staticmethod
     def _format_view_firebird_ddl(view_name: str, col_names: list[str], source: str) -> str:

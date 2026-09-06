@@ -15,6 +15,7 @@ from antlr4.error.Errors import ParseCancellationException, RecognitionException
 from antlr4.TokenStreamRewriter import TokenStreamRewriter
 
 from .firebird_grammar import FirebirdParserVisitor, FirebirdParser, FirebirdLexer
+from models import pg_quote_ident
 
 logger = logging.getLogger(__name__)
 
@@ -993,17 +994,25 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         return f"{decl_str}{body_str}"
 
     def visitCreate_view(self, ctx: FirebirdParser.Create_viewContext):
-        view_name = ctx.id_expression(0).getText().strip('"')
+        view_name = ctx.id_expression(0).getText().strip('"').lower()
         select_stmt = self.get_raw_text(ctx.select_only_statement())
 
         view_opts = ""
         if ctx.view_options():
-            view_opts = self.get_raw_text(ctx.view_options())
-            view_opts = f" {view_opts}"
+            vac = ctx.view_options().view_alias_constraint()
+            if vac and vac.table_alias():
+                cols = [
+                    pg_quote_ident((ta.identifier().getText() if ta.identifier() else ta.getText()).strip('"').lower())
+                    for ta in vac.table_alias()
+                ]
+                if cols:
+                    view_opts = f" ({', '.join(cols)})"
+            if not view_opts:
+                view_opts = f" {self.get_raw_text(ctx.view_options())}"
 
         # DROP first to guarantee idempotency, since changing the column list of an
         # existing view (names, order or types) requires recreating it
-        return f'DROP VIEW IF EXISTS "{view_name}" CASCADE;\nCREATE VIEW "{view_name}"{view_opts} AS {select_stmt};'
+        return f'DROP VIEW IF EXISTS {pg_quote_ident(view_name)} CASCADE;\nCREATE VIEW {pg_quote_ident(view_name)}{view_opts} AS {select_stmt};'
 
     def visitBody(self, ctx: FirebirdParser.BodyContext):
         # A body is usually BEGIN ... END
