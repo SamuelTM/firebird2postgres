@@ -216,7 +216,7 @@ class DataMigrator:
                 quoted_seq = pg_quote_ident(seq_name)
                 setval_arg = quoted_seq.replace("'", "''")
                 sync_query = f"""
-                    WITH max_calc AS (
+                    WITH max_calc AS MATERIALIZED (
                         SELECT {greatest_expr} AS max_val
                     )
                     SELECT setval(

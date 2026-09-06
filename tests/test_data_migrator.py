@@ -187,7 +187,7 @@ class TestDataMigrator(unittest.TestCase):
         self.assertEqual(len(sync_queries), 1)
         query = sync_queries[0]
         self.assertIn('"gen_shared_id"', query)
-        self.assertIn('WITH max_calc AS', query)
+        self.assertIn('WITH max_calc AS MATERIALIZED', query)
         self.assertIn('FROM "gen_shared_id" s, max_calc m', query)
         self.assertIn('(SELECT MAX("id") FROM "tabela1")', query)
         self.assertIn('(SELECT MAX("codigo") FROM "tabela2")', query)
