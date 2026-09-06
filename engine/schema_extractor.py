@@ -224,20 +224,22 @@ class SchemaExtractor:
     @staticmethod
     def _bind_sequence_generators(cursor, table_objs: list[Table]) -> None:
         """
-        Inspects trigger bodies for GEN_ID usage and binds identified sequences to table columns.
+        Inspects trigger bodies for GEN_ID / NEXT VALUE FOR usage and binds identified
+        sequences to table columns, matching case-insensitively and ignoring inactive triggers.
         """
         cursor.execute("""
             SELECT RDB$RELATION_NAME, RDB$TRIGGER_SOURCE
             FROM RDB$TRIGGERS
             WHERE RDB$SYSTEM_FLAG = 0
-              AND RDB$TRIGGER_SOURCE IS NOT NULL;
+              AND RDB$TRIGGER_SOURCE IS NOT NULL
+              AND (RDB$TRIGGER_INACTIVE = 0 OR RDB$TRIGGER_INACTIVE IS NULL);
         """)
         triggers = cursor.fetchall()
         pattern = re.compile(
-            r'NEW\.([A-Za-z0-9_]+)\s*=\s*GEN_ID\s*\(\s*([A-Za-z0-9_]+)\s*,\s*\d+\s*\)',
+            r'NEW\.(?:")?([A-Za-z0-9_]+)(?:")?\s*=\s*(?:GEN_ID\s*\(\s*([A-Za-z0-9_]+)\s*,\s*\d+\s*\)|NEXT\s+VALUE\s+FOR\s+([A-Za-z0-9_]+))',
             re.IGNORECASE
         )
-        tables_by_name = {t.name: t for t in table_objs}
+        tables_by_name = {t.name.upper(): t for t in table_objs}
 
         for trigger in triggers:
             relation_name = trigger[0].strip() if trigger[0] else None
@@ -245,13 +247,14 @@ class SchemaExtractor:
             if not relation_name or not source:
                 continue
 
-            match = pattern.search(source)
-            if match:
-                column_name = match.group(1).strip()
-                sequence_name = match.group(2).strip().lower()
+            table = tables_by_name.get(relation_name.upper())
+            if not table:
+                continue
 
-                table = tables_by_name.get(relation_name)
-                if table:
-                    column = next((c for c in table.columns if c.name == column_name), None)
-                    if column:
-                        column.sequence_name = sequence_name
+            for match in pattern.finditer(source):
+                column_name = match.group(1).strip()
+                sequence_name = (match.group(2) or match.group(3)).strip().lower()
+
+                column = next((c for c in table.columns if c.name.upper() == column_name.upper()), None)
+                if column:
+                    column.sequence_name = sequence_name
