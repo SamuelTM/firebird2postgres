@@ -78,8 +78,8 @@ _TOKEN_DATE_FUNC_PATTERN = re.compile(
     flags=re.IGNORECASE | re.DOTALL
 )
 
-_STRIP_COMMENTS = re.compile(
-    r"/\*.*?\*/|--[^\n]*",
+_STRIP_COMMENTS_PRESERVING_STRINGS = re.compile(
+    r"('(?:''|[^'])*')|(/\*.*?\*/|--[^\n]*)",
     flags=re.DOTALL
 )
 
@@ -106,7 +106,7 @@ def validate_immutable_expression(expr: str, context: str = "expression") -> Non
     volatile/stable functions (e.g. CURRENT_DATE, RANDOM(), nextval()) or dynamic date casts.
     Ignores plain string literals and comments to prevent false positives.
     """
-    no_comments = _STRIP_COMMENTS.sub(" ", expr)
+    no_comments = _STRIP_COMMENTS_PRESERVING_STRINGS.sub(lambda m: m.group(1) if m.group(1) else " ", expr)
     m_cast = _CAST_DYNAMIC_DATE_PATTERN.search(no_comments)
     if m_cast:
         raise ValueError(
