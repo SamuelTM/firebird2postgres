@@ -106,6 +106,18 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
             FirebirdToPostgresVisitor.transpile_expression("GEN_ID(GEN_SEQ, 1)"),
             "nextval('GEN_SEQ')",
         )
+        self.assertEqual(
+            FirebirdToPostgresVisitor.transpile_expression("DATEADD(1 DAY TO D)"),
+            "(D + (1) * INTERVAL '1 day')",
+        )
+        self.assertEqual(
+            FirebirdToPostgresVisitor.transpile_expression("DATEDIFF(DAY FROM D1 TO D2)"),
+            "(DATE(D2) - DATE(D1))",
+        )
+        with self.assertLogs('transpiler.firebird_visitor', level='WARNING') as cm:
+            res = FirebirdToPostgresVisitor.transpile_expression("FOOBAR $$$ INVALID")
+            self.assertEqual(res, "FOOBAR $$$ INVALID")
+            self.assertTrue(any("Failed to transpile Firebird expression" in log for log in cm.output))
 
 
     def test_extract_sequences_standalone_and_current_values(self):

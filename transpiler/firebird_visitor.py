@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 import sys
@@ -14,6 +15,8 @@ from antlr4.error.Errors import ParseCancellationException, RecognitionException
 from antlr4.TokenStreamRewriter import TokenStreamRewriter
 
 from .firebird_grammar import FirebirdParserVisitor, FirebirdParser, FirebirdLexer
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar('T', bound=ParserRuleContext)
 
@@ -61,6 +64,18 @@ _OLD_NEW_PATTERN = re.compile(
 _COLON_PATTERN = re.compile(
     r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|"  # Group 1: strings / comments
     r"(\b(RETURNING|INTO|FROM|WHERE|AND|OR|SELECT|VALUES|SET|THEN|ELSE|DO|IF|IN|NOT|AS|JOIN|ON):([a-zA-Z0-9_$]+))",
+    flags=re.IGNORECASE
+)
+
+_DATEADD_TO_PATTERN = re.compile(
+    r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|"  # Group 1: strings / comments
+    r"(\bDATEADD\s*\(\s*([a-zA-Z0-9_.\'\"()+-]+)\s+([a-zA-Z]+)\s+TO\s+([^,)]+)\))",
+    flags=re.IGNORECASE
+)
+
+_DATEDIFF_FROM_TO_PATTERN = re.compile(
+    r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|"  # Group 1: strings / comments
+    r"(\bDATEDIFF\s*\(\s*([a-zA-Z]+)\s+FROM\s+(.+?)\s+TO\s+([^,)]+)\))",
     flags=re.IGNORECASE
 )
 
@@ -424,7 +439,23 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
                 return match.group(1)
             return f"{match.group(3)} :{match.group(4)}"
 
-        return _COLON_PATTERN.sub(colon_repl, sql)
+        sql = _COLON_PATTERN.sub(colon_repl, sql)
+
+        # Step 4: Normalize alternative Firebird syntax DATEADD(num unit TO date) -> DATEADD(unit, num, date)
+        def dateadd_repl(match):
+            if match.group(1):
+                return match.group(1)
+            return f"DATEADD({match.group(4)}, {match.group(3)}, {match.group(5)})"
+
+        sql = _DATEADD_TO_PATTERN.sub(dateadd_repl, sql)
+
+        # Step 5: Normalize alternative Firebird syntax DATEDIFF(unit FROM d1 TO d2) -> DATEDIFF(unit, d1, d2)
+        def datediff_repl(match):
+            if match.group(1):
+                return match.group(1)
+            return f"DATEDIFF({match.group(3)}, {match.group(4)}, {match.group(5)})"
+
+        return _DATEDIFF_FROM_TO_PATTERN.sub(datediff_repl, sql)
 
     @classmethod
     def transpile(cls, firebird_sql_string: str) -> str:
@@ -502,8 +533,11 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
             m = re.search(r'AS\s+SELECT\s+(.*)\s*;?$', view_sql, re.IGNORECASE | re.DOTALL)
             if m:
                 return m.group(1).strip().rstrip(';').strip()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(
+                "Failed to transpile Firebird expression '%s' to PostgreSQL: %s. Using original expression.",
+                expr_clean, e
+            )
         return expr_clean
 
     @staticmethod

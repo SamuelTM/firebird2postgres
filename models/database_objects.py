@@ -75,6 +75,21 @@ def get_postgres_type(firebird_type: str) -> str:
     return type_mapping.get(firebird_type, firebird_type)
 
 
+def _is_enclosed_in_parens(s: str) -> bool:
+    s = s.strip()
+    if not (s.startswith('(') and s.endswith(')')):
+        return False
+    depth = 0
+    for i, ch in enumerate(s):
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+            if depth == 0 and i < len(s) - 1:
+                return False
+    return depth == 0
+
+
 class Table:
     def __init__(self, name: str):
         self.name = name
@@ -91,7 +106,7 @@ class Table:
 
     def get_sequence_queries(self) -> list[str]:
         """
-        Returns a list of CREATE SEQUENCE statements for all sequence-bound columns.
+        Returns a list of CREATE SEQUENCE statements for all identity/generator columns.
         """
         return [f'CREATE SEQUENCE "{col.sequence_name}";'
                 for col in self.columns if col.sequence_name]
@@ -107,8 +122,8 @@ class Table:
             escaped_name = f'"{col.pg_name}"'
 
             if col.computed_source:
-                expr = col.computed_source
-                if not expr.startswith('(') or not expr.endswith(')'):
+                expr = col.computed_source.strip()
+                if not _is_enclosed_in_parens(expr):
                     expr = f"({expr})"
                 col_def = f'{escaped_name} {type_decl} GENERATED ALWAYS AS {expr} STORED'
             else:
@@ -250,8 +265,8 @@ class Table:
                 query = f'CREATE INDEX "{index_name}" ON "{self.pg_name}" '
 
             if first_idx.expression:
-                expr = first_idx.expression
-                if not expr.startswith('(') or not expr.endswith(')'):
+                expr = first_idx.expression.strip()
+                if not _is_enclosed_in_parens(expr):
                     expr = f"({expr})"
                 query += f'({expr});'
             else:
