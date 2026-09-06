@@ -70,6 +70,13 @@ class DatabaseMigrator:
         self._ensure_schema()
         self.schema_migrator.migrate_schema(self.table_objs)
 
+    def analyze_tables(self):
+        """
+        Updates PostgreSQL optimizer statistics by running ANALYZE on migrated tables.
+        """
+        self._ensure_schema()
+        self.schema_migrator.analyze_tables(self.table_objs)
+
     def import_data(self, max_workers: int = 4) -> bool:
         """
         Reads data from Firebird and bulk inserts into PostgreSQL with sequence synchronization.

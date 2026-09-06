@@ -141,3 +141,19 @@ class SchemaMigrator:
         """
         self.create_tables(table_objs)
         self.create_constraints_and_indexes(table_objs)
+
+    def analyze_tables(self, table_objs: list[Table] = None):
+        """
+        Runs ANALYZE on migrated tables to update PostgreSQL optimizer statistics
+        immediately following data load and index creation.
+        """
+        logger.info("Updating PostgreSQL optimizer statistics (ANALYZE)...")
+        cursor = self.pg_con.cursor()
+        if table_objs:
+            for table in table_objs:
+                logger.debug(f'ANALYZE "{table.pg_name}";')
+                cursor.execute(f'ANALYZE "{table.pg_name}";')
+        else:
+            cursor.execute("ANALYZE;")
+        self.pg_con.commit()
+        logger.info("Optimizer statistics updated successfully.")

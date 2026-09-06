@@ -86,3 +86,13 @@ class TestSchemaMigrator(unittest.TestCase):
         self.assertTrue(any('DROP SEQUENCE IF EXISTS "gen_clientes_id" CASCADE;' in q for q in executed_queries))
         self.assertTrue(any('DROP DOMAIN "public"."dom_status" CASCADE;' in q for q in executed_queries))
         self.mock_pg_con.commit.assert_called()
+
+    def test_analyze_tables(self):
+        self.migrator.analyze_tables([self.table, self.table_orders])
+
+        executed_queries = [call[0][0] for call in self.mock_cursor.execute.call_args_list]
+
+        self.assertTrue(any('ANALYZE "clientes";' in q for q in executed_queries))
+        self.assertTrue(any('ANALYZE "orders";' in q for q in executed_queries))
+        self.mock_pg_con.commit.assert_called()
+
