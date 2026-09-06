@@ -594,6 +594,26 @@ class TestTranspilerProcedures(unittest.TestCase):
                       "P_PREFIX VARCHAR(20) DEFAULT 'test', "
                       'P_RATE DM_TAXA DEFAULT 0.05, OUT OUT_COUNT INTEGER) RETURNS INTEGER', pg_sql)
 
+    def test_quoted_variable_and_parameter_case_consistency(self):
+        fb_sql = """
+        CREATE PROCEDURE SP_QUOTED_CASE ("Param" INTEGER)
+        RETURNS ("Result" INTEGER)
+        AS
+        DECLARE VARIABLE "Count" INTEGER = 0;
+        BEGIN
+            "Count" = :"Param" + 1;
+            "Result" = "Count";
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        # Declaration and usage must have the exact same identifier casing
+        self.assertIn('"param" INTEGER', pg_sql)
+        self.assertIn('OUT "result" INTEGER', pg_sql)
+        self.assertIn('"count" INTEGER DEFAULT 0;', pg_sql)
+        self.assertIn('"count" := "param" + 1;', pg_sql)
+        self.assertIn('"result" := "count";', pg_sql)
+
+
 
 
 

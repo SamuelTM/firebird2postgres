@@ -533,6 +533,15 @@ def _is_time_expr(expr: str, symbols: dict[str, str] = None) -> bool:
     return False
 
 
+def _normalize_ident_case(raw_ident: str) -> str:
+    if not raw_ident:
+        return ""
+    if raw_ident.startswith('"') and raw_ident.endswith('"'):
+        clean = raw_ident[1:-1].replace('""', '"')
+        return pg_quote_ident(clean.lower())
+    return raw_ident
+
+
 class ASTDialectRewriter(FirebirdParserVisitor):
     """
     Pass 1 Visitor: Operates on AST nodes and rewrites tokens directly in the TokenStreamRewriter.
@@ -584,7 +593,9 @@ class ASTDialectRewriter(FirebirdParserVisitor):
     def visitBind_variable(self, ctx: FirebirdParser.Bind_variableContext):
         raw = ctx.getText()
         if raw.startswith(':'):
-            self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, raw.lstrip(':'))
+            name = raw.lstrip(':')
+            norm = _normalize_ident_case(name)
+            self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, norm)
         return self.visitChildren(ctx)
 
     def _get_tokens_text(self, ctx) -> str:
@@ -1108,7 +1119,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
             elif isinstance(child, FirebirdParser.ParameterContext):
                 type_spec = self._convert_type(self.get_raw_text(child.type_spec())) if child.type_spec() else "TEXT"
                 if has_returns:
-                    param_name = child.parameter_name().getText()
+                    param_name = _normalize_ident_case(child.parameter_name().getText())
                     out_params.append(f"OUT {param_name} {type_spec}".strip())
                     out_types.append(type_spec)
                 else:
@@ -1146,7 +1157,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
                 f'$$ LANGUAGE plpgsql;')
 
     def visitParameter(self, ctx: FirebirdParser.ParameterContext):
-        param_name = ctx.parameter_name().getText()
+        param_name = _normalize_ident_case(ctx.parameter_name().getText())
         # Firebird allows datatype directly or TYPE OF
         # Extract the raw tokens for the type to preserve spaces (e.g. VARCHAR(255))
         type_spec = ""
@@ -1489,7 +1500,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         return "\n".join(items)
 
     def visitVariable_declaration(self, ctx: FirebirdParser.Variable_declarationContext):
-        var_name = ctx.identifier().getText()
+        var_name = _normalize_ident_case(ctx.identifier().getText())
         is_const = " CONSTANT" if (hasattr(ctx, 'CONSTANT') and ctx.CONSTANT()) else ""
         type_spec = self._convert_type(self.get_raw_text(ctx.type_spec()))
         not_null = " NOT NULL" if (hasattr(ctx, 'NOT') and ctx.NOT()) else ""
