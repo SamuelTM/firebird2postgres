@@ -250,3 +250,34 @@ class TestTranspilerProcedures(unittest.TestCase):
         self.assertIn("INTO STRICT V_NOME;", pg_sql)
         self.assertIn("EXCEPTION WHEN NO_DATA_FOUND THEN", pg_sql)
 
+    def test_scalar_select_from_rdb_database_omits_exception_block(self):
+        fb_sql = """
+        CREATE OR ALTER PROCEDURE SP_NEXT_ID
+        RETURNS (V_ID INTEGER)
+        AS
+        BEGIN
+            SELECT GEN_ID(GEN_TEST, 1) FROM RDB$DATABASE INTO :V_ID;
+            SUSPEND;
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("nextval('GEN_TEST')", pg_sql)
+        self.assertIn("INTO STRICT V_ID;", pg_sql)
+        self.assertNotIn("EXCEPTION WHEN NO_DATA_FOUND THEN", pg_sql)
+
+    def test_aggregate_select_without_group_by_omits_exception_block(self):
+        fb_sql = """
+        CREATE OR ALTER PROCEDURE SP_COUNT_ACTIVE
+        RETURNS (V_COUNT INTEGER)
+        AS
+        BEGIN
+            SELECT COUNT(*) FROM CLIENTES WHERE ATIVO = 1 INTO :V_COUNT;
+            SUSPEND;
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("SELECT COUNT(*) FROM CLIENTES", pg_sql)
+        self.assertIn("INTO STRICT V_COUNT;", pg_sql)
+        self.assertNotIn("EXCEPTION WHEN NO_DATA_FOUND THEN", pg_sql)
+
+
