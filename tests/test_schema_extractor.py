@@ -182,6 +182,7 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
         validate_immutable_expression("CASE WHEN STATUS = 'CURRENT_DATE' THEN 1 ELSE 0 END")
         validate_immutable_expression("1 /* CURRENT_TIMESTAMP */")
         validate_immutable_expression("1 -- CURRENT_TIMESTAMP")
+        validate_immutable_expression("1 /* CAST('TODAY' AS DATE) */")
 
         # Non-immutable functions, sequences or dynamic date casts
         with self.assertRaises(ValueError):
@@ -198,6 +199,8 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
             validate_immutable_expression("nextval('g')")
         with self.assertRaises(ValueError):
             validate_immutable_expression("currval('g')")
+        with self.assertRaises(ValueError):
+            validate_immutable_expression("setval('g', 1)")
 
     def test_extract_columns_rejects_non_immutable_expression(self):
         mock_cursor = MagicMock()
