@@ -1,6 +1,7 @@
 import os
 import logging
 from concurrent.futures import ProcessPoolExecutor
+from graphlib import TopologicalSorter
 from config import DUMP_DIR, DumpFiles, get_dump_path
 from models import (
     Sequence,
@@ -279,13 +280,16 @@ class DdlExporter:
         fb_cursor.execute(query)
         views = fb_cursor.fetchall()
 
-        items = []
+        view_map = {}
         for view in views:
             view_name = view[0].strip() if view[0] else 'UNKNOWN'
             source = view[1]
             col_names = self._fetch_view_columns(fb_cursor, view_name)
             fb_sql = self._format_view_firebird_ddl(view_name, col_names, source)
-            items.append((view_name, fb_sql))
+            view_map[view_name] = (view_name, fb_sql)
+
+        ordered_names = self._resolve_view_dependency_order(fb_cursor, set(view_map.keys()))
+        items = [view_map[name] for name in ordered_names if name in view_map]
 
         self._export_transpiled_ddl(
             items,
@@ -298,6 +302,27 @@ class DdlExporter:
             chunksize=chunksize,
             per_item_separator=True,
         )
+
+    @staticmethod
+    def _resolve_view_dependency_order(cursor, view_names: set[str]) -> list[str]:
+        deps: dict[str, set[str]] = {name: set() for name in sorted(view_names)}
+        try:
+            dep_query = """
+                SELECT DISTINCT RDB$DEPENDENT_NAME, RDB$DEPENDED_ON_NAME
+                FROM RDB$DEPENDENCIES
+                WHERE RDB$DEPENDENT_TYPE = 1;
+            """
+            cursor.execute(dep_query)
+            for row in cursor.fetchall():
+                dep_name = row[0].strip() if row[0] else ""
+                used_name = row[1].strip() if row[1] else ""
+                if dep_name in deps and used_name in deps and dep_name != used_name:
+                    deps[dep_name].add(used_name)
+
+            return list(TopologicalSorter(deps).static_order())
+        except Exception as e:
+            logger.warning(f"Could not resolve view dependency order via RDB$DEPENDENCIES: {e}. Falling back to default order.")
+            return sorted(view_names)
 
     @staticmethod
     def _fetch_view_columns(cursor, view_name: str) -> list[str]:

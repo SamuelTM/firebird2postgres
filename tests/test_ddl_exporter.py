@@ -121,6 +121,26 @@ class TestDdlExporterViews(unittest.TestCase):
         expected = 'CREATE OR ALTER VIEW "V_ORDERS" ("Order Total", "SELECT") AS\nSELECT total, sel FROM orders\n\n'
         self.assertEqual(ddl, expected)
 
+    def test_resolve_view_dependency_order_reverse_alphabetical(self):
+        mock_cursor = MagicMock()
+        # A_CHILD depends on Z_BASE (in Firebird RDB$DEPENDENCIES: dependent=A_CHILD, depended_on=Z_BASE)
+        mock_cursor.fetchall.return_value = [
+            ("A_CHILD", "Z_BASE"),
+            ("A_CHILD", "SOME_TABLE"),  # Not in view_names, should be ignored
+        ]
+        ordered = DdlExporter._resolve_view_dependency_order(mock_cursor, {"A_CHILD", "Z_BASE"})
+        self.assertEqual(ordered, ["Z_BASE", "A_CHILD"])
+
+    def test_resolve_view_dependency_order_multilevel_chain(self):
+        mock_cursor = MagicMock()
+        # Chain: A_LEAF -> M_MID -> Z_ROOT
+        mock_cursor.fetchall.return_value = [
+            ("A_LEAF", "M_MID"),
+            ("M_MID", "Z_ROOT"),
+        ]
+        ordered = DdlExporter._resolve_view_dependency_order(mock_cursor, {"A_LEAF", "M_MID", "Z_ROOT"})
+        self.assertEqual(ordered, ["Z_ROOT", "M_MID", "A_LEAF"])
+
 
 if __name__ == '__main__':
     unittest.main()
