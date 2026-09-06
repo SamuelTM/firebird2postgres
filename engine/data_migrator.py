@@ -211,13 +211,13 @@ class DataMigrator:
                         seq_to_targets.setdefault(col.sequence_name, []).append((table.pg_name, col.pg_name))
 
             for seq_name, targets in seq_to_targets.items():
-                max_selects = ", ".join(f'COALESCE((SELECT MAX("{col}") FROM "{tbl}"), 0)' for tbl, col in targets)
+                max_selects = ", ".join(f'(SELECT MAX("{col}") FROM "{tbl}")' for tbl, col in targets)
                 greatest_expr = f'GREATEST({max_selects})' if len(targets) > 1 else max_selects
                 sync_query = f"""
                     SELECT setval(
                         '"{seq_name}"',
                         GREATEST((SELECT last_value FROM "{seq_name}"), {max_selects}),
-                        (SELECT is_called OR ({greatest_expr} >= (SELECT last_value FROM "{seq_name}")) FROM "{seq_name}")
+                        (SELECT is_called OR ({greatest_expr} IS NOT NULL AND {greatest_expr} >= (SELECT last_value FROM "{seq_name}")) FROM "{seq_name}")
                     );
                 """
                 logger.debug(sync_query.strip())
