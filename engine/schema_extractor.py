@@ -287,13 +287,14 @@ class SchemaExtractor:
         seq_names = [row[0].strip() for row in cursor.fetchall()]
         sequences = []
         for name in seq_names:
-            curr_val = 0
+            safe_name = name.replace('"', '""')
             try:
-                cursor.execute(f"SELECT GEN_ID({name}, 0) FROM RDB$DATABASE;")
+                cursor.execute(f'SELECT GEN_ID("{safe_name}", 0) FROM RDB$DATABASE;')
                 row = cursor.fetchone()
-                if row and row[0] is not None:
-                    curr_val = int(row[0])
-            except Exception:
-                pass
+                if not row or row[0] is None:
+                    raise RuntimeError(f"Failed to read current value for generator '{name}': no value returned")
+                curr_val = int(row[0])
+            except Exception as e:
+                raise RuntimeError(f"Failed to read current value for generator '{name}': {e}") from e
             sequences.append(Sequence(name=name, current_value=curr_val))
         return sequences

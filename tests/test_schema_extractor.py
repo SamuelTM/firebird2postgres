@@ -151,6 +151,53 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
         self.assertEqual(sequences[2].current_value, 0)
         self.assertEqual(sequences[2].get_create_sequence_query(), 'CREATE SEQUENCE "gen_tprocs_atendimento_apac_id";')
 
+    def test_extract_sequences_quotes_names_and_supports_negative_values(self):
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [
+            ('gen_lowercase',),
+            ('GEN_WITH_"QUOTE"',),
+        ]
+        mock_cursor.fetchone.side_effect = [
+            (-15,),
+            (-1,),
+        ]
+
+        sequences = SchemaExtractor._extract_sequences(mock_cursor)
+        self.assertEqual(len(sequences), 2)
+        self.assertEqual(sequences[0].name, 'gen_lowercase')
+        self.assertEqual(sequences[0].current_value, -15)
+        self.assertEqual(
+            sequences[0].get_create_sequence_query(),
+            'CREATE SEQUENCE "gen_lowercase" MINVALUE -9223372036854775807 START WITH -14;'
+        )
+        self.assertEqual(sequences[1].current_value, -1)
+        self.assertEqual(
+            sequences[1].get_create_sequence_query(),
+            'CREATE SEQUENCE "gen_with_\"quote\"" MINVALUE -9223372036854775807 START WITH 0;'
+        )
+
+        executed_queries = [call[0][0] for call in mock_cursor.execute.call_args_list[1:]]
+        self.assertIn('SELECT GEN_ID("gen_lowercase", 0) FROM RDB$DATABASE;', executed_queries)
+        self.assertIn('SELECT GEN_ID("GEN_WITH_""QUOTE""", 0) FROM RDB$DATABASE;', executed_queries)
+
+    def test_extract_sequences_raises_on_read_failure(self):
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [("GEN_FAIL",)]
+        mock_cursor.fetchone.side_effect = Exception("Firebird connection dropped")
+
+        with self.assertRaises(RuntimeError) as cm:
+            SchemaExtractor._extract_sequences(mock_cursor)
+        self.assertIn("Failed to read current value for generator 'GEN_FAIL'", str(cm.exception))
+
+    def test_extract_sequences_raises_on_none_row(self):
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [("GEN_NONE",)]
+        mock_cursor.fetchone.return_value = None
+
+        with self.assertRaises(RuntimeError) as cm:
+            SchemaExtractor._extract_sequences(mock_cursor)
+        self.assertIn("no value returned", str(cm.exception))
+
 
 if __name__ == '__main__':
     unittest.main()

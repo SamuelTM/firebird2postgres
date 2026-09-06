@@ -334,3 +334,19 @@ class TestSequenceModel(unittest.TestCase):
             'CREATE SEQUENCE "gen_tatendimentos_apac_id" START WITH 151;'
         )
 
+        seq_neg = Sequence('GEN_NEG_ID', current_value=-10)
+        self.assertEqual(
+            seq_neg.get_create_sequence_query(),
+            'CREATE SEQUENCE "gen_neg_id" MINVALUE -9223372036854775807 START WITH -9;'
+        )
+
+        seq_minus_one = Sequence('GEN_MINUS_ONE', current_value=-1)
+        self.assertEqual(
+            seq_minus_one.get_create_sequence_query(),
+            'CREATE SEQUENCE "gen_minus_one" MINVALUE -9223372036854775807 START WITH 0;'
+        )
+
+        seq_unknown = Sequence('GEN_UNKNOWN', current_value=None)
+        with self.assertRaises(ValueError):
+            seq_unknown.get_create_sequence_query()
+

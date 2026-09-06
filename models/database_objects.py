@@ -288,8 +288,13 @@ class Sequence:
         return self.name.lower()
 
     def get_create_sequence_query(self) -> str:
-        if self.current_value and self.current_value > 0:
-            return f'CREATE SEQUENCE "{self.pg_name}" START WITH {self.current_value + 1};'
+        if self.current_value is None:
+            raise ValueError(f"Cannot generate CREATE SEQUENCE for sequence '{self.name}': current_value is unknown (None)")
+        start_val = self.current_value + 1
+        if start_val < 1:
+            return f'CREATE SEQUENCE "{self.pg_name}" MINVALUE -9223372036854775807 START WITH {start_val};'
+        if start_val != 1:
+            return f'CREATE SEQUENCE "{self.pg_name}" START WITH {start_val};'
         return f'CREATE SEQUENCE "{self.pg_name}";'
 
     def get_drop_sequence_query(self) -> str:

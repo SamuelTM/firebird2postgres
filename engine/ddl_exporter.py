@@ -2,7 +2,13 @@ import os
 import logging
 from concurrent.futures import ProcessPoolExecutor
 from config import DUMP_DIR, DumpFiles, get_dump_path
-from models import get_postgres_type, resolve_firebird_type, resolve_pg_domain_name, decode_trigger_type
+from models import (
+    Sequence,
+    get_postgres_type,
+    resolve_firebird_type,
+    resolve_pg_domain_name,
+    decode_trigger_type,
+)
 from transpiler import FirebirdToPostgresVisitor
 
 logger = logging.getLogger(__name__)
@@ -366,19 +372,18 @@ class DdlExporter:
         items_fb = []
         items_pg = []
         for name in names:
-            curr_val = 0
+            safe_name = name.replace('"', '""')
             try:
-                cursor.execute(f"SELECT GEN_ID({name}, 0) FROM RDB$DATABASE;")
+                cursor.execute(f'SELECT GEN_ID("{safe_name}", 0) FROM RDB$DATABASE;')
                 row = cursor.fetchone()
-                if row and row[0] is not None:
-                    curr_val = int(row[0])
-            except Exception:
-                pass
-            items_fb.append(f"CREATE SEQUENCE {name};\nSET GENERATOR {name} TO {curr_val};")
-            if curr_val > 0:
-                items_pg.append(f'CREATE SEQUENCE "{name.lower()}" START WITH {curr_val + 1};')
-            else:
-                items_pg.append(f'CREATE SEQUENCE "{name.lower()}";')
+                if not row or row[0] is None:
+                    raise RuntimeError(f"Failed to read current value for generator '{name}': no value returned")
+                curr_val = int(row[0])
+            except Exception as e:
+                raise RuntimeError(f"Failed to read current value for generator '{name}': {e}") from e
+            fb_ident = name if (name.isupper() and name.isidentifier()) else f'"{safe_name}"'
+            items_fb.append(f"CREATE SEQUENCE {fb_ident};\nSET GENERATOR {fb_ident} TO {curr_val};")
+            items_pg.append(Sequence(name=name, current_value=curr_val).get_create_sequence_query())
 
         _ensure_parent_dir(out_file)
         _ensure_parent_dir(conv_file)

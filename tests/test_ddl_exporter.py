@@ -85,6 +85,22 @@ class TestDdlExporterTriggers(unittest.TestCase):
             self.assertIn('CREATE SEQUENCE "gen_standalone";', pg_content)
             self.assertIn('CREATE SEQUENCE "gen_apac_id" START WITH 301;', pg_content)
 
+    def test_export_firebird_generators_raises_on_failure(self):
+        mock_fb_con = MagicMock()
+        mock_cursor = MagicMock()
+        mock_fb_con.cursor.return_value = mock_cursor
+
+        mock_cursor.fetchall.return_value = [("GEN_FAIL",)]
+        mock_cursor.fetchone.side_effect = Exception("Failed to query generator")
+
+        exporter = DdlExporter(mock_fb_con)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fb_out = os.path.join(tmpdir, "fb.sql")
+            pg_out = os.path.join(tmpdir, "pg.sql")
+            with self.assertRaises(RuntimeError) as cm:
+                exporter.export_firebird_generators(output_file=fb_out, converted_file=pg_out)
+            self.assertIn("Failed to read current value for generator 'GEN_FAIL'", str(cm.exception))
+
 
 if __name__ == '__main__':
     unittest.main()
