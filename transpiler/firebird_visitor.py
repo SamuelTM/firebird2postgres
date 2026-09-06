@@ -277,6 +277,16 @@ class ASTDialectRewriter(FirebirdParserVisitor):
             end_token = qb.numeric(1).stop if qb.SKIP_() else qb.numeric(0).stop
             self.rewriter.replaceRangeTokens(qb.FIRST().symbol, end_token, '')
             limit_clause = f' LIMIT {first_val}' + (f' OFFSET {skip_val}' if skip_val else '')
+
+            into_ctx = _find_node(ctx, FirebirdParser.Into_clauseContext)
+            if into_ctx:
+                prev_token_idx = into_ctx.start.tokenIndex - 1
+                while prev_token_idx >= ctx.start.tokenIndex and self.rewriter.tokens.tokens[prev_token_idx].channel != 0:
+                    prev_token_idx -= 1
+                prev_token = self.rewriter.tokens.tokens[max(ctx.start.tokenIndex, prev_token_idx)]
+                self.rewriter.insertAfterToken(prev_token, limit_clause)
+                return
+
             target_token = ctx.stop
             if target_token and target_token.text == ')':
                 self.rewriter.insertBeforeToken(target_token, limit_clause)
@@ -856,11 +866,18 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
             return ""
         if hasattr(ctx, 'start') and hasattr(ctx, 'stop') and ctx.start and ctx.stop:
             if self.rewriter:
-                return self.rewriter.getText(
+                text = self.rewriter.getText(
                     TokenStreamRewriter.DEFAULT_PROGRAM_NAME,
                     ctx.start.tokenIndex,
                     ctx.stop.tokenIndex
                 )
+                if ctx.stop.tokenIndex < len(self.rewriter.tokens.tokens) - 1:
+                    prog = self.rewriter.programs.get(TokenStreamRewriter.DEFAULT_PROGRAM_NAME)
+                    if prog:
+                        for op in prog:
+                            if isinstance(op, TokenStreamRewriter.InsertAfterOp) and op.index == ctx.stop.tokenIndex + 1:
+                                text += op.text
+                return text
             start_idx = ctx.start.start
             stop_idx = ctx.stop.stop
             stream = ctx.start.getInputStream()

@@ -48,11 +48,30 @@ class TestTranspilerProcedures(unittest.TestCase):
         DECLARE VARIABLE X INTEGER;
         BEGIN
             SELECT COUNT(*) FROM (SELECT FIRST 10 SKIP 20 ID FROM CLIENTES) INTO :TOTAL;
+            SELECT FIRST 1 ID FROM CLIENTES INTO :TOTAL;
+            SELECT FIRST 1 SKIP 5 ID FROM CLIENTES ORDER BY ID DESC INTO :TOTAL;
             SUSPEND;
         END;
         """
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
         self.assertIn("LIMIT 10 OFFSET 20", pg_sql)
+        self.assertIn("LIMIT 1 INTO STRICT TOTAL;", pg_sql)
+        self.assertIn("ORDER BY ID DESC LIMIT 1 OFFSET 5 INTO STRICT TOTAL;", pg_sql)
+
+    def test_syntax_translations_first_skip_in_for_loop(self):
+        fb_sql = """
+        CREATE OR ALTER PROCEDURE SP_TEST_LOOP
+        AS
+        DECLARE VARIABLE V_ID INTEGER;
+        BEGIN
+            FOR SELECT FIRST 5 ID FROM CLIENTES INTO :V_ID DO
+            BEGIN
+            END
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("FOR V_ID IN SELECT  ID FROM CLIENTES LIMIT 5 LOOP", pg_sql)
+
 
     def test_syntax_translations_rdb_database(self):
         fb_sql = """
