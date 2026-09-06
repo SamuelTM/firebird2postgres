@@ -59,7 +59,7 @@ class SchemaExtractor:
                    COALESCE(rf.RDB$NULL_FLAG, f.RDB$NULL_FLAG),
                    f.RDB$FIELD_PRECISION, f.RDB$FIELD_SCALE,
                    rf.RDB$DEFAULT_SOURCE, f.RDB$DEFAULT_SOURCE,
-                   rf.RDB$FIELD_SOURCE
+                   rf.RDB$FIELD_SOURCE, f.RDB$COMPUTED_SOURCE
             FROM RDB$RELATION_FIELDS rf
             JOIN RDB$FIELDS f ON rf.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
             WHERE rf.RDB$RELATION_NAME = ?
@@ -77,6 +77,7 @@ class SchemaExtractor:
             column_default = column[7].strip() if column[7] else None
             domain_default = column[8].strip() if column[8] else None
             field_source = column[9].strip() if column[9] else None
+            computed_source = column[10].strip() if column[10] else None
 
             column_data_type = resolve_firebird_type(
                 field_type=field_type,
@@ -102,6 +103,7 @@ class SchemaExtractor:
                     nullable=nullable,
                     default_value=default_value,
                     domain_name=domain_name,
+                    computed_source=computed_source,
                 )
             )
         return columns
@@ -118,7 +120,9 @@ class SchemaExtractor:
                 si.RDB$FIELD_NAME AS local_column,
                 rs.RDB$RELATION_NAME AS referenced_table,
                 rsi.RDB$FIELD_POSITION AS referenced_column_position,
-                rsi.RDB$FIELD_NAME AS referenced_column
+                rsi.RDB$FIELD_NAME AS referenced_column,
+                refc.RDB$UPDATE_RULE AS update_rule,
+                refc.RDB$DELETE_RULE AS delete_rule
             FROM RDB$RELATION_CONSTRAINTS rc
             JOIN RDB$INDEX_SEGMENTS si ON rc.RDB$INDEX_NAME = si.RDB$INDEX_NAME
             JOIN RDB$REF_CONSTRAINTS refc ON rc.RDB$CONSTRAINT_NAME = refc.RDB$CONSTRAINT_NAME
@@ -138,6 +142,8 @@ class SchemaExtractor:
                     referenced_table_name=row[3].strip(),
                     referenced_column_name=row[5].strip(),
                     referenced_column_index=row[4],
+                    update_rule=row[6].strip() if row[6] else None,
+                    delete_rule=row[7].strip() if row[7] else None,
                 )
             )
         return foreign_keys

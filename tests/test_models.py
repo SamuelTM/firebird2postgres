@@ -164,6 +164,35 @@ class TestTableDdlGenerators(unittest.TestCase):
             'REFERENCES "orders"("id", "company_id");', fk_sql
         )
 
+    def test_table_foreign_keys_with_actions_ddl(self):
+        table = Table('ORDERS')
+        table.foreign_keys.append(
+            ForeignKey(
+                key_name='FK_ORDERS_CLIENTE',
+                local_column_name='CLIENTE_ID',
+                local_column_index=0,
+                referenced_table_name='CLIENTES',
+                referenced_column_name='ID',
+                referenced_column_index=0,
+                update_rule='CASCADE',
+                delete_rule='SET NULL',
+            )
+        )
+        fk_sql = table.get_foreign_keys_query()
+        self.assertEqual(
+            'ALTER TABLE "orders" ADD CONSTRAINT "fk_orders_cliente" FOREIGN KEY ("cliente_id") '
+            'REFERENCES "clientes"("id") ON DELETE SET NULL ON UPDATE CASCADE;', fk_sql
+        )
+
+    def test_table_computed_columns_ddl(self):
+        table = Table('INVOICE_ITEMS')
+        table.columns.append(Column('QTD', 'INTEGER', nullable=False))
+        table.columns.append(Column('PRECO', 'NUMERIC(15,2)', nullable=False))
+        table.columns.append(Column('TOTAL', 'NUMERIC(15,2)', nullable=True, computed_source='QTD * PRECO'))
+
+        create_sql = table.get_create_table_query()
+        self.assertIn('"total" NUMERIC(15,2) GENERATED ALWAYS AS (QTD * PRECO) STORED', create_sql)
+
     def test_table_indexes_ddl(self):
         table = Table('PRODUCTS')
         table.indexes.append(

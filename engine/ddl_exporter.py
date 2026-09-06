@@ -108,7 +108,8 @@ class DdlExporter:
             FROM RDB$TRIGGERS
             WHERE RDB$SYSTEM_FLAG = 0
               AND RDB$TRIGGER_SOURCE IS NOT NULL
-            ORDER BY RDB$RELATION_NAME, RDB$TRIGGER_NAME;
+              AND (RDB$TRIGGER_INACTIVE = 0 OR RDB$TRIGGER_INACTIVE IS NULL)
+            ORDER BY RDB$RELATION_NAME, RDB$TRIGGER_SEQUENCE, RDB$TRIGGER_NAME;
         """
         fb_cursor.execute(query)
         triggers = fb_cursor.fetchall()

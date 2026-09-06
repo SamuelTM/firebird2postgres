@@ -32,12 +32,14 @@ def _import_single_table(table: Table, fb_cur, pg_cur, pg_con) -> int:
         logger.debug(f"Found {blob_count} BLOB column(s) in '{table.name}'. Adjusted batch size to {batch_size}.")
 
     # Explicitly list columns to ensure it perfectly matches the postgres insert order.
+    # Exclude computed (GENERATED ALWAYS) columns, as PostgreSQL forbids inserting into them directly.
     # Firebird-side keeps the original casing (quoted identifiers are case-sensitive there);
     # PostgreSQL-side uses the lowercase identifier.
-    fb_column_names = [f'"{col.name}"' for col in table.columns]
+    cols_to_import = [col for col in table.columns if not col.computed_source]
+    fb_column_names = [f'"{col.name}"' for col in cols_to_import]
     fb_columns_str = ", ".join(fb_column_names)
 
-    pg_column_names = [f'"{col.pg_name}"' for col in table.columns]
+    pg_column_names = [f'"{col.pg_name}"' for col in cols_to_import]
     pg_columns_str = ", ".join(pg_column_names)
 
     fb_cur.execute(f'SELECT {fb_columns_str} FROM "{table.name}"')
@@ -46,7 +48,7 @@ def _import_single_table(table: Table, fb_cur, pg_cur, pg_con) -> int:
     # Identify column indices that can contain text/strings to avoid unnecessary checks on numeric/date columns
     # Note: 'BLOB SUBTYPE 1' maps to TEXT (strings), while 'BLOB SUBTYPE 0' maps to BYTEA (binary)
     str_col_indices = [
-        i for i, col in enumerate(table.columns)
+        i for i, col in enumerate(cols_to_import)
         if any(t in col.column_type.upper() for t in ('VARCHAR', 'CHAR', 'TEXT', 'BLOB SUBTYPE 1', 'CSTRING'))
         or col.domain_name
     ]

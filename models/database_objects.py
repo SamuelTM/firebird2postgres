@@ -1,6 +1,6 @@
 class Column:
     def __init__(self, name: str, column_type: str, nullable: bool, default_value: str = None,
-                 sequence_name: str = None, domain_name: str = None):
+                 sequence_name: str = None, domain_name: str = None, computed_source: str = None):
         self.name = name
         self.column_type = column_type
         self.nullable = nullable
@@ -9,6 +9,7 @@ class Column:
         # which is required for quoted (case-sensitive) queries against the source database
         self.sequence_name = sequence_name.lower() if sequence_name else None
         self.domain_name = domain_name
+        self.computed_source = computed_source.strip() if computed_source else None
 
     @property
     def pg_name(self) -> str:
@@ -17,7 +18,8 @@ class Column:
 
 class ForeignKey:
     def __init__(self, key_name: str, local_column_name: str, local_column_index: int, referenced_table_name: str,
-                 referenced_column_name: str, referenced_column_index: int):
+                 referenced_column_name: str, referenced_column_index: int,
+                 update_rule: str = None, delete_rule: str = None):
         # All identifiers here are PostgreSQL-side only, so they are normalized to lowercase
         self.referenced_column_index = referenced_column_index
         self.referenced_column_name = referenced_column_name.lower()
@@ -25,6 +27,8 @@ class ForeignKey:
         self.local_column_index = local_column_index
         self.local_column_name = local_column_name.lower()
         self.key_name = key_name.lower()
+        self.update_rule = update_rule.strip().upper() if update_rule else None
+        self.delete_rule = delete_rule.strip().upper() if delete_rule else None
 
 
 class UniqueKey:
@@ -100,7 +104,12 @@ class Table:
             converted_type = get_postgres_type(col.column_type)
             escaped_name = f'"{col.pg_name}"'
 
-            if col.domain_name:
+            if col.computed_source:
+                expr = col.computed_source
+                if not expr.startswith('(') or not expr.endswith(')'):
+                    expr = f"({expr})"
+                col_def = f'{escaped_name} {converted_type} GENERATED ALWAYS AS {expr} STORED'
+            elif col.domain_name:
                 # Column declared with a user domain: reference it (schema-qualified, lowercase)
                 # to preserve the original semantics and bypass pg_catalog name shadowing
                 col_def = f'{escaped_name} public."{col.domain_name}"'
@@ -109,13 +118,14 @@ class Table:
                 # NUMERIC(10,2)) resolved by firebird_types.resolve_firebird_type
                 col_def = f'{escaped_name} {converted_type}'
 
-            if col.sequence_name:
-                col_def += f" DEFAULT nextval('\"{col.sequence_name}\"')"
-            elif col.default_value:
-                col_def += f' {col.default_value}'
+            if not col.computed_source:
+                if col.sequence_name:
+                    col_def += f" DEFAULT nextval('\"{col.sequence_name}\"')"
+                elif col.default_value:
+                    col_def += f' {col.default_value}'
 
-            if not col.nullable:
-                col_def += ' NOT NULL'
+                if not col.nullable:
+                    col_def += ' NOT NULL'
 
             query += col_def
 
@@ -146,6 +156,14 @@ class Table:
 
         for foreign_key_index, foreign_key_name in enumerate(foreign_keys_grouped_by_name):
             foreign_keys = foreign_keys_grouped_by_name[foreign_key_name]
+            first_fk = foreign_keys[0]
+
+            action_clause = ""
+            if first_fk.delete_rule and first_fk.delete_rule not in ('RESTRICT', 'NO ACTION'):
+                action_clause += f" ON DELETE {first_fk.delete_rule}"
+            if first_fk.update_rule and first_fk.update_rule not in ('RESTRICT', 'NO ACTION'):
+                action_clause += f" ON UPDATE {first_fk.update_rule}"
+
             if len(foreign_keys) > 1:
                 # The catalog join yields a local x referenced segment cross product; keep
                 # only the position-matched pairs, indexed by the real column position so
@@ -162,11 +180,11 @@ class Table:
                 referenced_columns_str = ", ".join([f'"{item}"' for _, item in ordered_pairs])
 
                 query += (f'CONSTRAINT "{foreign_key_name}" FOREIGN KEY ({local_columns_str}) '
-                          f'REFERENCES "{foreign_keys[0].referenced_table_name}"({referenced_columns_str})')
+                          f'REFERENCES "{first_fk.referenced_table_name}"({referenced_columns_str}){action_clause}')
             else:
                 foreign_key = foreign_keys[0]
                 query += (f'CONSTRAINT "{foreign_key.key_name}" FOREIGN KEY ("{foreign_key.local_column_name}") '
-                          f'REFERENCES "{foreign_key.referenced_table_name}"("{foreign_key.referenced_column_name}")')
+                          f'REFERENCES "{foreign_key.referenced_table_name}"("{foreign_key.referenced_column_name}"){action_clause}')
 
             if foreign_key_index < len(foreign_keys_grouped_by_name) - 1:
                 query += ', ADD '
