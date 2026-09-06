@@ -1,5 +1,5 @@
 import re
-from models import Table, Column, ForeignKey, UniqueKey, Index, resolve_firebird_type, resolve_pg_domain_name
+from models import Table, Column, ForeignKey, UniqueKey, Index, Sequence, resolve_firebird_type, resolve_pg_domain_name
 from transpiler import FirebirdToPostgresVisitor
 
 
@@ -31,6 +31,14 @@ class SchemaExtractor:
 
         self._bind_sequence_generators(fb_cursor, table_objs)
         return table_objs
+
+    def extract_sequences(self) -> list[Sequence]:
+        """
+        Extracts all user-defined sequences/generators from Firebird system catalog,
+        preserving their names and querying their current values.
+        """
+        fb_cursor = self.fb_con.cursor()
+        return self._extract_sequences(fb_cursor)
 
     @staticmethod
     def _fetch_user_tables(cursor) -> list[str]:
@@ -263,3 +271,29 @@ class SchemaExtractor:
                 column = next((c for c in table.columns if c.name.upper() == column_name.upper()), None)
                 if column:
                     column.sequence_name = sequence_name
+
+    @staticmethod
+    def _extract_sequences(cursor) -> list[Sequence]:
+        """
+        Queries all user-defined generators from RDB$GENERATORS and reads their current values.
+        """
+        cursor.execute("""
+            SELECT RDB$GENERATOR_NAME
+            FROM RDB$GENERATORS
+            WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
+              AND RDB$GENERATOR_NAME NOT STARTING WITH 'RDB$'
+              AND RDB$GENERATOR_NAME NOT STARTING WITH 'MON$';
+        """)
+        seq_names = [row[0].strip() for row in cursor.fetchall()]
+        sequences = []
+        for name in seq_names:
+            curr_val = 0
+            try:
+                cursor.execute(f"SELECT GEN_ID({name}, 0) FROM RDB$DATABASE;")
+                row = cursor.fetchone()
+                if row and row[0] is not None:
+                    curr_val = int(row[0])
+            except Exception:
+                pass
+            sequences.append(Sequence(name=name, current_value=curr_val))
+        return sequences

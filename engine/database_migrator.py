@@ -1,4 +1,4 @@
-from models import Table
+from models import Table, Sequence
 from transpiler import FirebirdToPostgresVisitor
 from utils import SqlRunner
 from .schema_extractor import SchemaExtractor
@@ -21,6 +21,7 @@ class DatabaseMigrator:
         self.fb_con = fb_con
         self.pg_con = pg_con
         self.table_objs: list[Table] = []
+        self.sequence_objs: list[Sequence] = []
 
         self.extractor = SchemaExtractor(fb_con)
         self.schema_migrator = SchemaMigrator(pg_con)
@@ -33,6 +34,7 @@ class DatabaseMigrator:
         Extracts the DDL schema from Firebird system tables into memory.
         """
         self.table_objs = self.extractor.extract_schema()
+        self.sequence_objs = self.extractor.extract_sequences()
 
     def _ensure_schema(self):
         if not self.table_objs:
@@ -47,14 +49,14 @@ class DatabaseMigrator:
         Drops all migrated objects (tables, sequences and domains) from PostgreSQL.
         """
         self._ensure_schema()
-        self.schema_migrator.drop_schema(self.table_objs)
+        self.schema_migrator.drop_schema(self.table_objs, self.sequence_objs)
 
     def create_tables(self):
         """
         Executes the generated PostgreSQL DDL to create base tables and sequences (without constraints/indexes).
         """
         self._ensure_schema()
-        self.schema_migrator.create_tables(self.table_objs)
+        self.schema_migrator.create_tables(self.table_objs, self.sequence_objs)
 
     def create_constraints_and_indexes(self):
         """
@@ -68,7 +70,7 @@ class DatabaseMigrator:
         Executes the generated PostgreSQL DDL to create the tables, sequences, indexes, and keys.
         """
         self._ensure_schema()
-        self.schema_migrator.migrate_schema(self.table_objs)
+        self.schema_migrator.migrate_schema(self.table_objs, self.sequence_objs)
 
     def analyze_tables(self):
         """
@@ -103,6 +105,11 @@ class DatabaseMigrator:
     def export_firebird_domains(self, output_file: str = None,
                                 converted_file: str = None):
         self.ddl_exporter.export_firebird_domains(output_file, converted_file)
+
+    def export_firebird_generators(self, output_file: str = None,
+                                   converted_file: str = None):
+        self.ddl_exporter.export_firebird_generators(output_file, converted_file)
+
 
     def export_all_firebird_ddl(self, output_dir: str = None):
         """

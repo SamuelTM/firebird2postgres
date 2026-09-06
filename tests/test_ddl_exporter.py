@@ -50,6 +50,42 @@ class TestDdlExporterTriggers(unittest.TestCase):
             # "trg_00000_z_calcula" < "trg_00010_a_valida"
             self.assertLess("trg_00000_z_calcula", "trg_00010_a_valida")
 
+    def test_export_firebird_generators(self):
+        mock_fb_con = MagicMock()
+        mock_cursor = MagicMock()
+        mock_fb_con.cursor.return_value = mock_cursor
+
+        mock_cursor.fetchall.return_value = [
+            ("GEN_STANDALONE",),
+            ("GEN_APAC_ID",),
+        ]
+        mock_cursor.fetchone.side_effect = [
+            (0,),
+            (300,),
+        ]
+
+        exporter = DdlExporter(mock_fb_con)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fb_out = os.path.join(tmpdir, "fb_generators.sql")
+            pg_out = os.path.join(tmpdir, "pg_sequences.sql")
+
+            exporter.export_firebird_generators(output_file=fb_out, converted_file=pg_out)
+
+            with open(fb_out, "r", encoding="utf-8") as f:
+                fb_content = f.read()
+            with open(pg_out, "r", encoding="utf-8") as f:
+                pg_content = f.read()
+
+            self.assertIn("CREATE SEQUENCE GEN_STANDALONE;", fb_content)
+            self.assertIn("SET GENERATOR GEN_STANDALONE TO 0;", fb_content)
+            self.assertIn("CREATE SEQUENCE GEN_APAC_ID;", fb_content)
+            self.assertIn("SET GENERATOR GEN_APAC_ID TO 300;", fb_content)
+
+            self.assertIn('CREATE SEQUENCE "gen_standalone";', pg_content)
+            self.assertIn('CREATE SEQUENCE "gen_apac_id" START WITH 301;', pg_content)
+
 
 if __name__ == '__main__':
     unittest.main()
+

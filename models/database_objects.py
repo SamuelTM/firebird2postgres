@@ -261,3 +261,22 @@ class Table:
             queries.append(query)
 
         return queries
+
+
+class Sequence:
+    def __init__(self, name: str, current_value: int = 0):
+        self.name = name.strip()
+        self.current_value = current_value
+
+    @property
+    def pg_name(self) -> str:
+        return self.name.lower()
+
+    def get_create_sequence_query(self) -> str:
+        if self.current_value and self.current_value > 0:
+            return f'CREATE SEQUENCE "{self.pg_name}" START WITH {self.current_value + 1};'
+        return f'CREATE SEQUENCE "{self.pg_name}";'
+
+    def get_drop_sequence_query(self) -> str:
+        return f'DROP SEQUENCE IF EXISTS "{self.pg_name}" CASCADE;'
+

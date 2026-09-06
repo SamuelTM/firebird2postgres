@@ -5,6 +5,7 @@ from models import (
     ForeignKey,
     UniqueKey,
     Index,
+    Sequence,
     get_postgres_type,
     resolve_firebird_type,
     resolve_pg_domain_name,
@@ -315,4 +316,19 @@ class TestTableDdlGenerators(unittest.TestCase):
         self.assertEqual(len(idx_queries), 2)
         self.assertIn('CREATE INDEX "idx_clientes_nome_upper" ON "clientes" ((UPPER(NOME)));', idx_queries)
         self.assertIn('CREATE UNIQUE INDEX "uk_clientes_doc_clean" ON "clientes" ((TRIM(CNPJ)));', idx_queries)
+
+
+class TestSequenceModel(unittest.TestCase):
+    def test_sequence_creation_queries(self):
+        seq_zero = Sequence('GEN_TEST_ID', current_value=0)
+        self.assertEqual(seq_zero.pg_name, 'gen_test_id')
+        self.assertEqual(seq_zero.get_create_sequence_query(), 'CREATE SEQUENCE "gen_test_id";')
+        self.assertEqual(seq_zero.get_drop_sequence_query(), 'DROP SEQUENCE IF EXISTS "gen_test_id" CASCADE;')
+
+        seq_with_value = Sequence('GEN_TATENDIMENTOS_APAC_ID', current_value=150)
+        self.assertEqual(seq_with_value.pg_name, 'gen_tatendimentos_apac_id')
+        self.assertEqual(
+            seq_with_value.get_create_sequence_query(),
+            'CREATE SEQUENCE "gen_tatendimentos_apac_id" START WITH 151;'
+        )
 

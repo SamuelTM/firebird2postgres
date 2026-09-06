@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import MagicMock
 from engine.schema_migrator import SchemaMigrator
-from models import Table, Column, ForeignKey, UniqueKey, Index
+from models import Table, Column, ForeignKey, UniqueKey, Index, Sequence
 
 
 class TestSchemaMigrator(unittest.TestCase):
@@ -46,6 +46,26 @@ class TestSchemaMigrator(unittest.TestCase):
         self.assertFalse(any('FOREIGN KEY' in q for q in executed_queries))
 
         self.mock_pg_con.commit.assert_called()
+
+    def test_create_tables_creates_standalone_sequences(self):
+        standalone_seq = Sequence('GEN_TATENDIMENTOS_APAC_ID', current_value=120)
+        self.migrator.create_tables([self.table], sequences=[standalone_seq])
+
+        executed_queries = [call[0][0] for call in self.mock_cursor.execute.call_args_list]
+
+        # Should drop and create standalone sequence with START WITH 121
+        self.assertTrue(any('DROP SEQUENCE IF EXISTS "gen_tatendimentos_apac_id" CASCADE;' in q for q in executed_queries))
+        self.assertTrue(any('CREATE SEQUENCE "gen_tatendimentos_apac_id" START WITH 121;' in q for q in executed_queries))
+        # Should also create table-bound sequence
+        self.assertTrue(any('CREATE SEQUENCE "gen_clientes_id";' in q for q in executed_queries))
+
+    def test_drop_schema_drops_standalone_sequences(self):
+        standalone_seq = Sequence('GEN_TPROCS_ATENDIMENTO_APAC_ID', current_value=0)
+        self.migrator.drop_schema([self.table], sequences=[standalone_seq])
+
+        executed_queries = [call[0][0] for call in self.mock_cursor.execute.call_args_list]
+        self.assertTrue(any('DROP SEQUENCE IF EXISTS "gen_tprocs_atendimento_apac_id" CASCADE;' in q for q in executed_queries))
+        self.assertTrue(any('DROP SEQUENCE IF EXISTS "gen_clientes_id" CASCADE;' in q for q in executed_queries))
 
     def test_create_constraints_and_indexes(self):
         self.migrator.create_constraints_and_indexes([self.table, self.table_orders])

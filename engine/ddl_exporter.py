@@ -324,6 +324,10 @@ class DdlExporter:
             output_file=_path(DumpFiles.DOMAINS_FB),
             converted_file=_path(DumpFiles.DOMAINS_PG)
         )
+        self.export_firebird_generators(
+            output_file=_path(DumpFiles.GENERATORS_FB),
+            converted_file=_path(DumpFiles.SEQUENCES_PG)
+        )
         with ProcessPoolExecutor() as executor:
             self.export_firebird_triggers(
                 output_file=_path(DumpFiles.TRIGGERS_FB),
@@ -340,6 +344,54 @@ class DdlExporter:
                 converted_file=_path(DumpFiles.VIEWS_PG),
                 executor=executor
             )
+
+    def export_firebird_generators(self, output_file: str = None,
+                                   converted_file: str = None):
+        """
+        Extracts all user-defined generators from Firebird and saves their source code to a file
+        and the PostgreSQL converted CREATE SEQUENCE definitions with initial values.
+        """
+        out_file = output_file or get_dump_path(DumpFiles.GENERATORS_FB)
+        conv_file = converted_file or get_dump_path(DumpFiles.SEQUENCES_PG)
+
+        cursor = self.fb_con.cursor()
+        cursor.execute("""
+            SELECT RDB$GENERATOR_NAME
+            FROM RDB$GENERATORS
+            WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
+              AND RDB$GENERATOR_NAME NOT STARTING WITH 'RDB$'
+              AND RDB$GENERATOR_NAME NOT STARTING WITH 'MON$';
+        """)
+        names = [row[0].strip() for row in cursor.fetchall()]
+        items_fb = []
+        items_pg = []
+        for name in names:
+            curr_val = 0
+            try:
+                cursor.execute(f"SELECT GEN_ID({name}, 0) FROM RDB$DATABASE;")
+                row = cursor.fetchone()
+                if row and row[0] is not None:
+                    curr_val = int(row[0])
+            except Exception:
+                pass
+            items_fb.append(f"CREATE SEQUENCE {name};\nSET GENERATOR {name} TO {curr_val};")
+            if curr_val > 0:
+                items_pg.append(f'CREATE SEQUENCE "{name.lower()}" START WITH {curr_val + 1};')
+            else:
+                items_pg.append(f'CREATE SEQUENCE "{name.lower()}";')
+
+        _ensure_parent_dir(out_file)
+        _ensure_parent_dir(conv_file)
+
+        with open(out_file, 'w', encoding='utf-8') as f:
+            f.write(self._dump_header("FIREBIRD GENERATORS"))
+            for stmt in items_fb:
+                f.write(f"{stmt}\n\n")
+
+        with open(conv_file, 'w', encoding='utf-8') as f:
+            f.write(self._dump_header("POSTGRESQL SEQUENCES"))
+            for stmt in items_pg:
+                f.write(f"{stmt}\n")
 
     def export_firebird_domains(self, output_file: str = None,
                                 converted_file: str = None):

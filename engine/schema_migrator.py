@@ -1,6 +1,6 @@
 import logging
 import psycopg2
-from models import Table
+from models import Table, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +15,7 @@ class SchemaMigrator:
         self.pg_con = pg_con
 
     @staticmethod
-    def _drop_tables_and_sequences(cursor, table_objs: list[Table]):
+    def _drop_tables_and_sequences(cursor, table_objs: list[Table], sequences: list[Sequence] = None):
         """
         Drops migrated tables (CASCADE also removes their constraints, indexes, triggers
         and dependent views) and sequences. Domains are NOT dropped here, because the
@@ -26,14 +26,21 @@ class SchemaMigrator:
             logger.debug(drop_query)
             cursor.execute(drop_query)
 
+        seq_names = set()
+        if sequences:
+            for s in sequences:
+                seq_names.add(s.pg_name)
         for table in table_objs:
             for col in table.columns:
                 if col.sequence_name:
-                    drop_seq_query = f'DROP SEQUENCE IF EXISTS "{col.sequence_name}" CASCADE;'
-                    logger.debug(drop_seq_query)
-                    cursor.execute(drop_seq_query)
+                    seq_names.add(col.sequence_name)
 
-    def drop_schema(self, table_objs: list[Table]):
+        for seq_name in sorted(seq_names):
+            drop_seq_query = f'DROP SEQUENCE IF EXISTS "{seq_name}" CASCADE;'
+            logger.debug(drop_seq_query)
+            cursor.execute(drop_seq_query)
+
+    def drop_schema(self, table_objs: list[Table], sequences: list[Sequence] = None):
         """
         Drops all migrated objects (tables, sequences and domains) from PostgreSQL,
         so that a re-run always rebuilds the current Firebird schema from scratch.
@@ -44,7 +51,7 @@ class SchemaMigrator:
         logger.info("Dropping existing tables, sequences, and domains in PostgreSQL...")
         cursor = self.pg_con.cursor()
 
-        self._drop_tables_and_sequences(cursor, table_objs)
+        self._drop_tables_and_sequences(cursor, table_objs, sequences)
 
         # Drop every domain in the current schema (covers orphaned variants left by earlier
         # migration runs). Schema-qualify the DROP: unqualified names that match a pg_catalog
@@ -63,7 +70,7 @@ class SchemaMigrator:
         self.pg_con.commit()
         logger.info("Existing schema teardown completed.")
 
-    def create_tables(self, table_objs: list[Table]):
+    def create_tables(self, table_objs: list[Table], sequences: list[Sequence] = None):
         """
         Creates base tables and sequences in PostgreSQL without indexes or constraints.
         This enables optimal bulk data loading performance.
@@ -73,12 +80,24 @@ class SchemaMigrator:
 
         # Teardown of tables/sequences only - domains must already exist (STEP 3), since the
         # tables created here reference them
-        self._drop_tables_and_sequences(cursor, table_objs)
+        self._drop_tables_and_sequences(cursor, table_objs, sequences)
+
+        created_seqs = set()
+        if sequences:
+            for seq in sequences:
+                if seq.pg_name not in created_seqs:
+                    query = seq.get_create_sequence_query()
+                    logger.debug(query)
+                    cursor.execute(query)
+                    created_seqs.add(seq.pg_name)
 
         for table in table_objs:
-            for seq_query in table.get_sequence_queries():
-                logger.debug(seq_query)
-                cursor.execute(seq_query)
+            for col in table.columns:
+                if col.sequence_name and col.sequence_name not in created_seqs:
+                    query = f'CREATE SEQUENCE "{col.sequence_name}";'
+                    logger.debug(query)
+                    cursor.execute(query)
+                    created_seqs.add(col.sequence_name)
 
         for table in table_objs:
             create_query = table.get_create_table_query()
@@ -135,11 +154,11 @@ class SchemaMigrator:
             except (psycopg2.Error, OSError):
                 pass
 
-    def migrate_schema(self, table_objs: list[Table]):
+    def migrate_schema(self, table_objs: list[Table], sequences: list[Sequence] = None):
         """
         Convenience method executing both table creation and constraints/indexes creation.
         """
-        self.create_tables(table_objs)
+        self.create_tables(table_objs, sequences)
         self.create_constraints_and_indexes(table_objs)
 
     def analyze_tables(self, table_objs: list[Table] = None):

@@ -20,6 +20,9 @@ class DumpFiles:
     VIEWS_PG:      str = 'postgres_views_dump.sql'
     DOMAINS_FB:    str = 'firebird_domains_dump.sql'
     DOMAINS_PG:    str = 'postgres_domains_dump.sql'
+    GENERATORS_FB: str = 'firebird_generators_dump.sql'
+    SEQUENCES_PG:  str = 'postgres_sequences_dump.sql'
+
 
 
 def get_dump_path(filename: str, dump_dir: str = None) -> str:

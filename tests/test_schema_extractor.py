@@ -88,6 +88,38 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
         )
 
 
+    def test_extract_sequences_standalone_and_current_values(self):
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [
+            ("GEN_CLIENTES_ID   ",),
+            ("GEN_TATENDIMENTOS_APAC_ID   ",),
+            ("GEN_TPROCS_ATENDIMENTO_APAC_ID",),
+        ]
+        mock_cursor.fetchone.side_effect = [
+            (50,),
+            (120,),
+            (0,),
+        ]
+
+        sequences = SchemaExtractor._extract_sequences(mock_cursor)
+        self.assertEqual(len(sequences), 3)
+
+        self.assertEqual(sequences[0].name, "GEN_CLIENTES_ID")
+        self.assertEqual(sequences[0].pg_name, "gen_clientes_id")
+        self.assertEqual(sequences[0].current_value, 50)
+        self.assertEqual(sequences[0].get_create_sequence_query(), 'CREATE SEQUENCE "gen_clientes_id" START WITH 51;')
+
+        self.assertEqual(sequences[1].name, "GEN_TATENDIMENTOS_APAC_ID")
+        self.assertEqual(sequences[1].pg_name, "gen_tatendimentos_apac_id")
+        self.assertEqual(sequences[1].current_value, 120)
+        self.assertEqual(sequences[1].get_create_sequence_query(), 'CREATE SEQUENCE "gen_tatendimentos_apac_id" START WITH 121;')
+
+        self.assertEqual(sequences[2].name, "GEN_TPROCS_ATENDIMENTO_APAC_ID")
+        self.assertEqual(sequences[2].pg_name, "gen_tprocs_atendimento_apac_id")
+        self.assertEqual(sequences[2].current_value, 0)
+        self.assertEqual(sequences[2].get_create_sequence_query(), 'CREATE SEQUENCE "gen_tprocs_atendimento_apac_id";')
+
+
 if __name__ == '__main__':
     unittest.main()
 
