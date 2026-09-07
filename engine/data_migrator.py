@@ -206,10 +206,24 @@ class DataMigrator:
 
             logger.info("Synchronizing sequences...")
             seq_to_targets: dict[str, list[tuple[str, str]]] = {}
+            identity_targets: list[tuple[str, str]] = []
             for table in table_objs:
                 for col in table.columns:
-                    if col.sequence_name:
+                    if col.identity_type:
+                        identity_targets.append((table.pg_name, col.pg_name))
+                    elif col.sequence_name:
                         seq_to_targets.setdefault(col.sequence_name, []).append((table.pg_name, col.pg_name))
+
+            for tbl, col in identity_targets:
+                sync_query = f"""
+                    SELECT setval(
+                        pg_get_serial_sequence('{pg_quote_ident(tbl)}', '{col}'),
+                        COALESCE((SELECT MAX({pg_quote_ident(col)}) FROM {pg_quote_ident(tbl)}), 1),
+                        (SELECT MAX({pg_quote_ident(col)}) IS NOT NULL FROM {pg_quote_ident(tbl)})
+                    );
+                """
+                logger.debug(sync_query.strip())
+                pg_cur.execute(sync_query)
 
             for seq_name, targets in seq_to_targets.items():
                 max_selects = ", ".join(f'(SELECT MAX({pg_quote_ident(col)}) FROM {pg_quote_ident(tbl)})' for tbl, col in targets)

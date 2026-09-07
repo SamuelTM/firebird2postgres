@@ -405,6 +405,7 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
 
     def test_extract_columns_raises_typeerror_on_unsupported_type(self):
         mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = None  # No RDB$IDENTITY_TYPE
         # Row format: FIELD_NAME, FIELD_TYPE, FIELD_SUB_TYPE, FIELD_LENGTH, NULL_FLAG, PRECISION, SCALE, DEFAULT_SOURCE, DOMAIN_DEFAULT, FIELD_SOURCE, COMPUTED_SOURCE
         mock_cursor.fetchall.return_value = [
             ("COL_WEIRD", 999, None, 10, None, None, None, None, None, "RDB$999", None)
@@ -412,6 +413,29 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
         with self.assertRaises(TypeError) as cm:
             SchemaExtractor._extract_columns(mock_cursor, "TAB_TEST", relation_names=set(), domain_map={})
         self.assertIn("Unsupported or unrecognized Firebird data type", str(cm.exception))
+
+    def test_extract_columns_with_identity(self):
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = (1,)  # Has RDB$IDENTITY_TYPE
+        # Row format: ..., COMPUTED_SOURCE, IDENTITY_FLAG (1 = BY DEFAULT)
+        mock_cursor.fetchall.return_value = [
+            ("ID", 16, None, 8, 1, 0, 0, None, None, "RDB$1", None, 1)
+        ]
+        cols = SchemaExtractor._extract_columns(mock_cursor, "TAB_ID", relation_names=set(), domain_map={})
+        self.assertEqual(len(cols), 1)
+        self.assertEqual(cols[0].identity_type, 'BY DEFAULT')
+
+    def test_extract_sequences_reads_increment(self):
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = (100,)
+        mock_cursor.fetchall.return_value = [
+            ("GEN_CUSTOM", 5)
+        ]
+        seqs = SchemaExtractor._extract_sequences(mock_cursor)
+        self.assertEqual(len(seqs), 1)
+        self.assertEqual(seqs[0].name, "GEN_CUSTOM")
+        self.assertEqual(seqs[0].current_value, 100)
+        self.assertEqual(seqs[0].increment, 5)
 
 
 if __name__ == '__main__':

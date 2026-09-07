@@ -1,6 +1,7 @@
 class Column:
     def __init__(self, name: str, column_type: str, nullable: bool, default_value: str = None,
-                 sequence_name: str = None, domain_name: str = None, computed_source: str = None):
+                 sequence_name: str = None, domain_name: str = None, computed_source: str = None,
+                 identity_type: str = None):
         self.name = name
         self.column_type = column_type
         self.nullable = nullable
@@ -10,6 +11,7 @@ class Column:
         self.sequence_name = sequence_name.lower() if sequence_name else None
         self.domain_name = domain_name
         self.computed_source = computed_source.strip() if computed_source else None
+        self.identity_type = identity_type.upper() if identity_type else None
 
     @property
     def pg_name(self) -> str:
@@ -119,7 +121,7 @@ class Table:
         Returns a list of CREATE SEQUENCE statements for all identity/generator columns.
         """
         return [f'CREATE SEQUENCE {pg_quote_ident(col.sequence_name)};'
-                for col in self.columns if col.sequence_name]
+                for col in self.columns if col.sequence_name and not col.identity_type]
 
     def get_create_table_query(self) -> str:
         """
@@ -138,7 +140,9 @@ class Table:
                 col_def = f'{escaped_name} {type_decl}'
 
             if not col.computed_source:
-                if col.sequence_name:
+                if col.identity_type:
+                    col_def += f' GENERATED {col.identity_type} AS IDENTITY'
+                elif col.sequence_name:
                     nextval_literal = pg_quote_ident(col.sequence_name).replace("'", "''")
                     col_def += f" DEFAULT nextval('{nextval_literal}')"
                 elif col.default_value:
@@ -299,9 +303,10 @@ class Table:
 
 
 class Sequence:
-    def __init__(self, name: str, current_value: int = 0):
+    def __init__(self, name: str, current_value: int = 0, increment: int = 1):
         self.name = name.strip()
         self.current_value = current_value
+        self.increment = increment or 1
 
     @property
     def pg_name(self) -> str:
@@ -310,12 +315,18 @@ class Sequence:
     def get_create_sequence_query(self) -> str:
         if self.current_value is None:
             raise ValueError(f"Cannot generate CREATE SEQUENCE for sequence '{self.name}': current_value is unknown (None)")
-        start_val = self.current_value + 1
+        start_val = self.current_value + self.increment
         esc_name = pg_quote_ident(self.pg_name)
+        clauses = []
+        if self.increment != 1:
+            clauses.append(f"INCREMENT BY {self.increment}")
         if start_val < 1:
-            return f'CREATE SEQUENCE {esc_name} MINVALUE -9223372036854775807 START WITH {start_val};'
-        if start_val != 1:
-            return f'CREATE SEQUENCE {esc_name} START WITH {start_val};'
+            clauses.append(f"MINVALUE -9223372036854775807 START WITH {start_val}")
+        elif start_val != 1:
+            clauses.append(f"START WITH {start_val}")
+
+        if clauses:
+            return f'CREATE SEQUENCE {esc_name} {" ".join(clauses)};'
         return f'CREATE SEQUENCE {esc_name};'
 
     def get_drop_sequence_query(self) -> str:

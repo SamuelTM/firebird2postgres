@@ -79,19 +79,35 @@ class SchemaExtractor:
         """
         Extracts all columns for a given table, resolving types and domain mappings.
         """
-        cursor.execute("""
-            SELECT rf.RDB$FIELD_NAME, f.RDB$FIELD_TYPE, f.RDB$FIELD_SUB_TYPE,
-                   COALESCE(f.RDB$CHARACTER_LENGTH, f.RDB$FIELD_LENGTH),
-                   COALESCE(rf.RDB$NULL_FLAG, f.RDB$NULL_FLAG),
-                   f.RDB$FIELD_PRECISION, f.RDB$FIELD_SCALE,
-                   rf.RDB$DEFAULT_SOURCE, f.RDB$DEFAULT_SOURCE,
-                   rf.RDB$FIELD_SOURCE, f.RDB$COMPUTED_SOURCE
-            FROM RDB$RELATION_FIELDS rf
-            JOIN RDB$FIELDS f ON rf.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
-            WHERE rf.RDB$RELATION_NAME = ?
-            ORDER BY rf.RDB$FIELD_POSITION;
-        """, (table_name,))
-        raw_rows = cursor.fetchall()
+        try:
+            cursor.execute("""
+                SELECT rf.RDB$FIELD_NAME, f.RDB$FIELD_TYPE, f.RDB$FIELD_SUB_TYPE,
+                       COALESCE(f.RDB$CHARACTER_LENGTH, f.RDB$FIELD_LENGTH),
+                       COALESCE(rf.RDB$NULL_FLAG, f.RDB$NULL_FLAG),
+                       f.RDB$FIELD_PRECISION, f.RDB$FIELD_SCALE,
+                       rf.RDB$DEFAULT_SOURCE, f.RDB$DEFAULT_SOURCE,
+                       rf.RDB$FIELD_SOURCE, f.RDB$COMPUTED_SOURCE,
+                       rf.RDB$IDENTITY_TYPE
+                FROM RDB$RELATION_FIELDS rf
+                JOIN RDB$FIELDS f ON rf.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
+                WHERE rf.RDB$RELATION_NAME = ?
+                ORDER BY rf.RDB$FIELD_POSITION;
+            """, (table_name,))
+            raw_rows = cursor.fetchall()
+        except Exception:
+            cursor.execute("""
+                SELECT rf.RDB$FIELD_NAME, f.RDB$FIELD_TYPE, f.RDB$FIELD_SUB_TYPE,
+                       COALESCE(f.RDB$CHARACTER_LENGTH, f.RDB$FIELD_LENGTH),
+                       COALESCE(rf.RDB$NULL_FLAG, f.RDB$NULL_FLAG),
+                       f.RDB$FIELD_PRECISION, f.RDB$FIELD_SCALE,
+                       rf.RDB$DEFAULT_SOURCE, f.RDB$DEFAULT_SOURCE,
+                       rf.RDB$FIELD_SOURCE, f.RDB$COMPUTED_SOURCE
+                FROM RDB$RELATION_FIELDS rf
+                JOIN RDB$FIELDS f ON rf.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
+                WHERE rf.RDB$RELATION_NAME = ?
+                ORDER BY rf.RDB$FIELD_POSITION;
+            """, (table_name,))
+            raw_rows = cursor.fetchall()
         symbols = {
             row[0].strip().lower(): resolve_firebird_type(
                 field_type=row[1],
@@ -144,6 +160,11 @@ class SchemaExtractor:
             if default_value:
                 default_value = FirebirdToPostgresVisitor.transpile_default_clause(default_value, symbols=symbols)
 
+            identity_flag = column[11] if len(column) > 11 else None
+            identity_type = None
+            if identity_flag is not None:
+                identity_type = 'ALWAYS' if identity_flag == 0 else 'BY DEFAULT'
+
             columns.append(
                 Column(
                     name=column_name,
@@ -152,6 +173,7 @@ class SchemaExtractor:
                     default_value=default_value,
                     domain_name=domain_name,
                     computed_source=computed_source,
+                    identity_type=identity_type,
                 )
             )
 
@@ -434,26 +456,38 @@ class SchemaExtractor:
     @staticmethod
     def _extract_sequences(cursor) -> list[Sequence]:
         """
-        Queries all user-defined generators from RDB$GENERATORS and reads their current values.
+        Queries all user-defined generators from RDB$GENERATORS and reads their current values and increments.
         """
-        cursor.execute("""
-            SELECT RDB$GENERATOR_NAME
-            FROM RDB$GENERATORS
-            WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
-              AND RDB$GENERATOR_NAME NOT STARTING WITH 'RDB$'
-              AND RDB$GENERATOR_NAME NOT STARTING WITH 'MON$';
-        """)
-        seq_names = [row[0].strip() for row in cursor.fetchall()]
+        try:
+            cursor.execute("""
+                SELECT RDB$GENERATOR_NAME, COALESCE(RDB$GENERATOR_INCREMENT, 1)
+                FROM RDB$GENERATORS
+                WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
+                  AND RDB$GENERATOR_NAME NOT STARTING WITH 'RDB$'
+                  AND RDB$GENERATOR_NAME NOT STARTING WITH 'MON$';
+            """)
+            seq_rows = cursor.fetchall()
+        except Exception:
+            cursor.execute("""
+                SELECT RDB$GENERATOR_NAME, 1
+                FROM RDB$GENERATORS
+                WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
+                  AND RDB$GENERATOR_NAME NOT STARTING WITH 'RDB$'
+                  AND RDB$GENERATOR_NAME NOT STARTING WITH 'MON$';
+            """)
+            seq_rows = cursor.fetchall()
         sequences = []
-        for name in seq_names:
+        for row in seq_rows:
+            name = row[0].strip()
+            increment = int(row[1]) if len(row) > 1 and row[1] is not None else 1
             safe_name = name.replace('"', '""')
             try:
                 cursor.execute(f'SELECT GEN_ID("{safe_name}", 0) FROM RDB$DATABASE;')
-                row = cursor.fetchone()
-                if not row or row[0] is None:
+                r = cursor.fetchone()
+                if not r or r[0] is None:
                     raise RuntimeError(f"Failed to read current value for generator '{name}': no value returned")
-                curr_val = int(row[0])
+                curr_val = int(r[0])
             except Exception as e:
                 raise RuntimeError(f"Failed to read current value for generator '{name}': {e}") from e
-            sequences.append(Sequence(name=name, current_value=curr_val))
+            sequences.append(Sequence(name=name, current_value=curr_val, increment=increment))
         return sequences

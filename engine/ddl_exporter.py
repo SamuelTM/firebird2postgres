@@ -458,30 +458,42 @@ class DdlExporter:
         out_file = output_file or get_dump_path(DumpFiles.GENERATORS_FB)
         conv_file = converted_file or get_dump_path(DumpFiles.SEQUENCES_PG)
 
-        cursor = self.fb_con.cursor()
-        cursor.execute("""
-            SELECT RDB$GENERATOR_NAME
-            FROM RDB$GENERATORS
-            WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
-              AND RDB$GENERATOR_NAME NOT STARTING WITH 'RDB$'
-              AND RDB$GENERATOR_NAME NOT STARTING WITH 'MON$';
-        """)
-        names = [row[0].strip() for row in cursor.fetchall()]
+        try:
+            cursor.execute("""
+                SELECT RDB$GENERATOR_NAME, COALESCE(RDB$GENERATOR_INCREMENT, 1)
+                FROM RDB$GENERATORS
+                WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
+                  AND RDB$GENERATOR_NAME NOT STARTING WITH 'RDB$'
+                  AND RDB$GENERATOR_NAME NOT STARTING WITH 'MON$';
+            """)
+            rows = cursor.fetchall()
+        except Exception:
+            cursor.execute("""
+                SELECT RDB$GENERATOR_NAME, 1
+                FROM RDB$GENERATORS
+                WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
+                  AND RDB$GENERATOR_NAME NOT STARTING WITH 'RDB$'
+                  AND RDB$GENERATOR_NAME NOT STARTING WITH 'MON$';
+            """)
+            rows = cursor.fetchall()
         items_fb = []
         items_pg = []
-        for name in names:
+        for row in rows:
+            name = row[0].strip()
+            increment = int(row[1]) if len(row) > 1 and row[1] is not None else 1
             safe_name = name.replace('"', '""')
             try:
                 cursor.execute(f'SELECT GEN_ID("{safe_name}", 0) FROM RDB$DATABASE;')
-                row = cursor.fetchone()
-                if not row or row[0] is None:
+                r = cursor.fetchone()
+                if not r or r[0] is None:
                     raise RuntimeError(f"Failed to read current value for generator '{name}': no value returned")
-                curr_val = int(row[0])
+                curr_val = int(r[0])
             except Exception as e:
                 raise RuntimeError(f"Failed to read current value for generator '{name}': {e}") from e
             fb_ident = name if (name.isupper() and name.isidentifier()) else f'"{safe_name}"'
-            items_fb.append(f"CREATE SEQUENCE {fb_ident};\nSET GENERATOR {fb_ident} TO {curr_val};")
-            items_pg.append(Sequence(name=name, current_value=curr_val).get_create_sequence_query())
+            inc_clause = f" INCREMENT BY {increment}" if increment != 1 else ""
+            items_fb.append(f"CREATE SEQUENCE {fb_ident}{inc_clause};\nSET GENERATOR {fb_ident} TO {curr_val};")
+            items_pg.append(Sequence(name=name, current_value=curr_val, increment=increment).get_create_sequence_query())
 
         _ensure_parent_dir(out_file)
         _ensure_parent_dir(conv_file)
