@@ -927,12 +927,21 @@ class ASTDialectRewriter(FirebirdParserVisitor):
     are performed in semantic context, leaving string literals and comments 100% untouched.
     """
 
-    def __init__(self, rewriter: TokenStreamRewriter, symbols: dict[str, str] = None, expr_map: dict[str, str] = None):
+    def __init__(self, rewriter: TokenStreamRewriter, symbols: dict[str, str] = None, expr_map: dict[str, str] = None, sequence_increments: dict[str, int] = None):
         super().__init__()
         self.rewriter = rewriter
         self.handled_qbs = set()
         self.symbols: dict[str, str] = {k.strip('":').lower(): v.upper() for k, v in symbols.items()} if symbols else {}
         self.expr_map: dict[str, str] = expr_map or {}
+        self.sequence_increments: dict[str, int] = {k.strip('":').lower(): v for k, v in sequence_increments.items()} if sequence_increments else {}
+        if symbols:
+            for k, v in symbols.items():
+                if k.lower().startswith("__seq_inc__"):
+                    seq = k.lower().replace("__seq_inc__", "").strip('":')
+                    try:
+                        self.sequence_increments[seq] = int(v)
+                    except (ValueError, TypeError):
+                        pass
         self.is_trigger = False
         self.trigger_return = "RETURN NEW"
 
@@ -1061,18 +1070,26 @@ class ASTDialectRewriter(FirebirdParserVisitor):
         if fn_name == 'GEN_ID' and len(args) >= 2:
             raw_seq = args[0].getText()
             seq_target, quoted_seq, clean_seq = self._normalize_sequence_target(raw_seq)
-            step = args[1].getText().strip()
-            if step == '1':
+            step = self._get_tokens_text(args[1]).strip()
+            seq_inc = self.sequence_increments.get(clean_seq.lower(), 1)
+
+            if step == str(seq_inc):
                 self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"nextval('{seq_target}')")
             elif step == '0':
+                dec_expr = f"{seq_inc}" if seq_inc >= 0 else f"({seq_inc})"
                 self.rewriter.replaceRangeTokens(
                     ctx.start, ctx.stop,
-                    f"(SELECT CASE WHEN is_called THEN last_value ELSE last_value - 1 END FROM {quoted_seq})"
+                    f"(SELECT CASE WHEN is_called THEN last_value ELSE last_value - {dec_expr} END FROM {quoted_seq})"
+                )
+            elif step == '1' and seq_inc != 1:
+                raise ValueError(
+                    f"Cannot transpile GEN_ID for sequence '{clean_seq}' with step '{step}': "
+                    f"sequence configured increment is {seq_inc}. PostgreSQL nextval only advances by the configured sequence increment."
                 )
             else:
                 raise ValueError(
-                    f"Unsupported GEN_ID step '{step}' for sequence '{clean_seq}'. "
-                    f"PostgreSQL sequences only support atomic step 1 (nextval) and step 0 (current state inspection)."
+                    f"Unsupported GEN_ID step '{step}' for sequence '{clean_seq}' (configured increment: {seq_inc}). "
+                    f"PostgreSQL sequences only support advancing by configured increment {seq_inc} (nextval) and step 0 (current state inspection)."
                 )
         elif fn_name == 'IIF' and len(args) == 3:
             cond_str = self._get_tokens_text(args[0]).strip()
@@ -1570,7 +1587,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         return _normalize_first_skip(sql, expr_map)
 
     @classmethod
-    def transpile(cls, firebird_sql_string: str, symbols: dict[str, str] = None, domain_map: dict[str, str] = None) -> str:
+    def transpile(cls, firebird_sql_string: str, symbols: dict[str, str] = None, domain_map: dict[str, str] = None, sequence_increments: dict[str, int] = None) -> str:
         """
         Parses Firebird SQL using Two-Stage Parsing (SLL -> LL), traverses the AST with the visitor,
         and applies dialect token rewriting to produce clean PostgreSQL SQL.
@@ -1620,7 +1637,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         rewriter = TokenStreamRewriter(stream)
 
         # Pass 1: Semantic token rewriting on AST
-        dialect_rewriter = ASTDialectRewriter(rewriter, symbols=symbols, expr_map=expr_map)
+        dialect_rewriter = ASTDialectRewriter(rewriter, symbols=symbols, expr_map=expr_map, sequence_increments=sequence_increments)
         dialect_rewriter.visit(tree)
 
         # Pass 2: High-level PL/pgSQL structure visitor
@@ -1633,7 +1650,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         return pg_sql
 
     @classmethod
-    def transpile_expression(cls, expr: str, symbols: dict[str, str] = None) -> str:
+    def transpile_expression(cls, expr: str, symbols: dict[str, str] = None, sequence_increments: dict[str, int] = None) -> str:
         """
         Transpiles a standalone Firebird SQL scalar expression (e.g. computed column, expression index)
         to PostgreSQL SQL, rewriting built-ins like IIF, DATEADD, DATEDIFF, LIST, GEN_ID.
@@ -1643,7 +1660,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         expr_clean = expr.strip()
         dummy_sql = f'CREATE VIEW "__v__" AS SELECT {expr_clean} FROM RDB$DATABASE;'
         try:
-            view_sql = cls.transpile(dummy_sql, symbols=symbols)
+            view_sql = cls.transpile(dummy_sql, symbols=symbols, sequence_increments=sequence_increments)
             m = re.search(r'AS\s+SELECT\s+(.*)\s*;?$', view_sql, re.IGNORECASE | re.DOTALL)
             if m:
                 return m.group(1).strip().rstrip(';').strip()

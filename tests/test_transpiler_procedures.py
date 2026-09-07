@@ -138,6 +138,27 @@ class TestTranspilerProcedures(unittest.TestCase):
                 FirebirdToPostgresVisitor.transpile(f"CREATE PROCEDURE P AS BEGIN DUMMY = GEN_ID(GEN_PEDIDOS, {invalid_step}); END;")
             self.assertIn("Unsupported GEN_ID step", str(cm.exception))
 
+    def test_gen_id_with_configured_sequence_increment(self):
+        fb_step10 = "CREATE PROCEDURE P AS BEGIN DUMMY = GEN_ID(GEN_STEP10, 10); END;"
+        pg_step10 = FirebirdToPostgresVisitor.transpile(fb_step10, sequence_increments={'gen_step10': 10})
+        self.assertIn("nextval('GEN_STEP10')", pg_step10)
+
+        # GEN_ID(G, 1) when sequence increment is 10 must be rejected
+        fb_step1_mismatch = "CREATE PROCEDURE P AS BEGIN DUMMY = GEN_ID(GEN_STEP10, 1); END;"
+        with self.assertRaises(ValueError) as cm:
+            FirebirdToPostgresVisitor.transpile(fb_step1_mismatch, sequence_increments={'gen_step10': 10})
+        self.assertIn("sequence configured increment is 10", str(cm.exception))
+
+        # GEN_ID(G, 0) with increment 10
+        fb_step0_inc10 = "CREATE PROCEDURE P AS BEGIN DUMMY = GEN_ID(GEN_STEP10, 0); END;"
+        pg_step0_inc10 = FirebirdToPostgresVisitor.transpile(fb_step0_inc10, sequence_increments={'gen_step10': 10})
+        self.assertIn("last_value - 10", pg_step0_inc10)
+
+        # GEN_ID(G, 0) with negative increment -2
+        fb_step0_neg = "CREATE PROCEDURE P AS BEGIN DUMMY = GEN_ID(GEN_DESC, 0); END;"
+        pg_step0_neg = FirebirdToPostgresVisitor.transpile(fb_step0_neg, sequence_increments={'gen_desc': -2})
+        self.assertIn("last_value - (-2)", pg_step0_neg)
+
     def test_gen_id_with_quoted_sequence_name(self):
         fb_sql = """
         CREATE PROCEDURE P AS

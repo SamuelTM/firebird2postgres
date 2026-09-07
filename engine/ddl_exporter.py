@@ -25,17 +25,25 @@ def _ensure_parent_dir(file_path: str):
 
 def _transpile_worker(item: tuple) -> tuple[str | None, str | None]:
     """
-    Worker function for multiprocessing pool.
-    Takes (item_name, fb_sql), (item_name, fb_sql, transpile_sql), (item_name, fb_sql, transpile_sql, domain_map),
-    or (item_name, fb_sql, transpile_sql, domain_map, symbols)
+    Worker function executed in worker processes.
+    Tuple may be (item_name, fb_sql), (item_name, fb_sql, transpile_sql),
+    (item_name, fb_sql, transpile_sql, domain_map),
+    (item_name, fb_sql, transpile_sql, domain_map, symbols),
+    or (item_name, fb_sql, transpile_sql, domain_map, symbols, sequence_increments)
     and returns (pg_sql, error_msg).
     Avoids returning fb_sql across IPC to minimize pickle overhead.
     """
     sql_to_transpile = item[2] if len(item) > 2 and item[2] is not None else item[1]
     domain_map = item[3] if len(item) > 3 else None
     symbols = item[4] if len(item) > 4 else None
+    sequence_increments = item[5] if len(item) > 5 else None
     try:
-        pg_sql = FirebirdToPostgresVisitor.transpile(sql_to_transpile, domain_map=domain_map, symbols=symbols)
+        pg_sql = FirebirdToPostgresVisitor.transpile(
+            sql_to_transpile,
+            domain_map=domain_map,
+            symbols=symbols,
+            sequence_increments=sequence_increments
+        )
         return pg_sql, None
     except Exception as e:
         return None, str(e)
@@ -194,6 +202,7 @@ class DdlExporter:
         procedures = fb_cursor.fetchall()
 
         domain_map = self._fetch_domain_map(fb_cursor)
+        seq_increments = self._fetch_all_sequence_increments(fb_cursor)
 
         items = []
         for proc in procedures:
@@ -202,7 +211,7 @@ class DdlExporter:
 
             input_params, output_params = self._fetch_procedure_parameters(fb_cursor, proc_name, domain_map=domain_map)
             fb_sql = self._format_procedure_firebird_ddl(proc_name, input_params, output_params, source)
-            items.append((proc_name, fb_sql, fb_sql, domain_map))
+            items.append((proc_name, fb_sql, fb_sql, domain_map, None, seq_increments))
 
         self._export_transpiled_ddl(
             items,
@@ -356,6 +365,7 @@ class DdlExporter:
 
         symbols = self._fetch_all_column_symbols(fb_cursor)
         domain_map = self._fetch_domain_map(fb_cursor)
+        seq_increments = self._fetch_all_sequence_increments(fb_cursor)
 
         view_map = {}
         for view in views:
@@ -363,7 +373,7 @@ class DdlExporter:
             source = view[1]
             col_names = self._fetch_view_columns(fb_cursor, view_name)
             fb_sql = self._format_view_firebird_ddl(view_name, col_names, source)
-            view_map[view_name] = (view_name, fb_sql, None, domain_map, symbols)
+            view_map[view_name] = (view_name, fb_sql, None, domain_map, symbols, seq_increments)
 
         ordered_names = self._resolve_view_dependency_order(fb_cursor, set(view_map.keys()))
         items = [view_map[name] for name in ordered_names if name in view_map]
@@ -448,6 +458,25 @@ class DdlExporter:
         except Exception as e:
             logger.warning("Failed to fetch column symbols for DDL export: %s", e)
         return symbols
+
+    @staticmethod
+    def _fetch_all_sequence_increments(cursor) -> dict[str, int]:
+        query = """
+            SELECT TRIM(RDB$GENERATOR_NAME), COALESCE(RDB$GENERATOR_INCREMENT, 1)
+            FROM RDB$GENERATORS
+            WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
+              AND RDB$GENERATOR_NAME NOT STARTING WITH 'RDB$'
+              AND RDB$GENERATOR_NAME NOT STARTING WITH 'MON$';
+        """
+        increments = {}
+        try:
+            cursor.execute(query)
+            for row in cursor.fetchall():
+                if row[0]:
+                    increments[row[0].strip().lower()] = int(row[1]) if row[1] is not None else 1
+        except Exception as e:
+            logger.warning("Failed to fetch sequence increments: %s", e)
+        return increments
 
     @staticmethod
     def _format_view_firebird_ddl(view_name: str, col_names: list[str], source: str) -> str:
