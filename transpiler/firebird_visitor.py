@@ -1668,9 +1668,9 @@ class _CollectingErrorListener(ErrorListener):
 
 _SAFE_PROC_CALLS = {
     'if', 'while', 'loop', 'for', 'in', 'case', 'when', 'then', 'else', 'end',
-    'select', 'from', 'where', 'into', 'values', 'set', 'join', 'on',
+    'select', 'from', 'where', 'into', 'values', 'set', 'join', 'on', 'using',
     'group', 'by', 'having', 'order', 'limit', 'offset', 'exists', 'between',
-    'like', 'similar', 'not', 'and', 'or', 'is', 'null',
+    'like', 'similar', 'not', 'and', 'or', 'is', 'null', 'over', 'filter', 'row', 'check',
     'raise', 'format', 'return', 'exit', 'continue', 'declare', 'begin',
     'coalesce', 'nullif', 'iif', 'greatest', 'least',
     'abs', 'round', 'ceil', 'ceiling', 'floor', 'trunc', 'sign', 'power', 'sqrt', 'mod', 'exp', 'ln', 'log',
@@ -1686,8 +1686,7 @@ _SAFE_PROC_CALLS = {
     'quote_ident', 'quote_literal', 'quote_nullable',
     'varchar', 'char', 'numeric', 'decimal', 'float', 'double', 'int', 'integer',
     'smallint', 'bigint', 'timestamp', 'date', 'time', 'boolean', 'text', 'bytea',
-    'interval', 'blob', 'clob', 'precision',
-    'nextval', 'gen_id', 'setval', 'currval'
+    'interval', 'blob', 'clob', 'precision'
 }
 
 
@@ -1969,29 +1968,50 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         return False
 
     @staticmethod
-    def _classify_procedure_volatility(body_str: str, decl_str: str = "") -> tuple[str, list[str]]:
+    def _strip_sql_comments_and_strings(sql: str) -> str:
         """
-        Analyzes transpiled PL/pgSQL procedure body and declarations to determine volatility.
+        Strips comments and replaces string literal contents with empty quotes in a single pass.
+        This prevents strings containing '--' or '/*' from hiding or swallowing code,
+        and prevents comments containing DML or function calls from triggering false positives.
+        """
+        pattern = re.compile(
+            r"('(?:''|[^'])*')"    # Group 1: string literal -> replace with "''"
+            r"|(--[^\r\n]*)"       # Group 2: line comment -> replace with ' '
+            r"|(/\*[\s\S]*?\*/)",  # Group 3: block comment -> replace with ' '
+            re.MULTILINE
+        )
+        return pattern.sub(lambda m: "''" if m.group(1) is not None else " ", sql)
+
+    @staticmethod
+    def _classify_procedure_volatility(body_str: str, decl_str: str = "", params_str: str = "") -> tuple[str, list[str]]:
+        """
+        Analyzes transpiled PL/pgSQL procedure body, declarations, and parameter defaults to determine volatility.
         Returns (volatility, reasons).
 
-        Per PostgreSQL safety requirements:
-        - Default volatility is VOLATILE.
-        - Functions with DML (INSERT, UPDATE, DELETE, MERGE, TRUNCATE), procedure calls (PERFORM),
-          dynamic SQL (EXECUTE), sequence mutations (nextval, gen_id), autonomous transactions,
-          transaction control (COMMIT, ROLLBACK), volatile built-ins, or unverified external function calls
-          are classified as VOLATILE.
-        - STABLE is restricted strictly to trivial read-only bodies without side effects and without external calls.
+        Promotion Policy for STABLE:
+        - Default volatility in PostgreSQL PL/pgSQL functions is VOLATILE.
+        - Promotion to STABLE requires strictly demonstrated read-only purity:
+          1. No data modification (INSERT, UPDATE, DELETE, MERGE, TRUNCATE).
+          2. No procedure calls (PERFORM, CALL, EXECUTE PROCEDURE).
+          3. No dynamic SQL execution (EXECUTE ...).
+          4. No sequence generator access (NEXT VALUE FOR, GEN_ID, nextval, setval, currval).
+          5. No transaction control (COMMIT, ROLLBACK, AUTONOMOUS).
+          6. No volatile built-in functions (random, gen_random_uuid, clock_timestamp, timeofday).
+          7. No unverified external or qualified function calls (including delimited "Q"() and schema.q()),
+             as their dependencies and purity cannot be statically guaranteed.
+          8. Parameter defaults and local variable initializers participate in classification under these same rules.
+        - If any side effect or unverified dependency is present, the function remains VOLATILE.
         """
-        full_code = f"{decl_str}\n{body_str}" if decl_str else body_str
-        clean_code = re.sub(r'--[^\n]*', '', full_code)
-        clean_code = re.sub(r'/\*.*?\*/', '', clean_code, flags=re.DOTALL)
-        clean_code = re.sub(r"'(?:''|[^'])*'", "''", clean_code)
+        full_code = f"{params_str}\n{decl_str}\n{body_str}" if (params_str or decl_str) else body_str
+        clean_code = FirebirdToPostgresVisitor._strip_sql_comments_and_strings(full_code)
 
         side_effects = []
         if re.search(r'\b(INSERT\s+INTO|UPDATE\b|DELETE\s+FROM|DELETE\b|MERGE\s+INTO|TRUNCATE\b)\b', clean_code, re.IGNORECASE):
             side_effects.append("data modification (DML)")
         if re.search(r'\b(PERFORM|EXECUTE\s+PROCEDURE)\b', clean_code, re.IGNORECASE):
             side_effects.append("procedure call (PERFORM)")
+        elif re.search(r'\bCALL\b', clean_code, re.IGNORECASE):
+            side_effects.append("procedure call (CALL)")
         if re.search(r'\bEXECUTE\s+(?!PROCEDURE\b)', clean_code, re.IGNORECASE):
             side_effects.append("dynamic SQL / external execution")
         if re.search(r'\b(NEXT\s+VALUE\s+FOR|GEN_ID|nextval|setval|currval)\b', clean_code, re.IGNORECASE):
@@ -2001,10 +2021,28 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         if re.search(r'\b(random|gen_random_uuid|clock_timestamp|timeofday)\s*\(', clean_code, re.IGNORECASE):
             side_effects.append("volatile built-in function")
 
-        calls = re.findall(r'\b([a-zA-Z_][a-zA-Z0-9_$]*)\s*\(', clean_code)
-        unknown_calls = sorted({c for c in calls if c.lower() not in _SAFE_PROC_CALLS})
+        # Extract function calls: support unquoted, delimited ("Q"()), and qualified (schema.q()) calls.
+        call_matches = re.findall(
+            r'(?:([a-zA-Z_][a-zA-Z0-9_$]*|"[^"\r\n]+")\s*\.\s*)?'
+            r'([a-zA-Z_][a-zA-Z0-9_$]*|"[^"\r\n]+")\s*\(',
+            clean_code,
+            re.MULTILINE
+        )
+        _sequence_calls = {'nextval', 'gen_id', 'setval', 'currval'}
+        _volatile_builtin_calls = {'random', 'gen_random_uuid', 'clock_timestamp', 'timeofday'}
+        unknown_calls = set()
+        for qual, raw_name in call_matches:
+            if qual:
+                # Schema-qualified calls are external/unverified dependencies -> VOLATILE
+                unknown_calls.add(f"{qual}.{raw_name}")
+            else:
+                clean_name = raw_name.strip('"').lower()
+                if clean_name not in _SAFE_PROC_CALLS and clean_name not in _sequence_calls and clean_name not in _volatile_builtin_calls:
+                    unknown_calls.add(raw_name)
+
         if unknown_calls:
-            side_effects.append(f"external function call ({', '.join(unknown_calls)})")
+            sorted_unknown = sorted(unknown_calls)
+            side_effects.append(f"external function call ({', '.join(sorted_unknown)})")
 
         if side_effects:
             return "VOLATILE", side_effects
@@ -2075,34 +2113,22 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         else:
             return_type = "RETURNS SETOF record" if has_return_next else "RETURNS record"
 
-        # Classify volatility (STABLE vs VOLATILE) and generate optimization advisory
-        volatility, reasons = self._classify_procedure_volatility(body_str, decl_str)
-
-        clean_code = re.sub(r'--[^\n]*', '', body_str)
-        clean_code = re.sub(r'/\*.*?\*/', '', clean_code, flags=re.DOTALL)
-        clean_code = re.sub(r"'(?:''|[^'])*'", "''", clean_code)
+        # Classify volatility (STABLE vs VOLATILE) and generate volatility advisory
+        volatility, reasons = self._classify_procedure_volatility(body_str, decl_str, params_str)
 
         advisory_lines = [
-            f'-- [CLASSIFICATION & OPTIMIZATION ADVISORY]',
+            f'-- [CLASSIFICATION & VOLATILITY ADVISORY]',
             f'-- Volatility: {volatility} ({", ".join(reasons)})'
         ]
         if volatility == "STABLE":
-            is_simple_query = (
-                not decl_str
-                and not re.search(r'\b(FOR\s+SELECT|WHILE|LOOP|IF|BEGIN|EXCEPTION)\b', clean_code, re.IGNORECASE)
+            advisory_lines.append(
+                '-- Volatility note: STABLE indicates the function does not modify database state and returns '
+                'consistent results within a single statement.'
             )
-            if is_simple_query:
-                advisory_lines.append(
-                    '-- Language candidate: Pure set/query logic; evaluate converting to LANGUAGE sql '
-                    'for query inlining and optimizer pushdown.'
-                )
-            else:
-                advisory_lines.append(
-                    '-- Planner note: STABLE enables subquery memoization and optimizer caching within single statement.'
-                )
         else:
             advisory_lines.append(
-                '-- Planner note: VOLATILE functions cannot be cached across rows or inlined.'
+                '-- Volatility note: VOLATILE indicates the function may modify database state, '
+                'depend on sequence/external calls, or produce side effects across evaluations.'
             )
         advisory_str = "\n".join(advisory_lines) + "\n"
 

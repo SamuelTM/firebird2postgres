@@ -301,6 +301,108 @@ class TestIntegrationExecution(unittest.TestCase):
         rows_where = self.pg_cur.fetchall()
         self.assertEqual(rows_where, [(1, 999), (2, 100)])
 
+    @unittest.skipUnless(HAS_REAL_PG, "Live PostgreSQL instance required for real execution test")
+    def test_real_pg_volatility_classification_and_execution_semantics(self):
+        """
+        Validates Item D:
+        - Procedures with DML following string '--' are classified as VOLATILE and persist changes.
+        - Procedures with comments containing DML are classified as STABLE.
+        - Mutating procedures called by other procedures execute and persist changes under VOLATILE.
+        - Verifies PostgreSQL catalog attributes (pg_proc.provolatile).
+        """
+        if not HAS_REAL_PG or not self.pg_cur:
+            self.skipTest("Real PostgreSQL database connection not available")
+
+        # 1. Disposable fixtures
+        self.pg_cur.execute("""
+            DROP TABLE IF EXISTS reg_volatility_audit CASCADE;
+            DROP TABLE IF EXISTS reg_volatility_data CASCADE;
+            CREATE TABLE reg_volatility_audit (id SERIAL PRIMARY KEY, note TEXT);
+            CREATE TABLE reg_volatility_data (id INT PRIMARY KEY, val TEXT);
+            INSERT INTO reg_volatility_data (id, val) VALUES (1, 'initial');
+        """)
+
+        # 2. Case 1: String '--' followed by INSERT -> VOLATILE, executes and writes data
+        fb_dash = """
+        CREATE OR ALTER PROCEDURE SP_VOL_STR_DASH (MSG VARCHAR(50))
+        AS
+        DECLARE VARIABLE V_TEMP VARCHAR(50);
+        BEGIN
+            V_TEMP = '--';
+            INSERT INTO REG_VOLATILITY_AUDIT (NOTE) VALUES (:MSG);
+        END;
+        """
+        pg_dash = FirebirdToPostgresVisitor.transpile(fb_dash)
+        self.assertIn("LANGUAGE plpgsql VOLATILE;", pg_dash)
+        self.pg_cur.execute(pg_dash)
+
+        # Check pg_proc catalog: 'v' = VOLATILE
+        self.pg_cur.execute("SELECT provolatile FROM pg_proc WHERE proname = 'sp_vol_str_dash';")
+        self.assertEqual(self.pg_cur.fetchone()[0], 'v')
+
+        # Execute write and confirm row inserted
+        self.pg_cur.execute('SELECT "sp_vol_str_dash"(\'inserted_via_dash\');')
+        self.pg_cur.execute("SELECT note FROM reg_volatility_audit WHERE note = 'inserted_via_dash';")
+        self.assertEqual(self.pg_cur.fetchone()[0], 'inserted_via_dash')
+
+        # 3. Case 2: Read-only query with comment containing DML -> STABLE ('s')
+        fb_readonly = """
+        CREATE OR ALTER PROCEDURE SP_VOL_READONLY (P_ID INTEGER)
+        RETURNS (VAL TEXT)
+        AS
+        BEGIN
+            -- INSERT INTO REG_VOLATILITY_AUDIT (NOTE) VALUES ('should_not_run');
+            /* UPDATE REG_VOLATILITY_DATA SET VAL = 'broken'; */
+            SELECT VAL FROM REG_VOLATILITY_DATA WHERE ID = :P_ID INTO :VAL;
+            SUSPEND;
+        END;
+        """
+        pg_readonly = FirebirdToPostgresVisitor.transpile(fb_readonly)
+        self.assertIn("LANGUAGE plpgsql STABLE;", pg_readonly)
+        self.pg_cur.execute(pg_readonly)
+
+        # Check pg_proc catalog: 's' = STABLE
+        self.pg_cur.execute("SELECT provolatile FROM pg_proc WHERE proname = 'sp_vol_readonly';")
+        self.assertEqual(self.pg_cur.fetchone()[0], 's')
+
+        # Execute read and verify output and that no DML occurred
+        self.pg_cur.execute('SELECT "val" FROM "sp_vol_readonly"(1);')
+        self.assertEqual(self.pg_cur.fetchone()[0], 'initial')
+        self.pg_cur.execute("SELECT COUNT(*) FROM reg_volatility_audit WHERE note = 'should_not_run';")
+        self.assertEqual(self.pg_cur.fetchone()[0], 0)
+
+        # 4. Case 3: Mutating procedure calling another modifying procedure -> VOLATILE
+        fb_mutate = """
+        CREATE OR ALTER PROCEDURE SP_VOL_MUTATE (P_ID INTEGER, P_NEW_VAL VARCHAR(50))
+        AS
+        BEGIN
+            UPDATE REG_VOLATILITY_DATA SET VAL = :P_NEW_VAL WHERE ID = :P_ID;
+        END;
+        """
+        fb_caller = """
+        CREATE OR ALTER PROCEDURE SP_VOL_CALLER (P_ID INTEGER, P_NEW_VAL VARCHAR(50))
+        AS
+        BEGIN
+            EXECUTE PROCEDURE SP_VOL_MUTATE(:P_ID, :P_NEW_VAL);
+        END;
+        """
+        pg_mutate = FirebirdToPostgresVisitor.transpile(fb_mutate)
+        pg_caller = FirebirdToPostgresVisitor.transpile(fb_caller)
+        self.assertIn("LANGUAGE plpgsql VOLATILE;", pg_mutate)
+        self.assertIn("LANGUAGE plpgsql VOLATILE;", pg_caller)
+        self.pg_cur.execute(pg_mutate)
+        self.pg_cur.execute(pg_caller)
+
+        # Check catalog
+        self.pg_cur.execute("SELECT provolatile FROM pg_proc WHERE proname = 'sp_vol_caller';")
+        self.assertEqual(self.pg_cur.fetchone()[0], 'v')
+
+        # Execute caller and confirm mutation persisted
+        self.pg_cur.execute('SELECT "sp_vol_caller"(1, \'modified_via_caller\');')
+        self.pg_cur.execute("SELECT val FROM reg_volatility_data WHERE id = 1;")
+        self.assertEqual(self.pg_cur.fetchone()[0], 'modified_via_caller')
+
 
 if __name__ == '__main__':
     unittest.main()
+

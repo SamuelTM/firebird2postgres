@@ -964,6 +964,129 @@ class TestTranspilerProcedures(unittest.TestCase):
         self.assertIn("LANGUAGE plpgsql VOLATILE;", pg_ext_func)
         self.assertIn("external function call", pg_ext_func)
 
+    def test_volatility_classification_item_d_regression(self):
+        # 1. String '--' followed by INSERT must not be stripped as a line comment
+        fb_str_dash = """
+        CREATE OR ALTER PROCEDURE SP_STR_DASH
+        AS
+        DECLARE VARIABLE S VARCHAR(50);
+        BEGIN
+            S = '--';
+            INSERT INTO AUDIT_LOG (ID) VALUES (1);
+        END;
+        """
+        pg_str_dash = FirebirdToPostgresVisitor.transpile(fb_str_dash)
+        self.assertIn("LANGUAGE plpgsql VOLATILE;", pg_str_dash)
+        self.assertIn("data modification (DML)", pg_str_dash)
+
+        # 2. String containing '/*' must not swallow code up to next comment
+        fb_str_block = """
+        CREATE OR ALTER PROCEDURE SP_STR_BLOCK
+        AS
+        DECLARE VARIABLE S VARCHAR(50);
+        BEGIN
+            S = '/* not comment';
+            INSERT INTO AUDIT_LOG (ID) VALUES (1);
+            /* harmless trailing comment */
+        END;
+        """
+        pg_str_block = FirebirdToPostgresVisitor.transpile(fb_str_block)
+        self.assertIn("LANGUAGE plpgsql VOLATILE;", pg_str_block)
+        self.assertIn("data modification (DML)", pg_str_block)
+
+        # 3. Comments containing DML must not trigger false positives (read-only stays STABLE)
+        fb_comment_dml = """
+        CREATE OR ALTER PROCEDURE SP_COMMENT_DML (P_ID INTEGER)
+        RETURNS (NOME VARCHAR(100))
+        AS
+        BEGIN
+            -- INSERT INTO AUDIT_LOG VALUES (99);
+            /* UPDATE CLIENTES SET NOME = 'X'; */
+            SELECT NOME FROM CLIENTES WHERE ID = :P_ID INTO :NOME;
+            SUSPEND;
+        END;
+        """
+        pg_comment_dml = FirebirdToPostgresVisitor.transpile(fb_comment_dml)
+        self.assertIn("LANGUAGE plpgsql STABLE;", pg_comment_dml)
+        self.assertIn("Volatility: STABLE", pg_comment_dml)
+        self.assertNotIn("VOLATILE", pg_comment_dml)
+
+        # 4. Unknown delimited call ("Q"()) remains conservatively VOLATILE
+        fb_delim_call = """
+        CREATE OR ALTER PROCEDURE SP_DELIM_CALL
+        RETURNS (R INTEGER)
+        AS
+        BEGIN
+            R = "Q"();
+            SUSPEND;
+        END;
+        """
+        pg_delim_call = FirebirdToPostgresVisitor.transpile(fb_delim_call)
+        self.assertIn("LANGUAGE plpgsql VOLATILE;", pg_delim_call)
+        self.assertIn('external function call ("q")', pg_delim_call)
+
+        # 5. Unknown qualified call (schema.q()) remains conservatively VOLATILE
+        fb_qual_call = """
+        CREATE OR ALTER PROCEDURE SP_QUAL_CALL
+        RETURNS (R INTEGER)
+        AS
+        BEGIN
+            R = SCHEMA.Q();
+            SUSPEND;
+        END;
+        """
+        pg_qual_call = FirebirdToPostgresVisitor.transpile(fb_qual_call)
+        self.assertIn("LANGUAGE plpgsql VOLATILE;", pg_qual_call)
+        self.assertIn("external function call (SCHEMA.Q)", pg_qual_call)
+
+        # 6. Parameter initializer with sequence generator participates in classification
+        fb_param_seq = """
+        CREATE OR ALTER PROCEDURE SP_PARAM_SEQ (P_ID INTEGER = GEN_ID(GEN_TEST, 1))
+        RETURNS (R INTEGER)
+        AS
+        BEGIN
+            R = P_ID;
+            SUSPEND;
+        END;
+        """
+        pg_param_seq = FirebirdToPostgresVisitor.transpile(fb_param_seq)
+        self.assertIn("LANGUAGE plpgsql VOLATILE;", pg_param_seq)
+        self.assertIn("sequence generator access", pg_param_seq)
+
+        # 7. Variable declaration initializer with sequence participates in classification
+        fb_var_seq = """
+        CREATE OR ALTER PROCEDURE SP_VAR_SEQ
+        RETURNS (R INTEGER)
+        AS
+        DECLARE VARIABLE V_ID INTEGER = GEN_ID(GEN_TEST, 1);
+        BEGIN
+            R = V_ID;
+            SUSPEND;
+        END;
+        """
+        pg_var_seq = FirebirdToPostgresVisitor.transpile(fb_var_seq)
+        self.assertIn("LANGUAGE plpgsql VOLATILE;", pg_var_seq)
+        self.assertIn("sequence generator access", pg_var_seq)
+
+        # 8. Function calling another modifier
+        fb_call_modifier = """
+        CREATE OR ALTER PROCEDURE SP_CALL_MODIFIER
+        AS
+        BEGIN
+            EXECUTE PROCEDURE SP_DO_UPDATE(10);
+        END;
+        """
+        pg_call_modifier = FirebirdToPostgresVisitor.transpile(fb_call_modifier)
+        self.assertIn("LANGUAGE plpgsql VOLATILE;", pg_call_modifier)
+        self.assertIn("procedure call (PERFORM)", pg_call_modifier)
+
+        # 9. Optimization advisories do not promise speculative caching, inlining, or unmeasured gains
+        for out in (pg_str_dash, pg_str_block, pg_comment_dml, pg_delim_call, pg_param_seq):
+            self.assertNotIn("memoization", out.lower())
+            self.assertNotIn("optimizer caching", out.lower())
+            self.assertNotIn("inlined", out.lower())
+            self.assertNotIn("pushdown", out.lower())
+
     def test_disambiguation_with_table_alias_and_variable_conflict(self):
         fb_sql = """
         CREATE OR ALTER PROCEDURE SP_DISAMBIGUATION_TEST (ID INTEGER, VALOR NUMERIC(15,2))
