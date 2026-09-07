@@ -272,6 +272,42 @@ class TestDataMigrator(unittest.TestCase):
             self.assertEqual(info['active_attachments'], 3)
             self.assertTrue(any('Source Firebird database is LIVE' in msg for msg in cm.output))
 
+    def test_check_source_consistency_require_frozen_raises_when_live(self):
+        self.mock_fb_cur.fetchone.side_effect = [
+            (0, 0),  # MON$READ_ONLY = 0, MON$SHUTDOWN_MODE = 0
+            (1,),    # active_attachments = 1
+        ]
+        with self.assertRaises(RuntimeError) as ctx:
+            self.migrator.check_source_consistency(require_frozen=True)
+        self.assertIn("Source Firebird database is LIVE", str(ctx.exception))
+
+    def test_check_source_consistency_allow_live_source_overrides(self):
+        self.mock_fb_cur.fetchone.side_effect = [
+            (0, 0),  # MON$READ_ONLY = 0, MON$SHUTDOWN_MODE = 0
+            (2,),    # active_attachments = 2
+        ]
+        info = self.migrator.check_source_consistency(require_frozen=True, allow_live_source=True)
+        self.assertFalse(info['is_read_only'])
+
+    def test_check_source_consistency_captures_query_error(self):
+        self.mock_fb_cur.execute.side_effect = Exception("Permission denied to MON$DATABASE")
+        with self.assertRaises(RuntimeError) as ctx:
+            self.migrator.check_source_consistency(require_frozen=True)
+        self.assertIn("Cannot verify that source Firebird database is frozen", str(ctx.exception))
+
+    def test_import_data_require_frozen_blocks_destructive_migration(self):
+        table = Table('TAB1')
+        table.columns.append(Column('ID', 'INTEGER', nullable=False))
+        self.mock_fb_cur.fetchone.side_effect = [
+            (0, 0),  # LIVE database
+            (0,),
+        ]
+        with self.assertRaises(RuntimeError):
+            self.migrator.import_data([table], require_frozen_source=True)
+        # Verify DISABLE TRIGGER ALL was never executed because it failed before destructive actions
+        executed_pg = [call[0][0] for call in self.mock_pg_cur.execute.call_args_list]
+        self.assertNotIn('DISABLE TRIGGER ALL', str(executed_pg))
+
     def test_blob_memory_budget_flushes_incrementally_by_bytes(self):
         from engine.data_migrator import _import_single_table
 

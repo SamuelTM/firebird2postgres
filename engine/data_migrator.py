@@ -1,4 +1,5 @@
 import io
+import os
 import logging
 from concurrent.futures import ProcessPoolExecutor, as_completed, Executor
 import firebirdsql
@@ -172,13 +173,21 @@ class DataMigrator:
                          f"Re-enable them manually with ALTER TABLE ... ENABLE TRIGGER ALL.")
             raise
 
-    def check_source_consistency(self) -> dict:
+    def check_source_consistency(self, require_frozen: bool = False, allow_live_source: bool = False) -> dict:
         """
         Checks whether the source Firebird database is frozen (read-only or shutdown)
         or has active concurrent client attachments that could compromise snapshot
         consistency across parallel workers.
+        Captures and reports catalog query errors instead of silently ignoring them.
+        When require_frozen is True, raises RuntimeError if the source is not proven frozen.
         """
-        info = {'is_read_only': False, 'is_shutdown': False, 'active_attachments': 0}
+        info = {
+            'is_read_only': False,
+            'is_shutdown': False,
+            'active_attachments': 0,
+            'verified': False,
+            'error': None
+        }
         try:
             cur = self.fb_con.cursor()
             try:
@@ -187,35 +196,79 @@ class DataMigrator:
                 if row:
                     info['is_read_only'] = bool(row[0])
                     info['is_shutdown'] = (row[1] is not None and row[1] > 0)
-            except Exception:
-                pass
+                info['verified'] = True
+            except Exception as e:
+                info['error'] = f"Failed to check MON$DATABASE: {e}"
+                logger.warning(f"Could not check source database frozen state: {e}")
 
             try:
                 cur.execute("SELECT COUNT(*) FROM MON$ATTACHMENTS WHERE MON$ATTACHMENT_ID <> CURRENT_CONNECTION AND (MON$SYSTEM_FLAG = 0 OR MON$SYSTEM_FLAG IS NULL);")
                 row = cur.fetchone()
                 if row and row[0] is not None:
                     info['active_attachments'] = int(row[0])
-            except Exception:
-                pass
-        except Exception:
-            pass
+            except Exception as e:
+                err_msg = f"Failed to check MON$ATTACHMENTS: {e}"
+                info['error'] = f"{info['error']}; {err_msg}" if info['error'] else err_msg
+                logger.warning(f"Could not check source database attachments: {e}")
+        except Exception as e:
+            info['error'] = f"Failed to access source catalog: {e}"
+            logger.warning(f"Could not verify source consistency: {e}")
 
-        if not info['is_read_only'] and not info['is_shutdown'] and info['active_attachments'] > 0:
-            logger.warning(
-                f"Source Firebird database is LIVE (read-write) with {info['active_attachments']} active "
-                f"external attachment(s). Parallel table workers cannot share a single transactional snapshot; "
-                f"concurrent writes during migration may cause relational inconsistencies. "
-                f"For guaranteed consistency, freeze the source database ('gfix -mode read_only') or migrate from a backup copy."
-            )
+        is_frozen = info['is_read_only'] or info['is_shutdown']
+
+        if not is_frozen and not allow_live_source:
+            if require_frozen:
+                if info['error'] and not info['verified']:
+                    raise RuntimeError(
+                        f"Cannot verify that source Firebird database is frozen ({info['error']}). "
+                        f"Refusing destructive operations without verified static/frozen source. "
+                        f"Use allow_live_source=True or set ALLOW_LIVE_SOURCE=true to override."
+                    )
+                raise RuntimeError(
+                    f"Source Firebird database is LIVE (read-write mode with "
+                    f"{info['active_attachments']} active attachment(s)). "
+                    f"Parallel workers cannot share a single transactional snapshot; "
+                    f"concurrent writes during migration may cause relational inconsistencies. "
+                    f"Freeze the source database ('gfix -mode read_only') or migrate from a static copy. "
+                    f"Use allow_live_source=True or set ALLOW_LIVE_SOURCE=true to override."
+                )
+
+        if not is_frozen:
+            if info['active_attachments'] > 0:
+                logger.warning(
+                    f"Source Firebird database is LIVE (read-write) with {info['active_attachments']} active "
+                    f"external attachment(s). Parallel table workers cannot share a single transactional snapshot; "
+                    f"concurrent writes during migration may cause relational inconsistencies. "
+                    f"For guaranteed consistency, freeze the source database ('gfix -mode read_only') or migrate from a backup copy."
+                )
+            else:
+                logger.warning(
+                    f"Source Firebird database is in read-write mode. While 0 external attachments were "
+                    f"detected at inspection time, new writes may occur during migration. "
+                    f"Parallel table workers have independent connections and cannot share a single transaction snapshot. "
+                    f"For guaranteed consistency, freeze the source database ('gfix -mode read_only') or migrate from a backup copy."
+                )
+
         return info
 
-    def import_data(self, table_objs: list[Table], max_workers: int = 4, executor: Executor = None) -> bool:
+    def import_data(
+        self,
+        table_objs: list[Table],
+        max_workers: int = 4,
+        executor: Executor = None,
+        require_frozen_source: bool = False,
+        allow_live_source: bool = False
+    ) -> bool:
         """
         Reads data from Firebird and bulk inserts into PostgreSQL using a multi-process worker pool.
         Tables are prioritized by complexity (LPT scheduling) so heavy BLOB tables run concurrently.
+        Enforces source database consistency before destructive operations (DISABLE TRIGGER, TRUNCATE).
         Returns True if all tables were imported successfully, False if any table failed.
         """
-        self.check_source_consistency()
+        env_allow_live = os.getenv('ALLOW_LIVE_SOURCE', 'false').lower() in ('1', 'true', 'yes')
+        allow_live = allow_live_source or env_allow_live
+
+        self.check_source_consistency(require_frozen=require_frozen_source, allow_live_source=allow_live)
         self.last_nul_stats = {}
         logger.info(f"Starting data migration for {len(table_objs)} tables (workers={max_workers})...")
         pg_cur = self.pg_con.cursor()

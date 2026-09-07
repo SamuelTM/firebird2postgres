@@ -79,13 +79,18 @@ class DatabaseMigrator:
         self._ensure_schema()
         self.schema_migrator.analyze_tables(self.table_objs)
 
-    def import_data(self, max_workers: int = 4) -> bool:
+    def import_data(self, max_workers: int = 4, require_frozen_source: bool = False, allow_live_source: bool = False) -> bool:
         """
-        Reads data from Firebird and bulk inserts into PostgreSQL with sequence synchronization.
+        Imports data from Firebird to PostgreSQL using parallel worker pool.
         Returns True if successful, False if any table failed.
         """
         self._ensure_schema()
-        return self.data_migrator.import_data(self.table_objs, max_workers=max_workers)
+        return self.data_migrator.import_data(
+            self.table_objs,
+            max_workers=max_workers,
+            require_frozen_source=require_frozen_source,
+            allow_live_source=allow_live_source
+        )
 
     def export_firebird_triggers(self, output_file: str = None,
                                  converted_file: str = None,
