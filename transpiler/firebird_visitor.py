@@ -1211,7 +1211,7 @@ class ASTDialectRewriter(FirebirdParserVisitor):
             elif part in ('YEARDAY', 'YEARDAYS'):
                 self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"((EXTRACT(DOY FROM {expr}))::integer - 1)")
             elif part in ('MILLISECOND', 'MILLISECONDS'):
-                self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"(FLOOR(EXTRACT(MILLISECOND FROM {expr}))::integer % 1000)")
+                self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"(EXTRACT(MILLISECOND FROM {expr})::numeric % 1000)")
         return None
 
     def visitUnary_expression(self, ctx: FirebirdParser.Unary_expressionContext):

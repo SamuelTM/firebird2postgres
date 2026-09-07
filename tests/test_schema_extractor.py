@@ -222,7 +222,7 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
         )
         self.assertEqual(
             FirebirdToPostgresVisitor.transpile_expression("EXTRACT(MILLISECOND FROM TS)"),
-            "(FLOOR(EXTRACT(MILLISECOND FROM TS))::integer % 1000)",
+            "(EXTRACT(MILLISECOND FROM TS)::numeric % 1000)",
         )
         with self.assertRaises(RuntimeError) as cm:
             FirebirdToPostgresVisitor.transpile_expression("FOOBAR $$$ INVALID")

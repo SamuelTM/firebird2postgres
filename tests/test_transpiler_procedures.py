@@ -766,7 +766,7 @@ class TestTranspilerProcedures(unittest.TestCase):
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
         self.assertIn("WD := EXTRACT(DOW FROM D);", pg_sql)
         self.assertIn("YD := ((EXTRACT(DOY FROM D))::integer - 1);", pg_sql)
-        self.assertIn("MS := (FLOOR(EXTRACT(MILLISECOND FROM TS))::integer % 1000);", pg_sql)
+        self.assertIn("MS := (EXTRACT(MILLISECOND FROM TS)::numeric % 1000);", pg_sql)
 
     def test_procedure_with_domain_map(self):
         fb_sql = """
