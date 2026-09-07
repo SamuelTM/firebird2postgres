@@ -1,4 +1,5 @@
 import re
+from graphlib import TopologicalSorter, CycleError
 from models import Table, Column, ForeignKey, UniqueKey, Index, Sequence, CheckConstraint, resolve_firebird_type, resolve_pg_domain_name, build_domain_mapping
 from transpiler import FirebirdToPostgresVisitor, validate_immutable_expression
 
@@ -115,7 +116,6 @@ class SchemaExtractor:
             computed_source = column[10].strip() if column[10] else None
             if computed_source:
                 computed_source = FirebirdToPostgresVisitor.transpile_expression(computed_source, symbols=symbols)
-                validate_immutable_expression(computed_source, f"computed column '{column_name}' in table '{table_name}'")
 
             column_data_type = symbols.get(column_name.lower()) or resolve_firebird_type(
                 field_type=field_type,
@@ -150,7 +150,51 @@ class SchemaExtractor:
                     computed_source=computed_source,
                 )
             )
+
+        SchemaExtractor._expand_computed_column_dependencies(columns, table_name)
         return columns
+
+    @staticmethod
+    def _expand_computed_column_dependencies(columns: list[Column], table_name: str) -> None:
+        """
+        Inlines references between computed columns within the same table.
+        PostgreSQL generated columns cannot directly reference other generated columns.
+        """
+        computed_cols = {col.name: col for col in columns if col.computed_source}
+        if not computed_cols:
+            return
+
+        strip_literals = re.compile(r"'(?:''|[^'])*'|/\*.*?\*/|--[^\n]*", flags=re.DOTALL)
+        graph = {}
+        for name, col in computed_cols.items():
+            clean_expr = strip_literals.sub(" ", col.computed_source)
+            deps = {
+                other for other in computed_cols
+                if other != name and re.search(rf'\b{re.escape(other)}\b', clean_expr, re.IGNORECASE)
+            }
+            if re.search(rf'\b{re.escape(name)}\b', clean_expr, re.IGNORECASE):
+                raise ValueError(f"Self-referencing computed column '{name}' in table '{table_name}' is not permitted.")
+            graph[name] = deps
+
+        try:
+            sorter = TopologicalSorter(graph)
+            order = list(sorter.static_order())
+        except CycleError as e:
+            raise ValueError(f"Circular dependency detected between computed columns in table '{table_name}': {e}") from e
+
+        for name in order:
+            col = computed_cols[name]
+            curr_expr = col.computed_source
+            for dep in graph[name]:
+                dep_col = computed_cols[dep]
+                curr_expr = re.sub(
+                    rf'\b{re.escape(dep)}\b',
+                    f"({dep_col.computed_source})",
+                    curr_expr,
+                    flags=re.IGNORECASE
+                )
+            col.computed_source = curr_expr
+            validate_immutable_expression(col.computed_source, f"computed column '{name}' in table '{table_name}'")
 
     @staticmethod
     def _extract_foreign_keys(cursor, table_name: str) -> list[ForeignKey]:

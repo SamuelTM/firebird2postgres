@@ -116,6 +116,12 @@ def validate_immutable_expression(expr: str, context: str = "expression") -> Non
         )
 
     clean_expr = _STRIP_SQL_LITERALS_AND_COMMENTS.sub(" ", no_comments)
+    if re.search(r'\bSELECT\b', clean_expr, re.IGNORECASE):
+        raise ValueError(
+            f"Subquery in {context}: '{expr}' "
+            f"is not permitted in PostgreSQL (generated columns and expression indexes cannot contain subqueries)."
+        )
+
     m = _NON_IMMUTABLE_PATTERN.search(clean_expr)
     if m:
         fn_or_kw = m.group(0).rstrip('(').strip()

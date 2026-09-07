@@ -258,6 +258,40 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
             validate_immutable_expression("'/*' || CURRENT_TIMESTAMP")
         with self.assertRaises(ValueError):
             validate_immutable_expression("'*/' || NOW()")
+        with self.assertRaises(ValueError) as cm:
+            validate_immutable_expression("(SELECT 1)")
+        self.assertIn("Subquery", str(cm.exception))
+
+    def test_extract_columns_rejects_gen_id_zero_subquery(self):
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [
+            ("COL_GEN", 16, 0, 8, 1, 0, 0, None, None, "RDB$1", "GEN_ID(G, 0)"),
+        ]
+        with self.assertRaises(ValueError) as cm:
+            SchemaExtractor._extract_columns(mock_cursor, "T", {"T"})
+        self.assertIn("Subquery in computed column 'COL_GEN'", str(cm.exception))
+
+    def test_extract_columns_expands_computed_column_dependencies(self):
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [
+            ("BASE", 8, 0, 4, 1, None, None, None, None, "RDB$1", None),
+            ("COL_A", 8, 0, 4, 1, None, None, None, None, "RDB$2", "BASE * 2"),
+            ("COL_B", 8, 0, 4, 1, None, None, None, None, "RDB$3", "COL_A + 10"),
+        ]
+        columns = SchemaExtractor._extract_columns(mock_cursor, "T", {"T"})
+        self.assertEqual(len(columns), 3)
+        self.assertEqual(columns[1].computed_source, "BASE * 2")
+        self.assertEqual(columns[2].computed_source, "(BASE * 2) + 10")
+
+    def test_extract_columns_rejects_circular_computed_column_dependencies(self):
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [
+            ("COL_A", 8, 0, 4, 1, None, None, None, None, "RDB$1", "COL_B * 2"),
+            ("COL_B", 8, 0, 4, 1, None, None, None, None, "RDB$2", "COL_A + 1"),
+        ]
+        with self.assertRaises(ValueError) as cm:
+            SchemaExtractor._extract_columns(mock_cursor, "T", {"T"})
+        self.assertIn("Circular dependency detected", str(cm.exception))
 
     def test_extract_columns_rejects_non_immutable_expression(self):
         mock_cursor = MagicMock()
