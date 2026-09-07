@@ -704,6 +704,21 @@ class TestTranspilerProcedures(unittest.TestCase):
         self.assertIn("RETURNS VARCHAR(50)", pg_sql)
         self.assertNotIn("RETURNS SETOF", pg_sql)
 
+    def test_dateadd_preserves_date_type(self):
+        fb_sql = """
+        CREATE PROCEDURE SP_TEST_DATE (D DATE)
+        RETURNS (
+            DIFF INTEGER
+        )
+        AS
+        BEGIN
+            DIFF = DATEADD(DAY, 1, D) - D;
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("DIFF := ((D + (1) * INTERVAL '1 day')::date) - D;", pg_sql)
+
+
 
 
 

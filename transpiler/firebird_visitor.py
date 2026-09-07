@@ -503,6 +503,53 @@ def _normalize_procedure_params(sql: str) -> str:
     return "".join(result)
 
 
+def _is_date_type(type_str: str) -> bool:
+    if not type_str:
+        return False
+    u = type_str.strip().upper()
+    return ('DATE' in u) and ('TIMESTAMP' not in u)
+
+
+def _is_date_expr(expr: str, symbols: dict[str, str] = None) -> bool:
+    s = expr.strip()
+    while s.startswith("(") and s.endswith(")"):
+        d = 0
+        matching = True
+        for c in s[:-1]:
+            if c == "(":
+                d += 1
+            elif c == ")":
+                d -= 1
+            if d == 0:
+                matching = False
+                break
+        if matching:
+            s = s[1:-1].strip()
+        else:
+            break
+
+    upper = s.upper()
+    if (
+        upper.startswith("DATE ")
+        or upper.startswith("DATE'")
+        or upper == "CURRENT_DATE"
+        or bool(re.search(r"\bAS\s+DATE\b", upper))
+        or upper.endswith("::DATE")
+    ):
+        return True
+
+    if symbols:
+        clean = s.lstrip(':').strip('"').lower()
+        if _is_date_type(symbols.get(clean, '')):
+            return True
+        if '.' in clean:
+            col_part = clean.split('.')[-1].strip('"')
+            if _is_date_type(symbols.get(col_part, '')) or _is_date_type(symbols.get(clean, '')):
+                return True
+
+    return False
+
+
 def _is_time_type(type_str: str) -> bool:
     if not type_str:
         return False
@@ -715,10 +762,21 @@ class ASTDialectRewriter(FirebirdParserVisitor):
             part_str = self._get_tokens_text(args[0]).strip().lower()
             num_str = self._get_tokens_text(args[1]).strip()
             date_str = self._get_tokens_text(args[2]).strip()
-            self.rewriter.replaceRangeTokens(
-                ctx.start, ctx.stop,
-                f"({date_str} + ({num_str}) * INTERVAL '1 {part_str}')"
-            )
+            if _is_date_expr(date_str, self.symbols):
+                self.rewriter.replaceRangeTokens(
+                    ctx.start, ctx.stop,
+                    f"(({date_str} + ({num_str}) * INTERVAL '1 {part_str}')::date)"
+                )
+            elif _is_time_expr(date_str, self.symbols):
+                self.rewriter.replaceRangeTokens(
+                    ctx.start, ctx.stop,
+                    f"(({date_str} + ({num_str}) * INTERVAL '1 {part_str}')::time)"
+                )
+            else:
+                self.rewriter.replaceRangeTokens(
+                    ctx.start, ctx.stop,
+                    f"({date_str} + ({num_str}) * INTERVAL '1 {part_str}')"
+                )
         elif fn_name == 'DATEDIFF' and len(args) == 3:
             part_str = self._get_tokens_text(args[0]).strip().strip("'\"").lower()
             d1_str = self._get_tokens_text(args[1]).strip()
