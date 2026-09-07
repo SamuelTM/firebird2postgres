@@ -148,9 +148,11 @@ def run_ddl_validation(
     if apply_changes:
         failed_count = sum(1 for r in results if not r.success)
         if failed_count > 0:
-            print(f"\n[WARNING] {failed_count} errors encountered. Applying only successful statements...")
-        conn.commit()
-        print("[SUCCESS] Changes committed to PostgreSQL database.")
+            conn.rollback()
+            print(f"\n[ERROR] {failed_count} errors encountered. Rolled back all changes to prevent partial/corrupted DDL application.")
+        else:
+            conn.commit()
+            print("[SUCCESS] Changes committed to PostgreSQL database.")
     else:
         conn.rollback()
         print("[INFO] Test completed. Rollback executed (no changes persisted to database).")

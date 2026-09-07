@@ -50,5 +50,62 @@ class TestIdentifyObject(unittest.TestCase):
         self.assertEqual(identify_object('SELECT 1;'), ('OTHER', 'UNKNOWN'))
 
 
+class TestRunDdlValidation(unittest.TestCase):
+    def test_apply_changes_rolls_back_when_any_statement_fails(self):
+        import tempfile
+        from unittest.mock import MagicMock
+        from validate_postgres_ddl import run_ddl_validation
+
+        with tempfile.NamedTemporaryFile('w', suffix='.sql', delete=False) as f:
+            f.write('DROP VIEW IF EXISTS "v" CASCADE;\nCREATE VIEW "v" AS INVALID_SYNTAX;\n')
+            fpath = f.name
+
+        try:
+            mock_conn = MagicMock()
+            mock_cursor = MagicMock()
+            mock_conn.cursor.return_value = mock_cursor
+
+            # First statement succeeds, second fails
+            def execute_side_effect(sql):
+                if 'INVALID_SYNTAX' in sql:
+                    raise Exception("syntax error at or near 'INVALID_SYNTAX'")
+
+            mock_cursor.execute.side_effect = execute_side_effect
+
+            results = run_ddl_validation(mock_conn, [fpath], apply_changes=True)
+            self.assertEqual(len(results), 2)
+            self.assertTrue(results[0].success)
+            self.assertFalse(results[1].success)
+
+            mock_conn.rollback.assert_called()
+            mock_conn.commit.assert_not_called()
+        finally:
+            import os
+            os.remove(fpath)
+
+    def test_apply_changes_commits_when_all_statements_succeed(self):
+        import tempfile
+        from unittest.mock import MagicMock
+        from validate_postgres_ddl import run_ddl_validation
+
+        with tempfile.NamedTemporaryFile('w', suffix='.sql', delete=False) as f:
+            f.write('SELECT 1;\nSELECT 2;\n')
+            fpath = f.name
+
+        try:
+            mock_conn = MagicMock()
+            mock_cursor = MagicMock()
+            mock_conn.cursor.return_value = mock_cursor
+
+            results = run_ddl_validation(mock_conn, [fpath], apply_changes=True)
+            self.assertEqual(len(results), 2)
+            self.assertTrue(all(r.success for r in results))
+
+            mock_conn.commit.assert_called_once()
+        finally:
+            import os
+            os.remove(fpath)
+
+
 if __name__ == '__main__':
     unittest.main()
