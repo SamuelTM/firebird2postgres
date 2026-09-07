@@ -426,6 +426,16 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
         self.assertEqual(checks[1].name, "chk_valor")
         self.assertEqual(checks[1].expression, "VALOR >= 0")
 
+    def test_extract_check_constraints_raises_on_invalid_expression(self):
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [
+            ("CHK_BAD", "CHECK (INVALID SYNTAX +++)"),
+        ]
+        with self.assertRaises(RuntimeError) as cm:
+            SchemaExtractor._extract_check_constraints(mock_cursor, "ITENS")
+        self.assertIn("Failed to transpile CHECK constraint 'CHK_BAD' on table 'ITENS'", str(cm.exception))
+        self.assertIn("INVALID SYNTAX +++", str(cm.exception))
+
     def test_extract_columns_raises_typeerror_on_unsupported_type(self):
         mock_cursor = MagicMock()
         mock_cursor.fetchone.return_value = None  # No RDB$IDENTITY_TYPE

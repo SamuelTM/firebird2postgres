@@ -502,8 +502,11 @@ class SchemaExtractor:
 
             try:
                 pg_expr = FirebirdToPostgresVisitor.transpile_expression(inner_expr, symbols=symbols)
-            except Exception:
-                pg_expr = inner_expr
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to transpile CHECK constraint '{cname}' on table '{table_name}': "
+                    f"expression '{inner_expr}' could not be converted to PostgreSQL. Cause: {e}"
+                ) from e
 
             checks.append(CheckConstraint(name=cname, expression=pg_expr))
         return checks
