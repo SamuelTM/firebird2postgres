@@ -199,6 +199,15 @@ class TestDdlExporterViews(unittest.TestCase):
         self.assertIn("P_NAME VARCHAR(50) DEFAULT 'ANON'", in_params[1])
         self.assertIn("OUT_STATUS DM_STATUS", out_params[0])
 
+    def test_fetch_procedure_parameters_raises_on_unsupported_type(self):
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [
+            ("P_UNKNOWN", 0, 0, 999, 0, 10, 0, 0, "RDB$999", None, 0, 0, None),
+        ]
+        with self.assertRaises(TypeError) as cm:
+            DdlExporter._fetch_procedure_parameters(mock_cursor, "SP_TEST")
+        self.assertIn("Unsupported or unrecognized Firebird data type", str(cm.exception))
+
     def test_format_domain_postgres_ddl_transpiles_check_and_default(self):
         pg_ddl = DdlExporter._format_domain_postgres_ddl(
             pg_domain_name="dm_test",

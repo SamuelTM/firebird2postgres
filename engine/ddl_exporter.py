@@ -290,7 +290,10 @@ class DdlExporter:
                     field_scale=field_scale,
                 )
                 if type_name is None:
-                    type_name = 'VARCHAR(255)'
+                    raise TypeError(
+                        f"Unsupported or unrecognized Firebird data type (field_type={field_type}, "
+                        f"field_subtype={field_subtype}) for parameter '{param_name}' in procedure '{proc_name}'."
+                    )
 
             raw_default = param_default or field_default
             default_clause = ""
@@ -553,7 +556,12 @@ class DdlExporter:
                     field_length=field_length,
                     field_precision=field_precision,
                     field_scale=field_scale,
-                ) or 'VARCHAR'
+                )
+                if fb_full_type is None:
+                    raise TypeError(
+                        f"Unsupported or unrecognized Firebird data type (field_type={field_type}, "
+                        f"field_subtype={field_subtype}) for domain '{domain_name}'."
+                    )
                 pg_type = get_postgres_type(fb_full_type)
 
                 # Firebird DDL

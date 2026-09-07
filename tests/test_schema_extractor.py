@@ -403,6 +403,16 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
         self.assertEqual(checks[1].name, "chk_valor")
         self.assertEqual(checks[1].expression, "VALOR >= 0")
 
+    def test_extract_columns_raises_typeerror_on_unsupported_type(self):
+        mock_cursor = MagicMock()
+        # Row format: FIELD_NAME, FIELD_TYPE, FIELD_SUB_TYPE, FIELD_LENGTH, NULL_FLAG, PRECISION, SCALE, DEFAULT_SOURCE, DOMAIN_DEFAULT, FIELD_SOURCE, COMPUTED_SOURCE
+        mock_cursor.fetchall.return_value = [
+            ("COL_WEIRD", 999, None, 10, None, None, None, None, None, "RDB$999", None)
+        ]
+        with self.assertRaises(TypeError) as cm:
+            SchemaExtractor._extract_columns(mock_cursor, "TAB_TEST", relation_names=set(), domain_map={})
+        self.assertIn("Unsupported or unrecognized Firebird data type", str(cm.exception))
+
 
 if __name__ == '__main__':
     unittest.main()

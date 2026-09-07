@@ -126,8 +126,6 @@ class SchemaExtractor:
                 field_scale=field_scale,
             )
 
-            # RDB$FIELD_SOURCE starting with 'RDB$' is an implicit system domain (raw type).
-            # Anything else is a user-defined domain, referenced in PostgreSQL.
             domain_name = None
             if field_source and not field_source.startswith('RDB$'):
                 if domain_map and field_source.upper() in domain_map:
@@ -136,6 +134,11 @@ class SchemaExtractor:
                     domain_name = resolve_pg_domain_name(field_source, relation_names)
                 default_value = column_default
             else:
+                if not column_data_type:
+                    raise TypeError(
+                        f"Unsupported or unrecognized Firebird data type (field_type={field_type}, "
+                        f"field_subtype={field_subtype}) for column '{column_name}' in table '{table_name}'."
+                    )
                 default_value = column_default or domain_default
 
             if default_value:

@@ -10,7 +10,13 @@ class FirebirdDataType(IntEnum):
     TIME = 13
     CHAR = 14
     BIGINT = 16
+    BOOLEAN = 23
+    DECFLOAT16 = 24
+    DECFLOAT34 = 25
+    INT128 = 26
     DOUBLE_PRECISION = 27
+    TIME_TZ = 28
+    TIMESTAMP_TZ = 29
     TIMESTAMP = 35
     VARCHAR = 37
     BLOB = 261
@@ -24,7 +30,13 @@ _TYPE_MAP: dict[int, str] = {
     FirebirdDataType.TIME: 'TIME',
     FirebirdDataType.CHAR: 'CHAR',
     FirebirdDataType.BIGINT: 'BIGINT',
+    FirebirdDataType.BOOLEAN: 'BOOLEAN',
+    FirebirdDataType.DECFLOAT16: 'DECFLOAT(16)',
+    FirebirdDataType.DECFLOAT34: 'DECFLOAT(34)',
+    FirebirdDataType.INT128: 'INT128',
     FirebirdDataType.DOUBLE_PRECISION: 'DOUBLE PRECISION',
+    FirebirdDataType.TIME_TZ: 'TIME WITH TIME ZONE',
+    FirebirdDataType.TIMESTAMP_TZ: 'TIMESTAMP WITH TIME ZONE',
     FirebirdDataType.TIMESTAMP: 'TIMESTAMP',
     FirebirdDataType.VARCHAR: 'VARCHAR',
 }
@@ -50,7 +62,8 @@ def resolve_firebird_type(field_type: int, field_subtype: int = None,
     """
     type_name = get_firebird_data_type_name(field_type, field_subtype)
 
-    if (field_type in (FirebirdDataType.SMALLINT, FirebirdDataType.INTEGER, FirebirdDataType.BIGINT)
+    if (field_type in (FirebirdDataType.SMALLINT, FirebirdDataType.INTEGER,
+                       FirebirdDataType.BIGINT, FirebirdDataType.INT128)
             and field_subtype is not None and field_subtype > 0):
         if field_precision:
             scale = abs(field_scale) if field_scale else 0

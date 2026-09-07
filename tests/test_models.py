@@ -23,7 +23,15 @@ class TestFirebirdTypes(unittest.TestCase):
         self.assertEqual(get_postgres_type('BLOB SUBTYPE 1'), 'TEXT')
         self.assertEqual(get_postgres_type('BLOB SUBTYPE 0'), 'BYTEA')
         self.assertEqual(get_postgres_type('VARCHAR(100)'), 'VARCHAR(100)')
+        self.assertEqual(get_postgres_type('BOOLEAN'), 'BOOLEAN')
+        self.assertEqual(get_postgres_type('DECFLOAT(16)'), 'NUMERIC')
+        self.assertEqual(get_postgres_type('DECFLOAT(34)'), 'NUMERIC')
+        self.assertEqual(get_postgres_type('INT128'), 'NUMERIC(38)')
+        self.assertEqual(get_postgres_type('TIME WITH TIME ZONE'), 'TIMETZ')
+        self.assertEqual(get_postgres_type('TIMESTAMP WITH TIME ZONE'), 'TIMESTAMPTZ')
         self.assertEqual(get_postgres_type('CUSTOM_TYPE'), 'CUSTOM_TYPE')
+        with self.assertRaises(ValueError):
+            get_postgres_type(None)
 
     def test_resolve_firebird_type(self):
         # 7 = SMALLINT, 8 = INTEGER, 14 = CHAR, 37 = VARCHAR, 16 = BIGINT / INT64
@@ -33,6 +41,15 @@ class TestFirebirdTypes(unittest.TestCase):
         self.assertEqual(resolve_firebird_type(field_type=37, field_length=40, character_length=10), 'VARCHAR(10)')
         self.assertEqual(resolve_firebird_type(field_type=14, field_length=10), 'CHAR(10)')
         self.assertEqual(resolve_firebird_type(field_type=14, field_length=40, character_length=10), 'CHAR(10)')
+        # Modern FB 3/4/5 types
+        self.assertEqual(resolve_firebird_type(field_type=23), 'BOOLEAN')
+        self.assertEqual(resolve_firebird_type(field_type=24), 'DECFLOAT(16)')
+        self.assertEqual(resolve_firebird_type(field_type=25), 'DECFLOAT(34)')
+        self.assertEqual(resolve_firebird_type(field_type=26), 'INT128')
+        self.assertEqual(resolve_firebird_type(field_type=26, field_subtype=1, field_precision=30, field_scale=-4),
+                         'NUMERIC(30, 4)')
+        self.assertEqual(resolve_firebird_type(field_type=28), 'TIME WITH TIME ZONE')
+        self.assertEqual(resolve_firebird_type(field_type=29), 'TIMESTAMP WITH TIME ZONE')
         # Numeric with precision and scale
         self.assertEqual(resolve_firebird_type(field_type=16, field_subtype=1, field_precision=15, field_scale=-2),
                          'NUMERIC(15, 2)')

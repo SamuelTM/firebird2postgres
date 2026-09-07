@@ -66,6 +66,9 @@ class CheckConstraint:
 
 
 def get_postgres_type(firebird_type: str) -> str:
+    if not firebird_type:
+        raise ValueError("Cannot resolve PostgreSQL type for empty or None Firebird type.")
+
     type_mapping = {
         'SMALLINT': 'SMALLINT',
         'INTEGER': 'INTEGER',
@@ -79,7 +82,13 @@ def get_postgres_type(firebird_type: str) -> str:
         'VARCHAR': 'VARCHAR',
         'BLOB SUBTYPE 1': 'TEXT',
         'BLOB SUBTYPE 0': 'BYTEA',
-        'NUMERIC': 'NUMERIC'
+        'NUMERIC': 'NUMERIC',
+        'BOOLEAN': 'BOOLEAN',
+        'DECFLOAT(16)': 'NUMERIC',
+        'DECFLOAT(34)': 'NUMERIC',
+        'INT128': 'NUMERIC(38)',
+        'TIME WITH TIME ZONE': 'TIMETZ',
+        'TIMESTAMP WITH TIME ZONE': 'TIMESTAMPTZ',
     }
 
     return type_mapping.get(firebird_type, firebird_type)
