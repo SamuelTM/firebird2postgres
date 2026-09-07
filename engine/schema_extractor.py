@@ -185,21 +185,67 @@ class SchemaExtractor:
         """
         Inlines references between computed columns within the same table.
         PostgreSQL generated columns cannot directly reference other generated columns.
+        Substitutions operate strictly on column identifier references (preserving string literals
+        and comments) and preserve the declared data type via explicit casts.
         """
         computed_cols = {col.name: col for col in columns if col.computed_source}
         if not computed_cols:
             return
 
-        strip_literals = re.compile(r"'(?:''|[^'])*'|/\*.*?\*/|--[^\n]*", flags=re.DOTALL)
+        token_pat = re.compile(
+            r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)"
+            r"|((?:(?:\"[^\"]+\"|[A-Za-z0-9_$]+)\s*\.\s*)?(?:\"[^\"]+\"|[A-Za-z0-9_$]+))",
+            flags=re.DOTALL
+        )
+
+        def find_referenced_columns(expr: str) -> set[str]:
+            refs = set()
+            for m in token_pat.finditer(expr):
+                if m.group(1):
+                    continue
+                ident_full = m.group(2)
+                if not ident_full:
+                    continue
+                parts = re.split(r"\s*\.\s*", ident_full)
+                if len(parts) == 1:
+                    refs.add(parts[0].strip('"').lower())
+                elif len(parts) == 2:
+                    tbl_part = parts[0].strip('"').lower()
+                    if tbl_part == table_name.lower():
+                        refs.add(parts[1].strip('"').lower())
+            return refs
+
+        def replace_col_ident(expr: str, col_target: str, repl_sql: str) -> str:
+            def repl(m):
+                lit = m.group(1)
+                if lit:
+                    return lit
+                ident_full = m.group(2)
+                if not ident_full:
+                    return m.group(0)
+                parts = re.split(r"\s*\.\s*", ident_full)
+                if len(parts) == 1:
+                    col_part = parts[0].strip('"').lower()
+                    if col_part == col_target.lower():
+                        return repl_sql
+                elif len(parts) == 2:
+                    tbl_part = parts[0].strip('"').lower()
+                    col_part = parts[1].strip('"').lower()
+                    if tbl_part == table_name.lower() and col_part == col_target.lower():
+                        return repl_sql
+                return ident_full
+
+            return token_pat.sub(repl, expr)
+
         graph = {}
         for name, col in computed_cols.items():
-            clean_expr = strip_literals.sub(" ", col.computed_source)
+            refs = find_referenced_columns(col.computed_source)
+            if name.lower() in refs:
+                raise ValueError(f"Self-referencing computed column '{name}' in table '{table_name}' is not permitted.")
             deps = {
                 other for other in computed_cols
-                if other != name and re.search(rf'\b{re.escape(other)}\b', clean_expr, re.IGNORECASE)
+                if other != name and other.lower() in refs
             }
-            if re.search(rf'\b{re.escape(name)}\b', clean_expr, re.IGNORECASE):
-                raise ValueError(f"Self-referencing computed column '{name}' in table '{table_name}' is not permitted.")
             graph[name] = deps
 
         try:
@@ -213,12 +259,9 @@ class SchemaExtractor:
             curr_expr = col.computed_source
             for dep in graph[name]:
                 dep_col = computed_cols[dep]
-                curr_expr = re.sub(
-                    rf'\b{re.escape(dep)}\b',
-                    f"({dep_col.computed_source})",
-                    curr_expr,
-                    flags=re.IGNORECASE
-                )
+                type_cast = f"::{dep_col.column_type.lower()}" if dep_col.column_type else ""
+                replacement = f"(({dep_col.computed_source}){type_cast})"
+                curr_expr = replace_col_ident(curr_expr, dep, replacement)
             col.computed_source = curr_expr
             validate_immutable_expression(col.computed_source, f"computed column '{name}' in table '{table_name}'")
 

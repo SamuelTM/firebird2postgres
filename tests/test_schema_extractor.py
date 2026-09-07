@@ -281,7 +281,22 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
         columns = SchemaExtractor._extract_columns(mock_cursor, "T", {"T"})
         self.assertEqual(len(columns), 3)
         self.assertEqual(columns[1].computed_source, "BASE * 2")
-        self.assertEqual(columns[2].computed_source, "(BASE * 2) + 10")
+        self.assertEqual(columns[2].computed_source, "((BASE * 2)::integer) + 10")
+
+    def test_extract_columns_expands_computed_column_lexical_boundaries_and_types(self):
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [
+            ("X", 8, 0, 4, 1, None, None, None, None, "RDB$1", None),
+            ("A", 8, 0, 4, 1, None, None, None, None, "RDB$2", "X + 1"),
+            ("B", 8, 0, 4, 1, None, None, None, None, "RDB$3", '"A" + 1'),
+            ("C", 37, 0, 50, 1, None, None, None, None, "RDB$4", "A || 'A'"),
+        ]
+        columns = SchemaExtractor._extract_columns(mock_cursor, "T", {"T"})
+        self.assertEqual(len(columns), 4)
+        # B references "A" (quoted identifier) -> must NOT produce "(X + 1)" as a quoted identifier
+        self.assertEqual(columns[2].computed_source, "((X + 1)::integer) + 1")
+        # C references A and has literal 'A' -> string literal 'A' must be preserved untouched
+        self.assertEqual(columns[3].computed_source, "((X + 1)::integer) || 'A'")
 
     def test_extract_columns_rejects_circular_computed_column_dependencies(self):
         mock_cursor = MagicMock()
