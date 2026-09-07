@@ -402,6 +402,64 @@ class TestIntegrationExecution(unittest.TestCase):
         self.pg_cur.execute("SELECT val FROM reg_volatility_data WHERE id = 1;")
         self.assertEqual(self.pg_cur.fetchone()[0], 'modified_via_caller')
 
+    @unittest.skipUnless(HAS_REAL_PG, "Live PostgreSQL instance required for real execution test")
+    def test_real_pg_computed_columns_expansion_and_execution(self):
+        """
+        Validates Item F on a live PostgreSQL database:
+        - Creates a table with base column X and computed columns:
+          - "ABS": ABS(X)
+          - A: X + 1 (INT128)
+          - B: A * 2 (NUMERIC(15,2))
+          - C: B + 10 (NUMERIC(15,2))
+          - S: X || 'A' (VARCHAR(50))
+        - Expands computed column dependencies and generates valid PostgreSQL DDL
+        - Executes CREATE TABLE on PostgreSQL (verifying DDL syntax & cast validity)
+        - Inserts rows with positive and negative X values
+        - Verifies computed results in PostgreSQL match expected values
+        """
+        from models import Table, Column
+        from engine.schema_extractor import SchemaExtractor
+        from transpiler import FirebirdToPostgresVisitor
+
+        table = Table("REG_COMPUTED_TEST")
+        raw_cols = [
+            Column("X", "INTEGER", nullable=False),
+            Column("ABS", "INTEGER", nullable=True, computed_source=FirebirdToPostgresVisitor.transpile_expression("ABS(X)")),
+            Column("A", "INT128", nullable=True, computed_source=FirebirdToPostgresVisitor.transpile_expression('"X" + 1')),
+            Column("B", "NUMERIC(15,2)", nullable=True, computed_source=FirebirdToPostgresVisitor.transpile_expression("A * 2")),
+            Column("C", "NUMERIC(15,2)", nullable=True, computed_source=FirebirdToPostgresVisitor.transpile_expression("B + 10")),
+            Column("S", "VARCHAR(50)", nullable=True, computed_source=FirebirdToPostgresVisitor.transpile_expression("X || 'A'")),
+        ]
+        table.columns = raw_cols
+
+        SchemaExtractor._expand_computed_column_dependencies(table.columns, table.name)
+        create_sql = table.get_create_table_query()
+
+        self.pg_cur.execute("DROP TABLE IF EXISTS reg_computed_test CASCADE;")
+        self.pg_cur.execute(create_sql)
+
+        self.pg_cur.execute("INSERT INTO reg_computed_test (x) VALUES (-42), (10);")
+        self.pg_cur.execute('SELECT x, "abs", a, b, c, s FROM reg_computed_test ORDER BY x;')
+        rows = self.pg_cur.fetchall()
+
+        # Row 1: X = -42
+        self.assertEqual(rows[0][0], -42)
+        self.assertEqual(rows[0][1], 42)  # abs(-42)
+        self.assertEqual(rows[0][2], decimal.Decimal('-41'))  # -42 + 1
+        self.assertEqual(rows[0][3], decimal.Decimal('-82.00'))  # -41 * 2
+        self.assertEqual(rows[0][4], decimal.Decimal('-72.00'))  # -82 + 10
+        self.assertEqual(rows[0][5], '-42A')
+
+        # Row 2: X = 10
+        self.assertEqual(rows[1][0], 10)
+        self.assertEqual(rows[1][1], 10)  # abs(10)
+        self.assertEqual(rows[1][2], decimal.Decimal('11'))  # 10 + 1
+        self.assertEqual(rows[1][3], decimal.Decimal('22.00'))  # 11 * 2
+        self.assertEqual(rows[1][4], decimal.Decimal('32.00'))  # 22 + 10
+        self.assertEqual(rows[1][5], '10A')
+
+        self.pg_cur.execute("DROP TABLE IF EXISTS reg_computed_test CASCADE;")
+
 
 if __name__ == '__main__':
     unittest.main()

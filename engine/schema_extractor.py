@@ -1,7 +1,10 @@
 import re
 from graphlib import TopologicalSorter, CycleError
 import firebirdsql
-from models import Table, Column, ForeignKey, UniqueKey, Index, Sequence, CheckConstraint, resolve_firebird_type, resolve_pg_domain_name, build_domain_mapping
+from models import (
+    Table, Column, ForeignKey, UniqueKey, Index, Sequence, CheckConstraint,
+    get_postgres_type, resolve_firebird_type, resolve_pg_domain_name, build_domain_mapping
+)
 from transpiler import FirebirdToPostgresVisitor, validate_immutable_expression
 
 
@@ -251,13 +254,45 @@ class SchemaExtractor:
             flags=re.DOTALL
         )
 
+        _SQL_EXPR_KEYWORDS = {
+            'AND', 'OR', 'NOT', 'IS', 'NULL', 'TRUE', 'FALSE',
+            'CASE', 'WHEN', 'THEN', 'ELSE', 'END',
+            'BETWEEN', 'IN', 'LIKE', 'SIMILAR', 'DISTINCT',
+            'ESCAPE', 'COLLATE', 'AS', 'FROM'
+        }
+
+        def is_column_ref(m: re.Match, s: str) -> bool:
+            # Function call: followed by '(' (ignoring whitespace)
+            rest = s[m.end():]
+            if rest and rest.lstrip().startswith('('):
+                return False
+            # Type cast target: preceded by '::'
+            prefix = s[:m.start()].rstrip()
+            if prefix.endswith('::'):
+                return False
+            # CAST target type: preceded by AS (e.g. CAST(x AS type))
+            if re.search(r'\bAS$', prefix, re.IGNORECASE):
+                return False
+            # Collation: preceded by COLLATE
+            if re.search(r'\bCOLLATE$', prefix, re.IGNORECASE):
+                return False
+            # Date part in EXTRACT (e.g. EXTRACT(YEAR FROM col))
+            if re.search(r'\bEXTRACT\s*\(\s*$', prefix, re.IGNORECASE):
+                return False
+            ident = m.group(2)
+            # Unquoted SQL expression keywords are not column identifiers
+            if ident and not ident.startswith('"') and '.' not in ident:
+                if ident.upper() in _SQL_EXPR_KEYWORDS:
+                    return False
+            return True
+
         def find_referenced_columns(expr: str) -> set[str]:
             col_refs = set()
             for m in token_pat.finditer(expr):
                 if m.group(1):
                     continue
                 ident_full = m.group(2)
-                if not ident_full:
+                if not ident_full or not is_column_ref(m, expr):
                     continue
                 parts = re.split(r"\s*\.\s*", ident_full)
                 if len(parts) == 1:
@@ -274,7 +309,7 @@ class SchemaExtractor:
                 if lit:
                     return lit
                 ident_full = m.group(2)
-                if not ident_full:
+                if not ident_full or not is_column_ref(m, expr):
                     return m.group(0)
                 parts = re.split(r"\s*\.\s*", ident_full)
                 if len(parts) == 1:
@@ -310,9 +345,11 @@ class SchemaExtractor:
         for name in order:
             col = computed_cols[name]
             curr_expr = col.computed_source
-            for dep in graph[name]:
+            deps = [d for d in order if d in graph[name]]
+            for dep in deps:
                 dep_col = computed_cols[dep]
-                type_cast = f"::{dep_col.column_type.lower()}" if dep_col.column_type else ""
+                pg_type = get_postgres_type(dep_col.column_type).lower() if dep_col.column_type else ""
+                type_cast = f"::{pg_type}" if pg_type else ""
                 replacement = f"(({dep_col.computed_source}){type_cast})"
                 curr_expr = replace_col_ident(curr_expr, dep, replacement)
             col.computed_source = curr_expr

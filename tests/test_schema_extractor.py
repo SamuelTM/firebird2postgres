@@ -481,6 +481,67 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
         self.assertEqual(indexes[0].condition, "ACTIVE = 1")
         self.assertTrue(indexes[0].unique)
 
+    def test_item_f_computed_columns_regression(self):
+        """
+        Validates Item F requirements:
+        - Column "ABS" with expression ABS(X) is not mistaken for a self-reference.
+        - Literal 'A' does not become a dependency.
+        - Delimited identifier "A" correctly resolves to column A.
+        - Dependency chain A -> B -> C preserves intermediate conversions with valid PostgreSQL types.
+        - INT128 dependency produces ::numeric(39) rather than invalid ::int128.
+        - Precision/scale types (NUMERIC(15,2)) are preserved in casts.
+        - Real circular dependencies are properly detected and rejected.
+        """
+        # 1. Column "ABS" with expression ABS(X) + literal 'A' and delimited reference "X"
+        mock_cursor = MagicMock()
+        # Firebird types: 8 = INTEGER, 26 = INT128, 16 = BIGINT/NUMERIC
+        mock_cursor.fetchall.return_value = [
+            ("X", 8, 0, 4, 1, 0, 0, None, None, "RDB$1", None),
+            ("ABS", 8, 0, 4, 1, 0, 0, None, None, "RDB$2", "ABS(X)"),
+            ("A", 26, 0, 16, 1, 0, 0, None, None, "RDB$3", '"X" + 1'),
+            ("B", 16, 2, 8, 1, 15, 2, None, None, "RDB$4", 'A * 2'),
+            ("C", 16, 2, 8, 1, 15, 2, None, None, "RDB$5", "B + 10 || 'A'"),
+        ]
+        columns = SchemaExtractor._extract_columns(mock_cursor, "T_CALC", {"T_CALC"})
+        self.assertEqual(len(columns), 5)
+
+        # "ABS" computed source must stay "ABS(X)" without false self-referencing rejection
+        self.assertEqual(columns[1].computed_source, "ABS(X)")
+
+        # "A" references "X", expression is "X" + 1 (transpiled to "x" + 1)
+        self.assertEqual(columns[2].computed_source, '"x" + 1')
+
+        # "B" references INT128 column "A": must use valid ::numeric(39) cast, NOT ::int128
+        self.assertNotIn("int128", columns[3].computed_source.lower())
+        self.assertEqual(columns[3].computed_source, '(("x" + 1)::numeric(39)) * 2')
+
+        # "C" references "B" (NUMERIC(15,2)): must preserve precision/scale and literal 'A'
+        self.assertIn("::numeric(15, 2)", columns[4].computed_source.lower())
+        self.assertTrue(columns[4].computed_source.endswith("|| 'A'"))
+        self.assertEqual(
+            columns[4].computed_source,
+            '(((("x" + 1)::numeric(39)) * 2)::numeric(15, 2)) + 10 || \'A\''
+        )
+
+        # 2. Real cycle must be rejected
+        mock_cursor_cycle = MagicMock()
+        mock_cursor_cycle.fetchall.return_value = [
+            ("COL1", 8, 0, 4, 1, 0, 0, None, None, "RDB$1", "COL2 + 1"),
+            ("COL2", 8, 0, 4, 1, 0, 0, None, None, "RDB$2", "COL1 + 1"),
+        ]
+        with self.assertRaises(ValueError) as cm_cycle:
+            SchemaExtractor._extract_columns(mock_cursor_cycle, "T_CYCLE", {"T_CYCLE"})
+        self.assertIn("Circular dependency detected", str(cm_cycle.exception))
+
+        # 3. Real self-reference via column name must be rejected
+        mock_cursor_self = MagicMock()
+        mock_cursor_self.fetchall.return_value = [
+            ("MY_COL", 8, 0, 4, 1, 0, 0, None, None, "RDB$1", "MY_COL + 1"),
+        ]
+        with self.assertRaises(ValueError) as cm_self:
+            SchemaExtractor._extract_columns(mock_cursor_self, "T_SELF", {"T_SELF"})
+        self.assertIn("Self-referencing computed column 'MY_COL'", str(cm_self.exception))
+
 
 if __name__ == '__main__':
     unittest.main()
