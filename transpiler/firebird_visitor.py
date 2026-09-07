@@ -816,11 +816,14 @@ def _is_timestamp_expr(expr: str, symbols: dict[str, str] = None) -> bool:
 
     if symbols:
         clean = s.lstrip(':').strip('"').lower()
-        if _is_timestamp_type(symbols.get(clean, '')):
-            return True
         if '.' in clean:
+            # Qualified ref: prefer qualified key; bare fallback only if qualified is absent
             col_part = clean.split('.')[-1].strip('"')
-            if _is_timestamp_type(symbols.get(col_part, '')) or _is_timestamp_type(symbols.get(clean, '')):
+            key = clean if clean in symbols else col_part
+            if _is_timestamp_type(symbols.get(key, '')):
+                return True
+        else:
+            if _is_timestamp_type(symbols.get(clean, '')):
                 return True
 
     return False
@@ -865,11 +868,14 @@ def _is_date_expr(expr: str, symbols: dict[str, str] = None) -> bool:
 
     if symbols:
         clean = s.lstrip(':').strip('"').lower()
-        if _is_date_type(symbols.get(clean, '')):
-            return True
         if '.' in clean:
+            # Qualified ref: prefer qualified key; bare fallback only if qualified is absent
             col_part = clean.split('.')[-1].strip('"')
-            if _is_date_type(symbols.get(col_part, '')) or _is_date_type(symbols.get(clean, '')):
+            key = clean if clean in symbols else col_part
+            if _is_date_type(symbols.get(key, '')):
+                return True
+        else:
+            if _is_date_type(symbols.get(clean, '')):
                 return True
 
     return False
@@ -921,11 +927,14 @@ def _is_time_expr(expr: str, symbols: dict[str, str] = None) -> bool:
 
     if symbols:
         clean = s.lstrip(':').strip('"').lower()
-        if _is_time_type(symbols.get(clean, '')):
-            return True
         if '.' in clean:
+            # Qualified ref: prefer qualified key; bare fallback only if qualified is absent
             col_part = clean.split('.')[-1].strip('"')
-            if _is_time_type(symbols.get(col_part, '')) or _is_time_type(symbols.get(clean, '')):
+            key = clean if clean in symbols else col_part
+            if _is_time_type(symbols.get(key, '')):
+                return True
+        else:
+            if _is_time_type(symbols.get(clean, '')):
                 return True
 
     return False
@@ -1495,7 +1504,8 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                     f"{chosen_tbl.qualifier}.{raw_col_text}"
                 )
 
-    def _extract_tables_from_query_block(self, qb: FirebirdParser.Query_blockContext) -> list[TableSource]:
+    @staticmethod
+    def _extract_tables_from_query_block(qb: FirebirdParser.Query_blockContext) -> list[TableSource]:
         tables = []
         if not qb or not qb.from_clause():
             return tables
@@ -1530,8 +1540,16 @@ class ASTDialectRewriter(FirebirdParserVisitor):
         tables = self._extract_tables_from_query_block(ctx)
         scope = QueryScope(parent=self.current_scope, tables=tables)
         self.current_scope = scope
+        old_symbols = self.symbols.copy()
         try:
             if tables:
+                for tbl in tables:
+                    if tbl.alias_clean and tbl.table_name_clean:
+                        prefix = f"{tbl.table_name_clean}."
+                        for k, v in list(old_symbols.items()):
+                            if k.startswith(prefix):
+                                col = k[len(prefix):]
+                                self.symbols[f"{tbl.alias_clean}.{col}"] = v
                 self._disambiguate_scope(ctx, scope)
                 curr_p = ctx.parentCtx
                 while curr_p:
@@ -1548,9 +1566,11 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                     curr_p = curr_p.parentCtx
             return self.visitChildren(ctx)
         finally:
+            self.symbols = old_symbols
             self.current_scope = scope.parent
 
-    def _extract_table_source_from_general_table_ref(self, general_table_ref) -> Optional[TableSource]:
+    @staticmethod
+    def _extract_table_source_from_general_table_ref(general_table_ref) -> Optional[TableSource]:
         if not general_table_ref:
             return None
         alias = None
@@ -1574,6 +1594,13 @@ class ASTDialectRewriter(FirebirdParserVisitor):
         if table_source and table_source.table_name_clean.upper() != 'RDB$DATABASE':
             scope = QueryScope(parent=self.current_scope, tables=[table_source])
             self.current_scope = scope
+            old_symbols = self.symbols.copy()
+            if table_source.alias_clean and table_source.table_name_clean:
+                prefix = f"{table_source.table_name_clean}."
+                for k, v in list(old_symbols.items()):
+                    if k.startswith(prefix):
+                        col = k[len(prefix):]
+                        self.symbols[f"{table_source.alias_clean}.{col}"] = v
             try:
                 if ctx.update_set_clause():
                     self._disambiguate_scope(ctx.update_set_clause(), scope)
@@ -1581,6 +1608,7 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                     self._disambiguate_scope(ctx.where_clause(), scope)
                 return self.visitChildren(ctx)
             finally:
+                self.symbols = old_symbols
                 self.current_scope = scope.parent
         return self.visitChildren(ctx)
 
@@ -1589,11 +1617,19 @@ class ASTDialectRewriter(FirebirdParserVisitor):
         if table_source and table_source.table_name_clean.upper() != 'RDB$DATABASE':
             scope = QueryScope(parent=self.current_scope, tables=[table_source])
             self.current_scope = scope
+            old_symbols = self.symbols.copy()
+            if table_source.alias_clean and table_source.table_name_clean:
+                prefix = f"{table_source.table_name_clean}."
+                for k, v in list(old_symbols.items()):
+                    if k.startswith(prefix):
+                        col = k[len(prefix):]
+                        self.symbols[f"{table_source.alias_clean}.{col}"] = v
             try:
                 if ctx.where_clause():
                     self._disambiguate_scope(ctx.where_clause(), scope)
                 return self.visitChildren(ctx)
             finally:
+                self.symbols = old_symbols
                 self.current_scope = scope.parent
         return self.visitChildren(ctx)
 

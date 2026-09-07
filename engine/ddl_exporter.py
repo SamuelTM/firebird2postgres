@@ -1,13 +1,13 @@
-import os
 import logging
+import os
 from concurrent.futures import ProcessPoolExecutor
 from graphlib import TopologicalSorter
+
 from config import DUMP_DIR, DumpFiles, get_dump_path
 from models import (
     Sequence,
     get_postgres_type,
     resolve_firebird_type,
-    resolve_pg_domain_name,
     build_domain_mapping,
     decode_trigger_type,
 )
@@ -464,6 +464,11 @@ class DdlExporter:
         """
         Queries all column data types for user relations in Firebird to provide
         type inference context (symbols) during DDL transpilation.
+
+        Bare column names (without table qualifier) are only stored when ALL tables
+        containing that column agree on the PostgreSQL type. This prevents cross-table
+        type pollution where A.D(TIMESTAMP) and B.D(DATE) would make bare 'D' resolve
+        to whichever table was read first from the catalog.
         """
         query = """
             SELECT TRIM(RF.RDB$RELATION_NAME), TRIM(RF.RDB$FIELD_NAME),
@@ -475,6 +480,7 @@ class DdlExporter:
             WHERE (RF.RDB$SYSTEM_FLAG = 0 OR RF.RDB$SYSTEM_FLAG IS NULL);
         """
         symbols = {}
+        bare_types: dict[str, set[str]] = {}  # col -> {type1, type2, ...}
         try:
             cursor.execute(query)
             for row in cursor.fetchall():
@@ -495,8 +501,12 @@ class DdlExporter:
                 if pg_type:
                     if rel and col:
                         symbols[f"{rel}.{col}"] = pg_type
-                    if col and col not in symbols:
-                        symbols[col] = pg_type
+                    if col:
+                        bare_types.setdefault(col, set()).add(pg_type.upper())
+            # Only store bare column name when all tables agree on the type
+            for col, types in bare_types.items():
+                if len(types) == 1:
+                    symbols[col] = next(iter(types))
         except Exception as e:
             logger.warning("Failed to fetch column symbols for DDL export: %s", e)
         return symbols
