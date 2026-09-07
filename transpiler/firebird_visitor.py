@@ -503,15 +503,33 @@ def _normalize_procedure_params(sql: str) -> str:
     return "".join(result)
 
 
-def _is_date_type(type_str: str) -> bool:
-    if not type_str:
-        return False
-    u = type_str.strip().upper()
-    return ('DATE' in u) and ('TIMESTAMP' not in u)
+def _split_top_level_args(s: str) -> list[str]:
+    parts = []
+    depth = 0
+    in_str = False
+    last = 0
+    for i, c in enumerate(s):
+        if c == "'":
+            if not in_str:
+                in_str = True
+            elif i + 1 < len(s) and s[i + 1] == "'":
+                pass
+            else:
+                in_str = False
+        elif not in_str:
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+            elif c == "," and depth == 0:
+                parts.append(s[last:i].strip())
+                last = i + 1
+    parts.append(s[last:].strip())
+    return [p for p in parts if p]
 
 
-def _is_date_expr(expr: str, symbols: dict[str, str] = None) -> bool:
-    s = expr.strip()
+def _unwrap_outer_parens(s: str) -> str:
+    s = s.strip()
     while s.startswith("(") and s.endswith(")"):
         d = 0
         matching = True
@@ -527,7 +545,18 @@ def _is_date_expr(expr: str, symbols: dict[str, str] = None) -> bool:
             s = s[1:-1].strip()
         else:
             break
+    return s
 
+
+def _is_date_type(type_str: str) -> bool:
+    if not type_str:
+        return False
+    u = type_str.strip().upper()
+    return ('DATE' in u) and ('TIMESTAMP' not in u)
+
+
+def _is_date_expr(expr: str, symbols: dict[str, str] = None) -> bool:
+    s = _unwrap_outer_parens(expr)
     upper = s.upper()
     if (
         upper.startswith("DATE ")
@@ -537,6 +566,26 @@ def _is_date_expr(expr: str, symbols: dict[str, str] = None) -> bool:
         or upper.endswith("::DATE")
     ):
         return True
+
+    m_fn = re.match(r"^(COALESCE|NULLIF|IIF)\s*\((.*)\)$", s, re.IGNORECASE | re.DOTALL)
+    if m_fn:
+        fn = m_fn.group(1).upper()
+        args = _split_top_level_args(m_fn.group(2))
+        if fn == "NULLIF" and args:
+            return _is_date_expr(args[0], symbols)
+        if fn == "IIF" and len(args) >= 3:
+            return _is_date_expr(args[1], symbols) or _is_date_expr(args[2], symbols)
+        if fn == "COALESCE" and args:
+            return any(_is_date_expr(arg, symbols) for arg in args)
+
+    if upper.startswith("CASE") and upper.endswith("END"):
+        then_parts = re.findall(r"\bTHEN\b\s+(.*?)\s+(?=\bWHEN\b|\bELSE\b|\bEND\b)", s, re.IGNORECASE | re.DOTALL)
+        else_match = re.search(r"\bELSE\b\s+(.*?)\s+\bEND\b", s, re.IGNORECASE | re.DOTALL)
+        branch_exprs = list(then_parts)
+        if else_match:
+            branch_exprs.append(else_match.group(1))
+        if branch_exprs and any(_is_date_expr(b, symbols) for b in branch_exprs):
+            return True
 
     if symbols:
         clean = s.lstrip(':').strip('"').lower()
@@ -558,15 +607,36 @@ def _is_time_type(type_str: str) -> bool:
 
 
 def _is_time_expr(expr: str, symbols: dict[str, str] = None) -> bool:
-    s = expr.strip().strip("()").strip()
+    s = _unwrap_outer_parens(expr)
     upper = s.upper()
     if (
         upper.startswith("TIME ")
         or upper.startswith("TIME'")
         or upper in ("CURRENT_TIME", "LOCALTIME")
         or bool(re.search(r'\bAS\s+TIME\b', upper))
+        or upper.endswith("::TIME")
     ):
         return True
+
+    m_fn = re.match(r"^(COALESCE|NULLIF|IIF)\s*\((.*)\)$", s, re.IGNORECASE | re.DOTALL)
+    if m_fn:
+        fn = m_fn.group(1).upper()
+        args = _split_top_level_args(m_fn.group(2))
+        if fn == "NULLIF" and args:
+            return _is_time_expr(args[0], symbols)
+        if fn == "IIF" and len(args) >= 3:
+            return _is_time_expr(args[1], symbols) or _is_time_expr(args[2], symbols)
+        if fn == "COALESCE" and args:
+            return any(_is_time_expr(arg, symbols) for arg in args)
+
+    if upper.startswith("CASE") and upper.endswith("END"):
+        then_parts = re.findall(r"\bTHEN\b\s+(.*?)\s+(?=\bWHEN\b|\bELSE\b|\bEND\b)", s, re.IGNORECASE | re.DOTALL)
+        else_match = re.search(r"\bELSE\b\s+(.*?)\s+\bEND\b", s, re.IGNORECASE | re.DOTALL)
+        branch_exprs = list(then_parts)
+        if else_match:
+            branch_exprs.append(else_match.group(1))
+        if branch_exprs and any(_is_time_expr(b, symbols) for b in branch_exprs):
+            return True
 
     if symbols:
         clean = s.lstrip(':').strip('"').lower()

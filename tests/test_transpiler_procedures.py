@@ -718,13 +718,16 @@ class TestTranspilerProcedures(unittest.TestCase):
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
         self.assertIn("DIFF := ((D + (1) * INTERVAL '1 day')::date) - D;", pg_sql)
 
-
-
-
-
-
-
-
-
-
+    def test_datediff_with_compound_time_expressions(self):
+        fb_sql = """
+        CREATE PROCEDURE SP_TEST_COMPOUND_TIME (T1 TIME, T2 TIME)
+        RETURNS (DIFF_H INTEGER)
+        AS
+        BEGIN
+            DIFF_H = DATEDIFF(HOUR, COALESCE(T1, T2), COALESCE(T2, T1));
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertNotIn("::timestamp", pg_sql)
+        self.assertIn("DATE_TRUNC('hour', COALESCE(T2, T1)) - DATE_TRUNC('hour', COALESCE(T1, T2))", pg_sql)
 
