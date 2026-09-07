@@ -214,7 +214,8 @@ def run_ddl_validation(
     In dry-run mode (default), the entire transaction is rolled back at the end.
     Returns (results, runtime_issues).
     """
-    conn.autocommit = False
+    if getattr(conn, 'autocommit', False):
+        conn.autocommit = False
     cursor = conn.cursor()
     try:
         results: List[ValidationResult] = []
@@ -321,7 +322,10 @@ def run_ddl_validation(
             pass
 
 
-def print_diagnostic_report(results: List[ValidationResult]) -> bool:
+def print_diagnostic_report(
+    results: List[ValidationResult],
+    runtime_issues: Optional[List[Tuple[str, str]]] = None
+) -> bool:
     """
     Formats and prints a comprehensive diagnostic report.
     Returns True if all statements passed, False otherwise.
@@ -359,9 +363,18 @@ def print_diagnostic_report(results: List[ValidationResult]) -> bool:
     total_rate = (len(passed) / total) * 100
     print(f"{'OVERALL TOTAL':<18} | {total:<8} | {len(passed):<10} | {len(failed):<8} | {total_rate:>6.1f}%")
 
+    if runtime_issues:
+        print("\n" + "=" * 80)
+        print(f"  PL/PGSQL RUNTIME CHECKER ISSUES ({len(runtime_issues)} DETECTED)")
+        print("=" * 80)
+        for idx, (obj_name, issue_msg) in enumerate(runtime_issues, 1):
+            print(f"\n[{idx}/{len(runtime_issues)}] ⚠️  Object: {obj_name}")
+            for line in issue_msg.splitlines():
+                print(f"    ▶ {line}")
+
     if failed:
         print("\n" + "=" * 80)
-        print(f"  FAILURE DETAILS ({len(failed)} OBJECTS WITH COMPILATION ERRORS)")
+        print(f"  FAILURE DETAILS ({len(failed)} OBJECTS WITH COMPILATION/CHECK ERRORS)")
         print("=" * 80)
 
         for idx, r in enumerate(failed, 1):
@@ -378,12 +391,13 @@ def print_diagnostic_report(results: List[ValidationResult]) -> bool:
                 print(f"    ▶ {line}")
 
             # Show snippet of the SQL
-            sql_snippet = "\n".join(stmt.sql.splitlines()[:6])
-            if len(stmt.sql.splitlines()) > 6:
-                sql_snippet += "\n    ..."
-            print("  SQL Snippet:")
-            for s_line in sql_snippet.splitlines():
-                print(f"    | {s_line}")
+            if stmt.sql:
+                sql_snippet = "\n".join(stmt.sql.splitlines()[:6])
+                if len(stmt.sql.splitlines()) > 6:
+                    sql_snippet += "\n    ..."
+                print("  SQL Snippet:")
+                for s_line in sql_snippet.splitlines():
+                    print(f"    | {s_line}")
         return False
     else:
         print("\nSUCCESS! 100% of SQL objects compiled in PostgreSQL without any errors")
@@ -407,7 +421,9 @@ def validate_postgres_ddl(
 ) -> bool:
     """
     Validates the generated PostgreSQL DDL files against a PostgreSQL instance.
-    If no connection is provided, it connects using the .env configuration.
+    If no connection is provided, it connects using the .env configuration and closes it afterwards.
+    External connections passed in by the caller remain open and under caller responsibility.
+    Diagnostic preparation occurs before commit; errors in presentation do not claim rollback.
     """
     close_connection = False
     if target_files is None:
@@ -423,6 +439,9 @@ def validate_postgres_ddl(
             print(f"[FATAL ERROR] Could not connect to PostgreSQL: {e}")
             return False
 
+    committed = False
+    results = []
+    runtime_issues = []
     try:
         results, runtime_issues = run_ddl_validation(
             conn=pg_connection,
@@ -431,13 +450,41 @@ def validate_postgres_ddl(
             allow_missing_files=allow_missing_files,
             allow_empty_files=allow_empty_files
         )
-        return print_diagnostic_report(results, runtime_issues=runtime_issues)
+        committed = apply_changes and all(r.success for r in results)
+    except Exception as e:
+        print(f"[FATAL ERROR] DDL validation failed during execution/preparation: {e}")
+        return False
     finally:
-        if close_connection:
-            pg_connection.close()
+        if close_connection and pg_connection is not None:
+            try:
+                pg_connection.close()
+            except Exception:
+                pass
+
+    try:
+        return print_diagnostic_report(results, runtime_issues=runtime_issues)
+    except Exception as e:
+        if committed:
+            print(f"[ERROR] Failed to display diagnostic report: {e}. Note: changes WERE committed to the database.")
+        else:
+            print(f"[ERROR] Failed to display diagnostic report: {e}. Note: changes were NOT committed (rolled back).")
+        return False
 
 
 if __name__ == '__main__':
-    success = validate_postgres_ddl()
+    import argparse
+    parser = argparse.ArgumentParser(description="Validate PostgreSQL DDL compilation and runtime correctness.")
+    parser.add_argument('--apply', action='store_true', help="Persist DDL changes to database if validation passes.")
+    parser.add_argument('--files', nargs='*', help="Target SQL files to validate.")
+    parser.add_argument('--allow-missing', action='store_true', help="Allow missing target files without failing validation.")
+    parser.add_argument('--allow-empty', action='store_true', help="Allow empty target files without failing validation.")
+    cli_args = parser.parse_args()
+
+    success = validate_postgres_ddl(
+        target_files=cli_args.files if cli_args.files else None,
+        apply_changes=cli_args.apply,
+        allow_missing_files=cli_args.allow_missing,
+        allow_empty_files=cli_args.allow_empty
+    )
     if not success:
         sys.exit(1)

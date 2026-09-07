@@ -182,5 +182,173 @@ class TestRunDdlValidation(unittest.TestCase):
         self.assertFalse(print_diagnostic_report(results))
 
 
+def check_live_postgres_available() -> bool:
+    try:
+        from config import get_postgres_connection, PostgresConfig
+        cfg = PostgresConfig()
+        conn = get_postgres_connection(cfg)
+        cur = conn.cursor()
+        cur.execute("SELECT 1;")
+        res = cur.fetchone()
+        conn.close()
+        return bool(res and res[0] == 1)
+    except Exception:
+        return False
+
+
+HAS_REAL_PG = check_live_postgres_available()
+
+
+@unittest.skipUnless(HAS_REAL_PG, "Live PostgreSQL instance required for full regression tests")
+class TestValidatePostgresDdlRegression(unittest.TestCase):
+    """
+    Regression tests calling the complete public validate_postgres_ddl() function
+    against a real PostgreSQL database with a disposable schema.
+    Verifies return values, diagnostic report output, connection ownership,
+    and PostgreSQL catalog state across dry-run and apply modes.
+    """
+
+    def setUp(self):
+        from config import get_postgres_connection
+        self.conn = get_postgres_connection()
+        self.schema_name = "test_disposable_val"
+        cur = self.conn.cursor()
+        cur.execute(f"DROP SCHEMA IF EXISTS {self.schema_name} CASCADE;")
+        cur.execute(f"CREATE SCHEMA {self.schema_name};")
+        cur.execute(f"SET search_path TO {self.schema_name}, public;")
+        self.conn.commit()
+
+    def tearDown(self):
+        if self.conn and not self.conn.closed:
+            try:
+                cur = self.conn.cursor()
+                cur.execute(f"DROP SCHEMA IF EXISTS {self.schema_name} CASCADE;")
+                self.conn.commit()
+            except Exception:
+                pass
+            finally:
+                self.conn.close()
+
+    def test_complete_public_function_valid_ddl_dry_run_never_persists(self):
+        import tempfile, os
+        from validate_postgres_ddl import validate_postgres_ddl
+
+        with tempfile.NamedTemporaryFile("w+", suffix=".sql", delete=False) as f:
+            f.write("CREATE TABLE reg_dry_run_table (id INT PRIMARY KEY, name VARCHAR(50));\n")
+            fpath = f.name
+        self.addCleanup(os.remove, fpath)
+
+        success = validate_postgres_ddl(
+            pg_connection=self.conn,
+            target_files=[fpath],
+            apply_changes=False
+        )
+        self.assertTrue(success)
+        # Caller's connection must remain open and under caller responsibility
+        self.assertFalse(self.conn.closed)
+
+        # Verify catalog: table must NOT have been persisted in dry-run mode
+        cur = self.conn.cursor()
+        cur.execute(
+            f"SELECT 1 FROM information_schema.tables "
+            f"WHERE table_schema = '{self.schema_name}' AND table_name = 'reg_dry_run_table';"
+        )
+        self.assertIsNone(cur.fetchone())
+
+    def test_complete_public_function_valid_ddl_apply_persists_in_catalog(self):
+        import tempfile, os
+        from validate_postgres_ddl import validate_postgres_ddl
+
+        with tempfile.NamedTemporaryFile("w+", suffix=".sql", delete=False) as f:
+            f.write("CREATE TABLE reg_apply_table (id INT PRIMARY KEY, name VARCHAR(50));\n")
+            fpath = f.name
+        self.addCleanup(os.remove, fpath)
+
+        success = validate_postgres_ddl(
+            pg_connection=self.conn,
+            target_files=[fpath],
+            apply_changes=True
+        )
+        self.assertTrue(success)
+        self.assertFalse(self.conn.closed)
+
+        # Verify catalog: table MUST have been persisted in apply mode
+        cur = self.conn.cursor()
+        cur.execute(
+            f"SELECT 1 FROM information_schema.tables "
+            f"WHERE table_schema = '{self.schema_name}' AND table_name = 'reg_apply_table';"
+        )
+        row = cur.fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], 1)
+
+    def test_complete_public_function_invalid_ddl_apply_reverts_all_changes(self):
+        import tempfile, os
+        from validate_postgres_ddl import validate_postgres_ddl
+
+        with tempfile.NamedTemporaryFile("w+", suffix=".sql", delete=False) as f:
+            # Statement 1 valid, Statement 2 syntax error
+            f.write(
+                "CREATE TABLE reg_first_ok (id INT PRIMARY KEY);\n"
+                "CREATE TABLE reg_second_bad (id INT INVALID_SYNTAX);\n"
+            )
+            fpath = f.name
+        self.addCleanup(os.remove, fpath)
+
+        success = validate_postgres_ddl(
+            pg_connection=self.conn,
+            target_files=[fpath],
+            apply_changes=True
+        )
+        self.assertFalse(success)
+        self.assertFalse(self.conn.closed)
+
+        # Verify catalog: all changes rolled back; Statement 1 must NOT exist
+        cur = self.conn.cursor()
+        cur.execute(
+            f"SELECT 1 FROM information_schema.tables "
+            f"WHERE table_schema = '{self.schema_name}' AND table_name = 'reg_first_ok';"
+        )
+        self.assertIsNone(cur.fetchone())
+
+    def test_complete_public_function_report_signature_and_runtime_issues_formatting(self):
+        from validate_postgres_ddl import print_diagnostic_report, ValidationResult, SQLStatement
+
+        stmt = SQLStatement("test.sql", "FUNCTION", "sp_demo", "SELECT 1;", 1)
+        results = [ValidationResult(stmt, success=True)]
+        runtime_issues = [("sp_demo", "Line 4: table test does not exist")]
+
+        # Calling print_diagnostic_report with runtime_issues must succeed without TypeError
+        ret = print_diagnostic_report(results, runtime_issues=runtime_issues)
+        self.assertTrue(ret)
+
+    def test_presentation_failure_does_not_claim_rollback_when_committed(self):
+        import tempfile, os
+        from unittest.mock import patch
+        from validate_postgres_ddl import validate_postgres_ddl
+
+        with tempfile.NamedTemporaryFile("w+", suffix=".sql", delete=False) as f:
+            f.write("CREATE TABLE reg_tbl_pres (id INT PRIMARY KEY);\n")
+            fpath = f.name
+        self.addCleanup(os.remove, fpath)
+
+        # Simulate presentation failure after successful commit
+        with patch('validate_postgres_ddl.print_diagnostic_report', side_effect=RuntimeError("Formatting crash")):
+            import io
+            from contextlib import redirect_stdout
+            out = io.StringIO()
+            with redirect_stdout(out):
+                success = validate_postgres_ddl(
+                    pg_connection=self.conn,
+                    target_files=[fpath],
+                    apply_changes=True
+                )
+            self.assertFalse(success)
+            output_str = out.getvalue()
+            # Must accurately indicate changes WERE committed, not that a rollback occurred
+            self.assertIn("changes WERE committed", output_str)
+            self.assertNotIn("rolled back all changes", output_str)
+
+
 if __name__ == '__main__':
     unittest.main()
