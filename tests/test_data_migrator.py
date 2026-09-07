@@ -327,5 +327,47 @@ class TestDataMigrator(unittest.TestCase):
         # copy_expert should have been called multiple times (flushes) rather than once
         self.assertGreaterEqual(self.mock_pg_cur.copy_expert.call_count, 3)
 
+    def test_blob_serialized_byte_buffer_measures_exact_utf8_bytes(self):
+        from engine.data_migrator import SerializedByteBuffer
+        buf = SerializedByteBuffer()
+        emoji_str = "🚀\n"
+        buf.write(emoji_str)
+        self.assertEqual(len(emoji_str), 2)  # 2 Python characters
+        self.assertEqual(buf.tell(), len(emoji_str.encode('utf-8')))  # 5 UTF-8 bytes
+        self.assertEqual(buf.byte_count, 5)
+
+        acc_str = "Operação de Validação\n"
+        buf.write(acc_str)
+        total_expected = len(emoji_str.encode('utf-8')) + len(acc_str.encode('utf-8'))
+        self.assertEqual(buf.tell(), total_expected)
+
+    def test_blob_single_row_exceeding_budget_flushes_buffer_before_and_after(self):
+        from engine.data_migrator import _import_single_table
+
+        table = Table('TAB_LARGE_BLOB')
+        table.columns.append(Column('ID', 'INTEGER', nullable=False))
+        table.columns.append(Column('DOC', 'BLOB SUBTYPE 0', nullable=True))
+
+        rows = [
+            (1, b'A' * 30),
+            (2, b'B' * 300),
+            (3, b'C' * 30)
+        ]
+        self.mock_fb_cur.fetchmany.side_effect = [rows, []]
+
+        _import_single_table(table, self.mock_fb_cur, self.mock_pg_cur, self.mock_pg_con, max_buffer_bytes=200)
+        self.assertEqual(self.mock_pg_cur.copy_expert.call_count, 3)
+
+    def test_blob_table_uses_row_by_row_fetch_size(self):
+        from engine.data_migrator import _import_single_table
+
+        table = Table('TAB_BLOB_STREAM')
+        table.columns.append(Column('ID', 'INTEGER', nullable=False))
+        table.columns.append(Column('IMG', 'BLOB SUBTYPE 0', nullable=True))
+
+        self.mock_fb_cur.fetchmany.return_value = []
+        _import_single_table(table, self.mock_fb_cur, self.mock_pg_cur, self.mock_pg_con)
+        self.mock_fb_cur.fetchmany.assert_called_with(1)
+
 
 

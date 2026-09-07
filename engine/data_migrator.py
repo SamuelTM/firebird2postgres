@@ -14,6 +14,41 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_BUFFER_BYTES = 32 * 1024 * 1024  # 32 MB buffer budget per worker
 
 
+class SerializedByteBuffer:
+    """
+    In-memory text buffer for PostgreSQL COPY protocol that accurately tracks
+    serialized volume in UTF-8 bytes rather than Python unicode character count.
+    """
+    def __init__(self):
+        self._buf = io.StringIO()
+        self._bytes = 0
+
+    def write(self, s: str) -> int:
+        self._bytes += len(s.encode('utf-8'))
+        return self._buf.write(s)
+
+    @property
+    def byte_count(self) -> int:
+        return self._bytes
+
+    def tell(self) -> int:
+        # Returns exact serialized byte count
+        return self._bytes
+
+    def seek(self, pos: int) -> int:
+        return self._buf.seek(pos)
+
+    def read(self, *args, **kwargs) -> str:
+        return self._buf.read(*args, **kwargs)
+
+    def getvalue(self) -> str:
+        return self._buf.getvalue()
+
+    def reset(self):
+        self._buf = io.StringIO()
+        self._bytes = 0
+
+
 def _import_single_table(table: Table, fb_cur, pg_cur, pg_con, max_buffer_bytes: int = DEFAULT_MAX_BUFFER_BYTES) -> tuple[int, dict[str, int]]:
     """
     Imports data for a single table:
@@ -37,11 +72,12 @@ def _import_single_table(table: Table, fb_cur, pg_cur, pg_con, max_buffer_bytes:
     pg_cur.execute(f'TRUNCATE TABLE {pg_quote_ident(table.pg_name)};')
 
     blob_count = sum(1 for col in table.columns if 'BLOB' in col.column_type)
-    # Tables with BLOBs fetch in smaller row slices (100 rows) to prevent the Firebird client
-    # and Python runtime from buffering gigabytes of binary data before serialization
-    fetch_size = 100 if blob_count > 0 else 10000
+    # When tables contain BLOB columns, stream row-by-row (fetch_size=1) to prevent the
+    # Firebird driver and Python runtime from buffering dozens/hundreds of large binary objects
+    # into memory before serialization.
+    fetch_size = 1 if blob_count > 0 else 10000
     if blob_count > 0:
-        logger.debug(f"Found {blob_count} BLOB column(s) in '{table.name}'. Adjusted fetch slice to {fetch_size} rows with {max_buffer_bytes // (1024 * 1024)}MB memory buffer budget.")
+        logger.debug(f"Found {blob_count} BLOB column(s) in '{table.name}'. Adjusted fetch slice to row-by-row streaming with {max_buffer_bytes // (1024 * 1024)}MB serialized byte buffer budget.")
 
     # Explicitly list columns to ensure it perfectly matches the postgres insert order.
     # Exclude computed (GENERATED ALWAYS) columns, as PostgreSQL forbids inserting into them directly.
@@ -60,7 +96,7 @@ def _import_single_table(table: Table, fb_cur, pg_cur, pg_con, max_buffer_bytes:
 
     total_rows = 0
     nul_stats: dict[str, int] = {}
-    buf = io.StringIO()
+    buf = SerializedByteBuffer()
 
     while True:
         rows = fb_cur.fetchmany(fetch_size)
@@ -72,31 +108,45 @@ def _import_single_table(table: Table, fb_cur, pg_cur, pg_con, max_buffer_bytes:
             for col_idx, val in enumerate(row):
                 if val is None:
                     line.append(r'\N')
-                elif isinstance(val, bytes):
-                    line.append(r'\\x' + val.hex())
-                elif isinstance(val, str):
-                    if '\x00' in val:
-                        col_name = col_names[col_idx]
-                        nul_stats[col_name] = nul_stats.get(col_name, 0) + val.count('\x00')
-                        val = val.replace('\x00', '')
-                    line.append(val.replace('\\', '\\\\')
-                                   .replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t'))
-                elif isinstance(val, bool):
-                    line.append('t' if val else 'f')
                 else:
-                    line.append(str(val))
-            buf.write('\t'.join(line) + '\n')
+                    if hasattr(val, 'read') and callable(val.read):
+                        val = val.read()
+                    if isinstance(val, (bytes, bytearray, memoryview)):
+                        line.append(r'\\x' + bytes(val).hex())
+                    elif isinstance(val, str):
+                        if '\x00' in val:
+                            col_name = col_names[col_idx]
+                            nul_stats[col_name] = nul_stats.get(col_name, 0) + val.count('\x00')
+                            val = val.replace('\x00', '')
+                        line.append(val.replace('\\', '\\\\')
+                                       .replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t'))
+                    elif isinstance(val, bool):
+                        line.append('t' if val else 'f')
+                    else:
+                        line.append(str(val))
 
-            # Flush buffer incrementally via COPY as soon as accumulated text volume exceeds memory budget
-            if buf.tell() >= max_buffer_bytes:
+            row_str = '\t'.join(line) + '\n'
+            row_bytes = len(row_str.encode('utf-8'))
+
+            # If existing buffer has data and adding this row would exceed max_buffer_bytes,
+            # flush existing buffer first so we don't accumulate beyond budget
+            if buf.byte_count > 0 and (buf.byte_count + row_bytes > max_buffer_bytes):
                 buf.seek(0)
                 pg_cur.copy_expert(copy_sql, buf)
-                buf = io.StringIO()
+                buf = SerializedByteBuffer()
+
+            buf.write(row_str)
+
+            # Flush buffer incrementally via COPY as soon as accumulated text volume exceeds memory budget
+            if buf.byte_count >= max_buffer_bytes:
+                buf.seek(0)
+                pg_cur.copy_expert(copy_sql, buf)
+                buf = SerializedByteBuffer()
 
         total_rows += len(rows)
 
     # Flush any remaining rows in buffer
-    if buf.tell() > 0:
+    if buf.byte_count > 0:
         buf.seek(0)
         pg_cur.copy_expert(copy_sql, buf)
 
