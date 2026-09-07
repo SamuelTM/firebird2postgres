@@ -225,6 +225,32 @@ class TestDataMigrator(unittest.TestCase):
         self.assertIn('IS NOT NULL', query)
         self.assertIn('s.is_called', query)
 
+    def test_identity_and_descending_sequence_synchronization(self):
+        t = Table('TEST_TBL')
+        col_id = Column('ID', 'BIGINT', nullable=False, identity_type='ALWAYS', identity_increment=1, identity_current=500)
+        col_desc = Column('CODE', 'INTEGER', nullable=False, sequence_name='GEN_DESC')
+        t.columns.extend([col_id, col_desc])
+
+        self.mock_fb_cur.fetchmany.return_value = []
+        # Return -2 for increment_by of gen_desc from pg_sequences
+        self.mock_pg_cur.fetchone.return_value = (-2,)
+        success = self.migrator.import_data([t], max_workers=1)
+        self.assertTrue(success)
+
+        executed_queries = [call[0][0] for call in self.mock_pg_cur.execute.call_args_list]
+        sync_queries = [q for q in executed_queries if 'SELECT setval(' in q]
+        self.assertEqual(len(sync_queries), 2)
+
+        # 1. Identity column sync query must preserve original current value 500
+        id_sync = sync_queries[0]
+        self.assertIn('GREATEST(500,', id_sync)
+
+        # 2. Descending sequence sync query must use LEAST and MIN
+        desc_sync = sync_queries[1]
+        self.assertIn('WITH min_calc AS MATERIALIZED', desc_sync)
+        self.assertIn('LEAST(', desc_sync)
+        self.assertIn('SELECT MIN("code")', desc_sync)
+
     def test_check_source_consistency_read_only(self):
         self.mock_fb_cur.fetchone.side_effect = [
             (1, 0),  # MON$READ_ONLY = 1, MON$SHUTDOWN_MODE = 0

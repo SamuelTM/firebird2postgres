@@ -87,7 +87,7 @@ class SchemaExtractor:
                        f.RDB$FIELD_PRECISION, f.RDB$FIELD_SCALE,
                        rf.RDB$DEFAULT_SOURCE, f.RDB$DEFAULT_SOURCE,
                        rf.RDB$FIELD_SOURCE, f.RDB$COMPUTED_SOURCE,
-                       rf.RDB$IDENTITY_TYPE
+                       rf.RDB$IDENTITY_TYPE, rf.RDB$GENERATOR_NAME
                 FROM RDB$RELATION_FIELDS rf
                 JOIN RDB$FIELDS f ON rf.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
                 WHERE rf.RDB$RELATION_NAME = ?
@@ -95,19 +95,35 @@ class SchemaExtractor:
             """, (table_name,))
             raw_rows = cursor.fetchall()
         except Exception:
-            cursor.execute("""
-                SELECT rf.RDB$FIELD_NAME, f.RDB$FIELD_TYPE, f.RDB$FIELD_SUB_TYPE,
-                       COALESCE(f.RDB$CHARACTER_LENGTH, f.RDB$FIELD_LENGTH),
-                       COALESCE(rf.RDB$NULL_FLAG, f.RDB$NULL_FLAG),
-                       f.RDB$FIELD_PRECISION, f.RDB$FIELD_SCALE,
-                       rf.RDB$DEFAULT_SOURCE, f.RDB$DEFAULT_SOURCE,
-                       rf.RDB$FIELD_SOURCE, f.RDB$COMPUTED_SOURCE
-                FROM RDB$RELATION_FIELDS rf
-                JOIN RDB$FIELDS f ON rf.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
-                WHERE rf.RDB$RELATION_NAME = ?
-                ORDER BY rf.RDB$FIELD_POSITION;
-            """, (table_name,))
-            raw_rows = cursor.fetchall()
+            try:
+                cursor.execute("""
+                    SELECT rf.RDB$FIELD_NAME, f.RDB$FIELD_TYPE, f.RDB$FIELD_SUB_TYPE,
+                           COALESCE(f.RDB$CHARACTER_LENGTH, f.RDB$FIELD_LENGTH),
+                           COALESCE(rf.RDB$NULL_FLAG, f.RDB$NULL_FLAG),
+                           f.RDB$FIELD_PRECISION, f.RDB$FIELD_SCALE,
+                           rf.RDB$DEFAULT_SOURCE, f.RDB$DEFAULT_SOURCE,
+                           rf.RDB$FIELD_SOURCE, f.RDB$COMPUTED_SOURCE,
+                           rf.RDB$IDENTITY_TYPE
+                    FROM RDB$RELATION_FIELDS rf
+                    JOIN RDB$FIELDS f ON rf.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
+                    WHERE rf.RDB$RELATION_NAME = ?
+                    ORDER BY rf.RDB$FIELD_POSITION;
+                """, (table_name,))
+                raw_rows = cursor.fetchall()
+            except Exception:
+                cursor.execute("""
+                    SELECT rf.RDB$FIELD_NAME, f.RDB$FIELD_TYPE, f.RDB$FIELD_SUB_TYPE,
+                           COALESCE(f.RDB$CHARACTER_LENGTH, f.RDB$FIELD_LENGTH),
+                           COALESCE(rf.RDB$NULL_FLAG, f.RDB$NULL_FLAG),
+                           f.RDB$FIELD_PRECISION, f.RDB$FIELD_SCALE,
+                           rf.RDB$DEFAULT_SOURCE, f.RDB$DEFAULT_SOURCE,
+                           rf.RDB$FIELD_SOURCE, f.RDB$COMPUTED_SOURCE
+                    FROM RDB$RELATION_FIELDS rf
+                    JOIN RDB$FIELDS f ON rf.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
+                    WHERE rf.RDB$RELATION_NAME = ?
+                    ORDER BY rf.RDB$FIELD_POSITION;
+                """, (table_name,))
+                raw_rows = cursor.fetchall()
         symbols = {
             row[0].strip().lower(): resolve_firebird_type(
                 field_type=row[1],
@@ -142,11 +158,11 @@ class SchemaExtractor:
                 field_scale=field_scale,
             )
 
+            # Preserve domains: if field_source is a user domain, retain its name
             domain_name = None
             if field_source and not field_source.startswith('RDB$'):
-                if domain_map and field_source.upper() in domain_map:
-                    domain_name = domain_map[field_source.upper()]
-                else:
+                column_data_type = resolve_pg_domain_name(field_source, relation_names)
+                if relation_names:
                     domain_name = resolve_pg_domain_name(field_source, relation_names)
                 default_value = column_default
             else:
@@ -162,8 +178,25 @@ class SchemaExtractor:
 
             identity_flag = column[11] if len(column) > 11 else None
             identity_type = None
+            identity_increment = None
+            identity_current = None
             if identity_flag is not None:
                 identity_type = 'ALWAYS' if identity_flag == 0 else 'BY DEFAULT'
+                gen_name = column[12].strip() if len(column) > 12 and column[12] else None
+                if gen_name:
+                    try:
+                        cursor.execute("SELECT COALESCE(RDB$GENERATOR_INCREMENT, 1) FROM RDB$GENERATORS WHERE RDB$GENERATOR_NAME = ?;", (gen_name,))
+                        grow = cursor.fetchone()
+                        identity_increment = int(grow[0]) if grow and grow[0] is not None else 1
+                    except Exception:
+                        identity_increment = 1
+                    try:
+                        safe_gen = gen_name.replace('"', '""')
+                        cursor.execute(f'SELECT GEN_ID("{safe_gen}", 0) FROM RDB$DATABASE;')
+                        vrow = cursor.fetchone()
+                        identity_current = int(vrow[0]) if vrow and vrow[0] is not None else None
+                    except Exception:
+                        identity_current = None
 
             columns.append(
                 Column(
@@ -174,6 +207,8 @@ class SchemaExtractor:
                     domain_name=domain_name,
                     computed_source=computed_source,
                     identity_type=identity_type,
+                    identity_increment=identity_increment,
+                    identity_current=identity_current,
                 )
             )
 

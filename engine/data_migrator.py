@@ -276,41 +276,99 @@ class DataMigrator:
 
             logger.info("Synchronizing sequences...")
             seq_to_targets: dict[str, list[tuple[str, str]]] = {}
-            identity_targets: list[tuple[str, str]] = []
+            identity_targets: list[tuple[str, str, Column]] = []
             for table in table_objs:
                 for col in table.columns:
                     if col.identity_type:
-                        identity_targets.append((table.pg_name, col.pg_name))
+                        identity_targets.append((table.pg_name, col.pg_name, col))
                     elif col.sequence_name:
                         seq_to_targets.setdefault(col.sequence_name, []).append((table.pg_name, col.pg_name))
 
-            for tbl, col in identity_targets:
-                sync_query = f"""
-                    SELECT setval(
-                        pg_get_serial_sequence('{pg_quote_ident(tbl)}', '{col}'),
-                        COALESCE((SELECT MAX({pg_quote_ident(col)}) FROM {pg_quote_ident(tbl)}), 1),
-                        (SELECT MAX({pg_quote_ident(col)}) IS NOT NULL FROM {pg_quote_ident(tbl)})
-                    );
-                """
+            for tbl, col, col_obj in identity_targets:
+                quoted_tbl = pg_quote_ident(tbl)
+                quoted_col = pg_quote_ident(col)
+                inc = col_obj.identity_increment if col_obj.identity_increment is not None else 1
+                curr = col_obj.identity_current
+                if inc < 0:
+                    if curr is not None:
+                        sync_query = f"""
+                            SELECT setval(
+                                pg_get_serial_sequence('{quoted_tbl}', '{col}'),
+                                LEAST({curr}, COALESCE((SELECT MIN({quoted_col}) FROM {quoted_tbl}), {curr})),
+                                true
+                            );
+                        """
+                    else:
+                        sync_query = f"""
+                            SELECT setval(
+                                pg_get_serial_sequence('{quoted_tbl}', '{col}'),
+                                COALESCE((SELECT MIN({quoted_col}) FROM {quoted_tbl}), -1),
+                                (SELECT MIN({quoted_col}) IS NOT NULL FROM {quoted_tbl})
+                            );
+                        """
+                else:
+                    if curr is not None:
+                        sync_query = f"""
+                            SELECT setval(
+                                pg_get_serial_sequence('{quoted_tbl}', '{col}'),
+                                GREATEST({curr}, COALESCE((SELECT MAX({quoted_col}) FROM {quoted_tbl}), {curr})),
+                                true
+                            );
+                        """
+                    else:
+                        sync_query = f"""
+                            SELECT setval(
+                                pg_get_serial_sequence('{quoted_tbl}', '{col}'),
+                                COALESCE((SELECT MAX({quoted_col}) FROM {quoted_tbl}), 1),
+                                (SELECT MAX({quoted_col}) IS NOT NULL FROM {quoted_tbl})
+                            );
+                        """
                 logger.debug(sync_query.strip())
                 pg_cur.execute(sync_query)
 
             for seq_name, targets in seq_to_targets.items():
-                max_selects = ", ".join(f'(SELECT MAX({pg_quote_ident(col)}) FROM {pg_quote_ident(tbl)})' for tbl, col in targets)
-                greatest_expr = f'GREATEST({max_selects})' if len(targets) > 1 else max_selects
                 quoted_seq = pg_quote_ident(seq_name)
                 setval_arg = quoted_seq.replace("'", "''")
-                sync_query = f"""
-                    WITH max_calc AS MATERIALIZED (
-                        SELECT {greatest_expr} AS max_val
+
+                # Check sequence direction from PostgreSQL catalog
+                try:
+                    pg_cur.execute(
+                        "SELECT increment_by FROM pg_sequences WHERE schemaname = current_schema() AND sequencename = lower(%s);",
+                        (seq_name,)
                     )
-                    SELECT setval(
-                        '{setval_arg}',
-                        GREATEST(s.last_value, m.max_val),
-                        s.is_called OR (m.max_val IS NOT NULL AND m.max_val >= s.last_value)
-                    )
-                    FROM {quoted_seq} s, max_calc m;
-                """
+                    inc_row = pg_cur.fetchone()
+                    seq_inc = int(inc_row[0]) if inc_row and inc_row[0] is not None else 1
+                except Exception:
+                    seq_inc = 1
+
+                if seq_inc < 0:
+                    min_selects = ", ".join(f'(SELECT MIN({pg_quote_ident(c)}) FROM {pg_quote_ident(t)})' for t, c in targets)
+                    least_expr = f'LEAST({min_selects})' if len(targets) > 1 else min_selects
+                    sync_query = f"""
+                        WITH min_calc AS MATERIALIZED (
+                            SELECT {least_expr} AS min_val
+                        )
+                        SELECT setval(
+                            '{setval_arg}',
+                            LEAST(s.last_value, m.min_val),
+                            s.is_called OR (m.min_val IS NOT NULL AND m.min_val <= s.last_value)
+                        )
+                        FROM {quoted_seq} s, min_calc m;
+                    """
+                else:
+                    max_selects = ", ".join(f'(SELECT MAX({pg_quote_ident(c)}) FROM {pg_quote_ident(t)})' for t, c in targets)
+                    greatest_expr = f'GREATEST({max_selects})' if len(targets) > 1 else max_selects
+                    sync_query = f"""
+                        WITH max_calc AS MATERIALIZED (
+                            SELECT {greatest_expr} AS max_val
+                        )
+                        SELECT setval(
+                            '{setval_arg}',
+                            GREATEST(s.last_value, m.max_val),
+                            s.is_called OR (m.max_val IS NOT NULL AND m.max_val >= s.last_value)
+                        )
+                        FROM {quoted_seq} s, max_calc m;
+                    """
                 logger.debug(sync_query.strip())
                 pg_cur.execute(sync_query)
             self.pg_con.commit()

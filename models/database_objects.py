@@ -1,7 +1,7 @@
 class Column:
     def __init__(self, name: str, column_type: str, nullable: bool, default_value: str = None,
                  sequence_name: str = None, domain_name: str = None, computed_source: str = None,
-                 identity_type: str = None):
+                 identity_type: str = None, identity_increment: int = None, identity_current: int = None):
         self.name = name
         self.column_type = column_type
         self.nullable = nullable
@@ -12,6 +12,8 @@ class Column:
         self.domain_name = domain_name
         self.computed_source = computed_source.strip() if computed_source else None
         self.identity_type = identity_type.upper() if identity_type else None
+        self.identity_increment = identity_increment
+        self.identity_current = identity_current
 
     @property
     def pg_name(self) -> str:
@@ -143,7 +145,13 @@ class Table:
 
             if not col.computed_source:
                 if col.identity_type:
-                    col_def += f' GENERATED {col.identity_type} AS IDENTITY'
+                    opts = []
+                    if col.identity_increment is not None and col.identity_increment != 1:
+                        opts.append(f"INCREMENT BY {col.identity_increment}")
+                        if col.identity_increment < 0:
+                            opts.append("MAXVALUE 9223372036854775807")
+                    opts_str = f" ({' '.join(opts)})" if opts else ""
+                    col_def += f' GENERATED {col.identity_type} AS IDENTITY{opts_str}'
                 elif col.sequence_name:
                     nextval_literal = pg_quote_ident(col.sequence_name).replace("'", "''")
                     col_def += f" DEFAULT nextval('{nextval_literal}')"
@@ -327,10 +335,16 @@ class Sequence:
         clauses = []
         if self.increment != 1:
             clauses.append(f"INCREMENT BY {self.increment}")
-        if start_val < 1:
-            clauses.append(f"MINVALUE -9223372036854775807 START WITH {start_val}")
-        elif start_val != 1:
-            clauses.append(f"START WITH {start_val}")
+        if self.increment > 0:
+            if start_val < 1:
+                clauses.append(f"MINVALUE -9223372036854775807 START WITH {start_val}")
+            elif start_val != 1:
+                clauses.append(f"START WITH {start_val}")
+        else:
+            if start_val > -1:
+                clauses.append(f"MAXVALUE 9223372036854775807 START WITH {start_val}")
+            elif start_val != -1:
+                clauses.append(f"START WITH {start_val}")
 
         if clauses:
             return f'CREATE SEQUENCE {esc_name} {" ".join(clauses)};'
