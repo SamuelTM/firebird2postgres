@@ -6,7 +6,8 @@ import sys
 # Ensure the firebird_grammar directory is in the path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'firebird_grammar'))
 
-from typing import TypeVar
+from collections import defaultdict
+from typing import TypeVar, Optional
 from antlr4 import InputStream, CommonTokenStream, ParserRuleContext
 from antlr4.atn.PredictionMode import PredictionMode
 from antlr4.error.ErrorListener import ErrorListener
@@ -939,6 +940,21 @@ def _normalize_ident_case(raw_ident: str) -> str:
     return raw_ident
 
 
+class TableSource:
+    def __init__(self, table_name: str, alias: Optional[str] = None, qualifier: str = ""):
+        self.table_name = table_name
+        self.table_name_clean = table_name.strip('":').lower()
+        self.alias = alias
+        self.alias_clean = alias.strip('":').lower() if alias else None
+        self.qualifier = qualifier
+
+
+class QueryScope:
+    def __init__(self, parent=None, tables: Optional[list[TableSource]] = None):
+        self.parent: Optional[QueryScope] = parent
+        self.tables: list[TableSource] = tables or []
+
+
 class ASTDialectRewriter(FirebirdParserVisitor):
     """
     Pass 1 Visitor: Operates on AST nodes and rewrites tokens directly in the TokenStreamRewriter.
@@ -964,16 +980,29 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                         pass
         self.is_trigger = False
         self.trigger_return = "RETURN NEW"
+        self.current_scope: Optional[QueryScope] = None
+        self.params: set[str] = set()
+        self.local_vars: set[str] = set()
+        self.table_columns: dict[str, set[str]] = defaultdict(set)
+        if symbols:
+            for k in symbols:
+                k_clean = k.strip('":').lower()
+                if '.' in k_clean:
+                    rel, col = k_clean.split('.', 1)
+                    self.table_columns[rel.strip('":')].add(col.strip('":'))
 
     def visitCreate_procedure_body(self, ctx: FirebirdParser.Create_procedure_bodyContext):
         old_symbols = self.symbols.copy()
+        old_local_vars = self.local_vars.copy()
         try:
             return self.visitChildren(ctx)
         finally:
             self.symbols = old_symbols
+            self.local_vars = old_local_vars
 
     def visitCreate_trigger(self, ctx: FirebirdParser.Create_triggerContext):
         old_symbols = self.symbols.copy()
+        old_local_vars = self.local_vars.copy()
         old_is_trigger = self.is_trigger
         old_trigger_return = self.trigger_return
         self.is_trigger = True
@@ -1002,6 +1031,7 @@ class ASTDialectRewriter(FirebirdParserVisitor):
             return self.visitChildren(ctx)
         finally:
             self.symbols = old_symbols
+            self.local_vars = old_local_vars
             self.is_trigger = old_is_trigger
             self.trigger_return = old_trigger_return
 
@@ -1009,12 +1039,14 @@ class ASTDialectRewriter(FirebirdParserVisitor):
         if ctx.parameter_name() and ctx.type_spec():
             name = ctx.parameter_name().getText().strip('":').lower()
             self.symbols[name] = ctx.type_spec().getText().upper()
+            self.params.add(name)
         return self.visitChildren(ctx)
 
     def visitVariable_declaration(self, ctx: FirebirdParser.Variable_declarationContext):
         if ctx.identifier() and ctx.type_spec():
             name = ctx.identifier().getText().strip('":').lower()
             self.symbols[name] = ctx.type_spec().getText().upper()
+            self.local_vars.add(name)
         return self.visitChildren(ctx)
 
     def visitColumn_definition(self, ctx: FirebirdParser.Column_definitionContext):
@@ -1361,8 +1393,8 @@ class ASTDialectRewriter(FirebirdParserVisitor):
             else:
                 self.rewriter.insertAfterToken(target_token, limit_clause)
 
-    def _disambiguate_scope(self, scope_node, table_qualifier: str):
-        if not scope_node or not table_qualifier or table_qualifier.upper() == 'RDB$DATABASE' or not self.symbols:
+    def _disambiguate_scope(self, scope_node, scope: QueryScope):
+        if not scope_node or not scope or not scope.tables:
             return
 
         def find_unqualified_col_parts(node):
@@ -1374,6 +1406,14 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                 return res
             # Do not touch INTO clause target variables
             if isinstance(node, FirebirdParser.Into_clauseContext):
+                return res
+            # Do not touch bind variables (:V)
+            if isinstance(node, FirebirdParser.Bind_variableContext):
+                return res
+            # In column_based_update_set_clause (e.g. V = V + 1), only recurse into value expression, not the target column name!
+            if isinstance(node, FirebirdParser.Column_based_update_set_clauseContext):
+                if hasattr(node, 'expression') and node.expression():
+                    res.extend(find_unqualified_col_parts(node.expression()))
                 return res
             if isinstance(node, FirebirdParser.General_element_partContext):
                 res.append(node)
@@ -1387,60 +1427,174 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                 continue
             curr = p.parentCtx
             is_qualified = False
-            while curr:
+            while curr and curr != scope_node:
                 if isinstance(curr, FirebirdParser.General_elementContext) and len(curr.children) > 1:
                     is_qualified = True
                     break
                 curr = curr.parentCtx
             if is_qualified:
                 continue
-            if hasattr(p, 'id_expression') and p.id_expression():
-                col_name = p.id_expression().getText().strip('":').lower()
-                if col_name in self.symbols:
-                    col_text = p.id_expression().getText()
-                    self.rewriter.replaceRangeTokens(
-                        p.id_expression().start,
-                        p.id_expression().stop,
-                        f"{table_qualifier}.{col_text}"
-                    )
+            if not (hasattr(p, 'id_expression') and p.id_expression()):
+                continue
+
+            raw_col_text = p.id_expression().getText()
+            col_name = raw_col_text.strip('":').lower()
+
+            curr_s = scope
+            chosen_tbl = None
+            ambiguous_candidates = []
+            unresolvable_scope = None
+
+            while curr_s:
+                active_tables = [t for t in curr_s.tables if t.table_name_clean.upper() != 'RDB$DATABASE']
+                if not active_tables:
+                    curr_s = curr_s.parent
+                    continue
+
+                tbl_matches = []
+                for tbl in active_tables:
+                    known_cols = self.table_columns.get(tbl.table_name_clean)
+                    if known_cols is not None and len(known_cols) > 0:
+                        if col_name in known_cols:
+                            tbl_matches.append(tbl)
+                    elif len(active_tables) == 1:
+                        # Single table in scope and no table_columns catalog for it
+                        # If col_name is known in symbols or procedure parameters/vars:
+                        if col_name in self.symbols or col_name in self.params or col_name in self.local_vars:
+                            tbl_matches.append(tbl)
+
+                if len(tbl_matches) == 1:
+                    chosen_tbl = tbl_matches[0]
+                    break
+                elif len(tbl_matches) > 1:
+                    ambiguous_candidates = tbl_matches
+                    break
+                else:
+                    # 0 matches in this scope.
+                    # If multiple tables in this scope and col_name is a known symbol:
+                    if len(active_tables) > 1 and (col_name in self.symbols or col_name in self.params or col_name in self.local_vars):
+                        unresolvable_scope = active_tables
+                    curr_s = curr_s.parent
+
+            if ambiguous_candidates:
+                raise ValueError(
+                    f"Ambiguous column reference '{col_name}' between tables "
+                    f"{[t.qualifier for t in ambiguous_candidates]} in query scope"
+                )
+
+            if not chosen_tbl and unresolvable_scope:
+                raise ValueError(
+                    f"Unresolvable column reference '{col_name}' between tables "
+                    f"{[t.qualifier for t in unresolvable_scope]}: metadata required to disambiguate table ownership"
+                )
+
+            if chosen_tbl:
+                self.rewriter.replaceRangeTokens(
+                    p.id_expression().start,
+                    p.id_expression().stop,
+                    f"{chosen_tbl.qualifier}.{raw_col_text}"
+                )
+
+    def _extract_tables_from_query_block(self, qb: FirebirdParser.Query_blockContext) -> list[TableSource]:
+        tables = []
+        if not qb or not qb.from_clause():
+            return tables
+        trl = qb.from_clause().table_ref_list()
+        if not trl:
+            return tables
+
+        def extract_from_aux(aux) -> Optional[TableSource]:
+            if not aux:
+                return None
+            alias = aux.table_alias().getText().strip() if aux.table_alias() else None
+            t_int = aux.table_ref_aux_internal()
+            t_name = t_int.getText().strip() if t_int else ""
+            qualifier = alias if alias else t_name
+            return TableSource(table_name=t_name, alias=alias, qualifier=qualifier)
+
+        for tr in trl.table_ref():
+            if hasattr(tr, 'table_ref_aux') and tr.table_ref_aux():
+                src = extract_from_aux(tr.table_ref_aux())
+                if src:
+                    tables.append(src)
+            if hasattr(tr, 'join_clause') and tr.join_clause():
+                for jc in tr.join_clause():
+                    if hasattr(jc, 'table_ref_aux') and jc.table_ref_aux():
+                        src = extract_from_aux(jc.table_ref_aux())
+                        if src:
+                            tables.append(src)
+        return tables
 
     def visitQuery_block(self, ctx: FirebirdParser.Query_blockContext):
         self._rewrite_first_skip(ctx)
-        if ctx.from_clause() and self.symbols:
-            table_ref_list = ctx.from_clause().table_ref_list()
-            if table_ref_list and len(table_ref_list.table_ref()) == 1:
-                table_ref = table_ref_list.table_ref(0)
-                aux = table_ref.table_ref_aux()
-                if aux:
-                    table_qualifier = aux.table_alias().getText().strip() if aux.table_alias() else (
-                        aux.table_ref_aux_internal().getText().strip() if aux.table_ref_aux_internal() else ""
-                    )
-                    if table_qualifier and table_qualifier.upper() != 'RDB$DATABASE':
-                        self._disambiguate_scope(ctx, table_qualifier)
-        return self.visitChildren(ctx)
+        tables = self._extract_tables_from_query_block(ctx)
+        scope = QueryScope(parent=self.current_scope, tables=tables)
+        self.current_scope = scope
+        try:
+            if tables:
+                self._disambiguate_scope(ctx, scope)
+                curr_p = ctx.parentCtx
+                while curr_p:
+                    if hasattr(curr_p, 'order_by_clause') and curr_p.order_by_clause():
+                        ob_list = curr_p.order_by_clause()
+                        if isinstance(ob_list, list):
+                            for ob in ob_list:
+                                self._disambiguate_scope(ob, scope)
+                        else:
+                            self._disambiguate_scope(ob_list, scope)
+                        break
+                    if isinstance(curr_p, (FirebirdParser.StatementContext, FirebirdParser.SubqueryContext)):
+                        break
+                    curr_p = curr_p.parentCtx
+            return self.visitChildren(ctx)
+        finally:
+            self.current_scope = scope.parent
+
+    def _extract_table_source_from_general_table_ref(self, general_table_ref) -> Optional[TableSource]:
+        if not general_table_ref:
+            return None
+        alias = None
+        if hasattr(general_table_ref, 'table_alias') and general_table_ref.table_alias():
+            alias = general_table_ref.table_alias().getText().strip()
+        table_name = ""
+        if hasattr(general_table_ref, 'dml_table_expression_clause') and general_table_ref.dml_table_expression_clause():
+            table_name = general_table_ref.dml_table_expression_clause().getText().strip()
+        if not table_name:
+            text = general_table_ref.getText().strip()
+            table_name = text.split()[0] if text else ""
+        qualifier = alias if alias else table_name
+        return TableSource(table_name=table_name, alias=alias, qualifier=qualifier)
 
     def _extract_table_qualifier(self, general_table_ref) -> str:
-        if not general_table_ref:
-            return ""
-        if hasattr(general_table_ref, 'table_alias') and general_table_ref.table_alias():
-            return general_table_ref.table_alias().getText().strip('" ')
-        if hasattr(general_table_ref, 'dml_table_expression_clause') and general_table_ref.dml_table_expression_clause():
-            return general_table_ref.dml_table_expression_clause().getText().strip('" ')
-        text = general_table_ref.getText().strip('" ')
-        return text.split()[0] if text else ""
+        src = self._extract_table_source_from_general_table_ref(general_table_ref)
+        return src.qualifier if src else ""
 
     def visitUpdate_statement(self, ctx: FirebirdParser.Update_statementContext):
-        if ctx.general_table_ref() and self.symbols and ctx.where_clause():
-            table_qualifier = self._extract_table_qualifier(ctx.general_table_ref())
-            if table_qualifier and table_qualifier.upper() != 'RDB$DATABASE':
-                self._disambiguate_scope(ctx.where_clause(), table_qualifier)
+        table_source = self._extract_table_source_from_general_table_ref(ctx.general_table_ref())
+        if table_source and table_source.table_name_clean.upper() != 'RDB$DATABASE':
+            scope = QueryScope(parent=self.current_scope, tables=[table_source])
+            self.current_scope = scope
+            try:
+                if ctx.update_set_clause():
+                    self._disambiguate_scope(ctx.update_set_clause(), scope)
+                if ctx.where_clause():
+                    self._disambiguate_scope(ctx.where_clause(), scope)
+                return self.visitChildren(ctx)
+            finally:
+                self.current_scope = scope.parent
         return self.visitChildren(ctx)
 
     def visitDelete_statement(self, ctx: FirebirdParser.Delete_statementContext):
-        if ctx.general_table_ref() and self.symbols and ctx.where_clause():
-            table_qualifier = self._extract_table_qualifier(ctx.general_table_ref())
-            if table_qualifier and table_qualifier.upper() != 'RDB$DATABASE':
-                self._disambiguate_scope(ctx.where_clause(), table_qualifier)
+        table_source = self._extract_table_source_from_general_table_ref(ctx.general_table_ref())
+        if table_source and table_source.table_name_clean.upper() != 'RDB$DATABASE':
+            scope = QueryScope(parent=self.current_scope, tables=[table_source])
+            self.current_scope = scope
+            try:
+                if ctx.where_clause():
+                    self._disambiguate_scope(ctx.where_clause(), scope)
+                return self.visitChildren(ctx)
+            finally:
+                self.current_scope = scope.parent
         return self.visitChildren(ctx)
 
     def visitSelect_statement(self, ctx: FirebirdParser.Select_statementContext):

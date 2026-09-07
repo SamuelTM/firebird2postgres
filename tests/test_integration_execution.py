@@ -231,5 +231,76 @@ class TestIntegrationExecution(unittest.TestCase):
         self.assertEqual(status, "NOT_PERFORMED")
 
 
+    def test_regression_disambiguation_runtime_execution_v_increment_and_assignment(self):
+        """
+        Regression test:
+        - Parameter V=100; table with V=1 and V=2; UPDATE T SET V=V+1 must produce 2 and 3.
+        - UPDATE T SET V=:V must produce 100.
+        - WHERE ID=:ID.
+        - Global precedence directive does not alter results.
+        """
+        if not HAS_REAL_PG or not self.pg_cur:
+            self.skipTest("Real PostgreSQL database connection not available")
+
+        # 1. Setup disposable table
+        self.pg_cur.execute("""
+            DROP TABLE IF EXISTS reg_t_disambig CASCADE;
+            CREATE TABLE reg_t_disambig (id INT PRIMARY KEY, v INT);
+            INSERT INTO reg_t_disambig (id, v) VALUES (1, 1), (2, 2);
+        """)
+
+        # 2. Transpile and create procedure with UPDATE T SET V = V + 1
+        fb_inc = """
+        CREATE OR ALTER PROCEDURE SP_REG_INC (V INTEGER)
+        AS
+        BEGIN
+            UPDATE REG_T_DISAMBIG SET V = V + 1;
+        END;
+        """
+        symbols = {'reg_t_disambig.id': 'INTEGER', 'reg_t_disambig.v': 'INTEGER'}
+        pg_inc = FirebirdToPostgresVisitor.transpile(fb_inc, symbols=symbols)
+        self.pg_cur.execute(pg_inc)
+
+        # Execute with V=100 -> Must produce 2 and 3 (NOT 101, 101!)
+        self.pg_cur.execute('SELECT "sp_reg_inc"(100);')
+        self.pg_cur.execute('SELECT id, v FROM reg_t_disambig ORDER BY id;')
+        rows_inc = self.pg_cur.fetchall()
+        self.assertEqual(rows_inc, [(1, 2), (2, 3)])
+
+        # 3. Transpile and create procedure with UPDATE T SET V = :V
+        fb_set_var = """
+        CREATE OR ALTER PROCEDURE SP_REG_SET_VAR (V INTEGER)
+        AS
+        BEGIN
+            UPDATE REG_T_DISAMBIG SET V = :V;
+        END;
+        """
+        pg_set_var = FirebirdToPostgresVisitor.transpile(fb_set_var, symbols=symbols)
+        self.pg_cur.execute(pg_set_var)
+
+        # Execute with V=100 -> Must produce 100 for both rows
+        self.pg_cur.execute('SELECT "sp_reg_set_var"(100);')
+        self.pg_cur.execute('SELECT id, v FROM reg_t_disambig ORDER BY id;')
+        rows_set = self.pg_cur.fetchall()
+        self.assertEqual(rows_set, [(1, 100), (2, 100)])
+
+        # 4. Transpile and create procedure with WHERE ID = :ID
+        fb_where = """
+        CREATE OR ALTER PROCEDURE SP_REG_WHERE (ID INTEGER, V INTEGER)
+        AS
+        BEGIN
+            UPDATE REG_T_DISAMBIG SET V = :V WHERE ID = :ID;
+        END;
+        """
+        pg_where = FirebirdToPostgresVisitor.transpile(fb_where, symbols=symbols)
+        self.pg_cur.execute(pg_where)
+
+        # Execute with ID=1, V=999 -> Only row 1 should become 999, row 2 stays 100
+        self.pg_cur.execute('SELECT "sp_reg_where"(1, 999);')
+        self.pg_cur.execute('SELECT id, v FROM reg_t_disambig ORDER BY id;')
+        rows_where = self.pg_cur.fetchall()
+        self.assertEqual(rows_where, [(1, 999), (2, 100)])
+
+
 if __name__ == '__main__':
     unittest.main()

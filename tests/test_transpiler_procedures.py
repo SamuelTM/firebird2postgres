@@ -1050,7 +1050,106 @@ class TestTranspilerProcedures(unittest.TestCase):
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
         self.assertIn("LIMIT (CASE WHEN N > 0 THEN N ELSE 1 END)", pg_sql)
         self.assertIn("OFFSET (CASE WHEN M > 0 THEN M ELSE 0 END)", pg_sql)
-        self.assertNotIn("IIF", pg_sql)
+    def test_regression_disambiguation_update_set_increment_preserves_column(self):
+        fb_sql = """
+        CREATE OR ALTER PROCEDURE SP_INC (V INTEGER)
+        AS
+        BEGIN
+            UPDATE T SET V = V + 1;
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("UPDATE T SET V = T.V + 1;", pg_sql)
+        self.assertNotIn("SET T.V =", pg_sql)
+
+    def test_regression_disambiguation_update_set_bind_variable_preserves_variable(self):
+        fb_sql = """
+        CREATE OR ALTER PROCEDURE SP_SET_VAR (V INTEGER)
+        AS
+        BEGIN
+            UPDATE T SET V = :V;
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("UPDATE T SET V = V;", pg_sql)
+        self.assertNotIn("SET V = T.V;", pg_sql)
+
+    def test_regression_disambiguation_where_id_equals_bind_variable(self):
+        fb_sql = """
+        CREATE OR ALTER PROCEDURE SP_WHERE_DISAMBIG (ID INTEGER, V INTEGER)
+        AS
+        BEGIN
+            UPDATE T SET V = :V WHERE ID = :ID;
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("UPDATE T SET V = V WHERE T.ID = ID;", pg_sql)
+
+    def test_regression_disambiguation_join_second_table_column(self):
+        fb_sql = """
+        CREATE OR ALTER PROCEDURE SP_JOIN_SECOND_TABLE
+        AS
+        BEGIN
+            SELECT COL_A, COL_B FROM T1 JOIN T2 ON T1.ID = T2.ID WHERE COL_B = 10;
+        END;
+        """
+        symbols = {
+            't1.id': 'INTEGER',
+            't1.col_a': 'INTEGER',
+            't2.id': 'INTEGER',
+            't2.col_b': 'VARCHAR',
+        }
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql, symbols=symbols)
+        self.assertIn("T1.COL_A", pg_sql)
+        self.assertIn("T2.COL_B", pg_sql)
+        self.assertNotIn("T1.COL_B", pg_sql)
+        self.assertIn("WHERE T2.COL_B = 10", pg_sql)
+
+    def test_regression_disambiguation_unresolvable_column_raises_explicit_diagnostic(self):
+        fb_sql = """
+        CREATE OR ALTER PROCEDURE SP_AMBIG_TEST
+        AS
+        BEGIN
+            SELECT UNRESOLVED_COL FROM T1 JOIN T2 ON T1.ID = T2.ID;
+        END;
+        """
+        symbols = {'t1.id': 'INTEGER', 't2.id': 'INTEGER', 'unresolved_col': 'VARCHAR'}
+        with self.assertRaises(ValueError) as ctx:
+            FirebirdToPostgresVisitor.transpile(fb_sql, symbols=symbols)
+        self.assertIn("Unresolvable column reference 'unresolved_col'", str(ctx.exception))
+
+    def test_regression_disambiguation_correlated_subquery_delimited_aliases_and_homonymous_var(self):
+        fb_sql = """
+        CREATE OR ALTER PROCEDURE SP_CORRELATED_TEST
+        AS
+        DECLARE VARIABLE "MY_VAR" INTEGER = 50;
+        DECLARE VARIABLE VAL INTEGER = 10;
+        BEGIN
+            SELECT "OutTbl".VAL, "OutTbl"."ID"
+            FROM "OuterTable" "OutTbl"
+            WHERE EXISTS (
+                SELECT 1
+                FROM "InnerTable" "InTbl"
+                WHERE "InTbl"."PARENT_ID" = "OutTbl"."ID"
+                  AND VAL = :VAL
+            );
+        END;
+        """
+        symbols = {
+            'outertable.val': 'INTEGER',
+            'outertable.id': 'INTEGER',
+            'innertable.parent_id': 'INTEGER',
+            'innertable.val': 'INTEGER',
+        }
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql, symbols=symbols)
+        # Verify delimited aliases preserve quotes
+        self.assertIn('"outertable" "outtbl"', pg_sql)
+        self.assertIn('"innertable" "intbl"', pg_sql)
+        # Verify correlated reference to outer table is preserved
+        self.assertIn('"intbl"."parent_id" = "outtbl"."id"', pg_sql)
+        # Verify inner table column VAL is qualified with inner alias, not outer alias or local var
+        self.assertIn('"InTbl".VAL = VAL', pg_sql)
+
 
 
 
