@@ -1616,6 +1616,37 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
                     return True
         return False
 
+    @staticmethod
+    def _classify_procedure_volatility(body_str: str) -> tuple[str, list[str]]:
+        """
+        Analyzes transpiled PL/pgSQL procedure body to determine volatility (STABLE vs VOLATILE).
+        Returns (volatility, reasons).
+
+        - Functions with DML (INSERT, UPDATE, DELETE, MERGE), sequence mutations (nextval, gen_id),
+          dynamic SQL (EXECUTE), or autonomous transactions are classified as VOLATILE.
+        - Read-only functions (no side effects) are classified as STABLE.
+        - Per PostgreSQL best practices, read-only functions reading tables must NOT be marked
+          IMMUTABLE (table state changes across transactions) nor PARALLEL SAFE automatically
+          without concurrency verification.
+        """
+        clean_code = re.sub(r'--[^\n]*', '', body_str)
+        clean_code = re.sub(r'/\*.*?\*/', '', clean_code, flags=re.DOTALL)
+        clean_code = re.sub(r"'(?:''|[^'])*'", "''", clean_code)
+
+        side_effects = []
+        if re.search(r'\b(INSERT\s+INTO|UPDATE\b|DELETE\s+FROM|DELETE\b|MERGE\s+INTO)\b', clean_code, re.IGNORECASE):
+            side_effects.append("data modification (DML)")
+        if re.search(r'\bEXECUTE\b', clean_code, re.IGNORECASE):
+            side_effects.append("dynamic SQL / external execution")
+        if re.search(r'\b(NEXT\s+VALUE\s+FOR|GEN_ID|nextval)\b', clean_code, re.IGNORECASE):
+            side_effects.append("sequence generator access")
+        if re.search(r'\bAUTONOMOUS\b', clean_code, re.IGNORECASE):
+            side_effects.append("autonomous transaction")
+
+        if side_effects:
+            return "VOLATILE", side_effects
+        return "STABLE", ["read-only query/computation"]
+
     def visitCreate_procedure_body(self, ctx: FirebirdParser.Create_procedure_bodyContext):
         proc_name = ctx.procedure_name().getText().strip('"')
 
@@ -1661,12 +1692,44 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         else:
             return_type = "RETURNS SETOF record" if has_return_next else "RETURNS record"
 
+        # Classify volatility (STABLE vs VOLATILE) and generate optimization advisory
+        volatility, reasons = self._classify_procedure_volatility(body_str)
+
+        clean_code = re.sub(r'--[^\n]*', '', body_str)
+        clean_code = re.sub(r'/\*.*?\*/', '', clean_code, flags=re.DOTALL)
+        clean_code = re.sub(r"'(?:''|[^'])*'", "''", clean_code)
+
+        advisory_lines = [
+            f'-- [CLASSIFICATION & OPTIMIZATION ADVISORY]',
+            f'-- Volatility: {volatility} ({", ".join(reasons)})'
+        ]
+        if volatility == "STABLE":
+            is_simple_query = (
+                not decl_str
+                and not re.search(r'\b(FOR\s+SELECT|WHILE|LOOP|IF|BEGIN|EXCEPTION)\b', clean_code, re.IGNORECASE)
+            )
+            if is_simple_query:
+                advisory_lines.append(
+                    '-- Language candidate: Pure set/query logic; evaluate converting to LANGUAGE sql '
+                    'for query inlining and optimizer pushdown.'
+                )
+            else:
+                advisory_lines.append(
+                    '-- Planner note: STABLE enables subquery memoization and optimizer caching within single statement.'
+                )
+        else:
+            advisory_lines.append(
+                '-- Planner note: VOLATILE functions cannot be cached across rows or inlined.'
+            )
+        advisory_str = "\n".join(advisory_lines) + "\n"
+
         # DROP first to guarantee idempotency, since changing an existing function's
         # signature (parameter types or return type) requires recreating it
         tag = choose_dollar_tag(f"{decl_str}{body_str}")
-        return (f'DROP FUNCTION IF EXISTS "{proc_name.lower()}" CASCADE;\n'
+        return (f'{advisory_str}'
+                f'DROP FUNCTION IF EXISTS "{proc_name.lower()}" CASCADE;\n'
                 f'CREATE FUNCTION "{proc_name.lower()}"({params_str}) {return_type} AS {tag}\n{decl_str}{body_str}\n'
-                f'{tag} LANGUAGE plpgsql;')
+                f'{tag} LANGUAGE plpgsql {volatility};')
 
     def visitParameter(self, ctx: FirebirdParser.ParameterContext):
         param_name = _normalize_ident_case(ctx.parameter_name().getText())

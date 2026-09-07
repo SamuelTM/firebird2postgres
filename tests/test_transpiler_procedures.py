@@ -858,7 +858,51 @@ class TestTranspilerProcedures(unittest.TestCase):
         """
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
         self.assertIn("AS $body$", pg_sql)
-        self.assertIn("$body$ LANGUAGE plpgsql;", pg_sql)
+        self.assertIn("$body$ LANGUAGE plpgsql STABLE;", pg_sql)
         self.assertIn("R := '$$';", pg_sql)
+
+    def test_procedure_volatility_classification_and_optimization_advisories(self):
+        # 1. Read-only procedure -> STABLE
+        fb_readonly = """
+        CREATE OR ALTER PROCEDURE SP_GET_CLIENTE (P_ID INTEGER)
+        RETURNS (NOME VARCHAR(100))
+        AS
+        BEGIN
+            SELECT NOME FROM CLIENTES WHERE ID = :P_ID INTO :NOME;
+            SUSPEND;
+        END;
+        """
+        pg_readonly = FirebirdToPostgresVisitor.transpile(fb_readonly)
+        self.assertIn("LANGUAGE plpgsql STABLE;", pg_readonly)
+        self.assertIn("Volatility: STABLE", pg_readonly)
+        self.assertNotIn("IMMUTABLE", pg_readonly)
+        self.assertNotIn("PARALLEL SAFE", pg_readonly)
+
+        # 2. Modifying procedure (DML: UPDATE) -> VOLATILE
+        fb_update = """
+        CREATE OR ALTER PROCEDURE SP_UPDATE_CLIENTE (P_ID INTEGER, P_NOME VARCHAR(100))
+        AS
+        BEGIN
+            UPDATE CLIENTES SET NOME = :P_NOME WHERE ID = :P_ID;
+        END;
+        """
+        pg_update = FirebirdToPostgresVisitor.transpile(fb_update)
+        self.assertIn("LANGUAGE plpgsql VOLATILE;", pg_update)
+        self.assertIn("Volatility: VOLATILE (data modification (DML))", pg_update)
+
+        # 3. Procedure accessing sequences (GEN_ID) -> VOLATILE
+        fb_seq = """
+        CREATE OR ALTER PROCEDURE SP_NEXT_ID
+        RETURNS (NEW_ID INTEGER)
+        AS
+        BEGIN
+            NEW_ID = GEN_ID(GEN_CLIENTES, 1);
+            SUSPEND;
+        END;
+        """
+        pg_seq = FirebirdToPostgresVisitor.transpile(fb_seq)
+        self.assertIn("LANGUAGE plpgsql VOLATILE;", pg_seq)
+        self.assertIn("Volatility: VOLATILE (sequence generator access)", pg_seq)
+
 
 

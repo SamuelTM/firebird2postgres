@@ -48,6 +48,8 @@ An ANTLR-based transpiler converts triggers, stored procedures and views to PL/p
 
 - If the transpiler cannot convert an object, it writes a `-- [TRANSPILER FAILED]` marker for manual review.
 
+- Classifies procedures individually by volatility: read-only procedures are marked `STABLE` with optimization advisories for `LANGUAGE sql` evaluation, while procedures with side-effects (DML, sequences, dynamic SQL) are marked `VOLATILE`. Avoids blindly marking functions as `IMMUTABLE` or `PARALLEL SAFE`.
+
 - The transpiler runs in a `ProcessPoolExecutor` for parallel conversion.
 
 ### Idempotency
