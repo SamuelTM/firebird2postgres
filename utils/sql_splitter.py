@@ -41,8 +41,9 @@ def split_sql_statements(content: str) -> list[tuple[str, int]]:
     stmt_start_line = 1
 
     in_single_quote = False
+    in_double_quote = False
     in_line_comment = False
-    in_block_comment = False
+    block_comment_depth = 0
     dollar_tag = None  # Holds the closing tag, e.g. "$$" or "$func$"
 
     i = 0
@@ -51,7 +52,8 @@ def split_sql_statements(content: str) -> list[tuple[str, int]]:
     def flush_statement():
         raw_sql = "".join(current_stmt).strip()
         code_without_comments = re.sub(r'--[^\n]*', '', raw_sql)
-        code_without_comments = re.sub(r'/\*.*?\*/', '', code_without_comments, flags=re.DOTALL)
+        while re.search(r'/\*(?:[^*]|\*(?!/))*\*/', code_without_comments, flags=re.DOTALL):
+            code_without_comments = re.sub(r'/\*(?:[^*]|\*(?!/))*\*/', '', code_without_comments, flags=re.DOTALL)
         if code_without_comments.strip():
             statements.append((raw_sql, stmt_start_line))
 
@@ -76,13 +78,18 @@ def split_sql_statements(content: str) -> list[tuple[str, int]]:
             i += 1
             continue
 
-        if in_block_comment:
+        if block_comment_depth > 0:
             if not current_stmt:
                 stmt_start_line = current_line
             current_stmt.append(ch)
+            if ch == '/' and next_ch == '*':
+                current_stmt.append(next_ch)
+                block_comment_depth += 1
+                i += 2
+                continue
             if ch == '*' and next_ch == '/':
                 current_stmt.append(next_ch)
-                in_block_comment = False
+                block_comment_depth -= 1
                 i += 2
                 continue
             i += 1
@@ -96,6 +103,17 @@ def split_sql_statements(content: str) -> list[tuple[str, int]]:
                     i += 2
                     continue
                 in_single_quote = False
+            i += 1
+            continue
+
+        if in_double_quote:
+            current_stmt.append(ch)
+            if ch == '"':
+                if next_ch == '"':  # Escaped double quote ""
+                    current_stmt.append(next_ch)
+                    i += 2
+                    continue
+                in_double_quote = False
             i += 1
             continue
 
@@ -125,7 +143,7 @@ def split_sql_statements(content: str) -> list[tuple[str, int]]:
             continue
 
         if ch == '/' and next_ch == '*':
-            in_block_comment = True
+            block_comment_depth = 1
             current_stmt.append(ch)
             current_stmt.append(next_ch)
             i += 2
@@ -133,6 +151,12 @@ def split_sql_statements(content: str) -> list[tuple[str, int]]:
 
         if ch == "'":
             in_single_quote = True
+            current_stmt.append(ch)
+            i += 1
+            continue
+
+        if ch == '"':
+            in_double_quote = True
             current_stmt.append(ch)
             i += 1
             continue

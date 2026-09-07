@@ -111,3 +111,46 @@ CREATE TABLE t2 (
         self.assertEqual(len(stmts), 1)
         self.assertEqual(stmts[0][0], "SELECT * FROM users")
         self.assertEqual(stmts[0][1], 1)
+
+    def test_quoted_identifier_with_semicolon(self):
+        sql = """
+        CREATE TABLE "a;b" (id int);
+        INSERT INTO "a;b" VALUES (1);
+        """
+        stmts = split_sql_statements(sql)
+        self.assertEqual(len(stmts), 2)
+        self.assertEqual(stmts[0][0], 'CREATE TABLE "a;b" (id int);')
+        self.assertEqual(stmts[1][0], 'INSERT INTO "a;b" VALUES (1);')
+
+    def test_quoted_identifier_with_comment_markers(self):
+        sql = """
+        CREATE TABLE "a--b" (id int);
+        SELECT * FROM "a/*b*/";
+        """
+        stmts = split_sql_statements(sql)
+        self.assertEqual(len(stmts), 2)
+        self.assertEqual(stmts[0][0], 'CREATE TABLE "a--b" (id int);')
+        self.assertEqual(stmts[1][0], 'SELECT * FROM "a/*b*/";')
+
+    def test_nested_block_comments(self):
+        sql = """
+        /* Outer /* Nested */ still in outer */
+        SELECT 1;
+        /* c1 /* c2 /* c3 */ c2 */ c1 */
+        SELECT 2;
+        """
+        stmts = split_sql_statements(sql)
+        self.assertEqual(len(stmts), 2)
+        self.assertIn("SELECT 1;", stmts[0][0])
+        self.assertIn("SELECT 2;", stmts[1][0])
+
+    def test_escaped_double_quotes_in_identifier(self):
+        sql = """
+        CREATE TABLE "a""b;c" (id int);
+        SELECT 1;
+        """
+        stmts = split_sql_statements(sql)
+        self.assertEqual(len(stmts), 2)
+        self.assertIn('CREATE TABLE "a""b;c" (id int);', stmts[0][0])
+        self.assertIn("SELECT 1;", stmts[1][0])
+
