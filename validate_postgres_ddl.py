@@ -168,8 +168,8 @@ def print_diagnostic_report(results: List[ValidationResult]) -> bool:
     """
     total = len(results)
     if total == 0:
-        print("\nNo statements to validate.")
-        return True
+        print("\n[ERROR] No statements found to validate.")
+        return False
 
     passed = [r for r in results if r.success]
     failed = [r for r in results if not r.success]

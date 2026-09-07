@@ -139,6 +139,7 @@ class DataMigrator:
         except psycopg2.Error as e:
             logger.error(f"Failed to re-enable triggers: {e}. "
                          f"Re-enable them manually with ALTER TABLE ... ENABLE TRIGGER ALL.")
+            raise
 
     def import_data(self, table_objs: list[Table], max_workers: int = 4, executor: Executor = None) -> bool:
         """

@@ -12,9 +12,9 @@ class TestSqlRunner(unittest.TestCase):
         self.mock_con.cursor.return_value = self.mock_cur
         self.runner = SqlRunner(self.mock_con)
 
-    def test_apply_file_not_found_returns_zero(self):
-        result = self.runner.apply_file("/nonexistent/file.sql")
-        self.assertEqual(result, 0)
+    def test_apply_file_not_found_raises_filenotfounderror(self):
+        with self.assertRaises(FileNotFoundError):
+            self.runner.apply_file("/nonexistent/file.sql")
         self.mock_con.cursor.assert_not_called()
 
     def test_apply_file_all_successful(self):

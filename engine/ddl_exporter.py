@@ -375,23 +375,19 @@ class DdlExporter:
     @staticmethod
     def _resolve_view_dependency_order(cursor, view_names: set[str]) -> list[str]:
         deps: dict[str, set[str]] = {name: set() for name in sorted(view_names)}
-        try:
-            dep_query = """
-                SELECT DISTINCT RDB$DEPENDENT_NAME, RDB$DEPENDED_ON_NAME
-                FROM RDB$DEPENDENCIES
-                WHERE RDB$DEPENDENT_TYPE = 1;
-            """
-            cursor.execute(dep_query)
-            for row in cursor.fetchall():
-                dep_name = row[0].strip() if row[0] else ""
-                used_name = row[1].strip() if row[1] else ""
-                if dep_name in deps and used_name in deps and dep_name != used_name:
-                    deps[dep_name].add(used_name)
+        dep_query = """
+            SELECT DISTINCT RDB$DEPENDENT_NAME, RDB$DEPENDED_ON_NAME
+            FROM RDB$DEPENDENCIES
+            WHERE RDB$DEPENDENT_TYPE = 1;
+        """
+        cursor.execute(dep_query)
+        for row in cursor.fetchall():
+            dep_name = row[0].strip() if row[0] else ""
+            used_name = row[1].strip() if row[1] else ""
+            if dep_name in deps and used_name in deps and dep_name != used_name:
+                deps[dep_name].add(used_name)
 
-            return list(TopologicalSorter(deps).static_order())
-        except Exception as e:
-            logger.warning(f"Could not resolve view dependency order via RDB$DEPENDENCIES: {e}. Falling back to default order.")
-            return sorted(view_names)
+        return list(TopologicalSorter(deps).static_order())
 
     @staticmethod
     def _fetch_view_columns(cursor, view_name: str) -> list[str]:

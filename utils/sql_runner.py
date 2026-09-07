@@ -20,8 +20,7 @@ class SqlRunner:
         Returns the number of successfully executed statements.
         """
         if not os.path.exists(file_path):
-            logger.warning(f"File '{file_path}' not found. Skipping.")
-            return 0
+            raise FileNotFoundError(f"SQL file '{file_path}' not found.")
 
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()

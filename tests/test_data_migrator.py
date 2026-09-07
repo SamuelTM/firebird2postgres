@@ -74,6 +74,16 @@ class TestDataMigrator(unittest.TestCase):
         self.assertFalse(success)
         self.mock_pg_con.rollback.assert_called()
 
+    def test_re_enable_triggers_propagates_psycopg2_error(self):
+        import psycopg2
+        table = Table('TABELA1')
+        table.columns.append(Column('ID', 'INTEGER', nullable=False))
+
+        self.mock_pg_cur.execute.side_effect = psycopg2.OperationalError("Trigger lock timeout")
+
+        with self.assertRaises(psycopg2.OperationalError):
+            self.migrator._re_enable_triggers([table])
+
     def test_parallel_data_migration_with_workers(self):
         from unittest.mock import patch, MagicMock
 

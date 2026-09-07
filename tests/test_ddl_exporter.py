@@ -141,6 +141,12 @@ class TestDdlExporterViews(unittest.TestCase):
         ordered = DdlExporter._resolve_view_dependency_order(mock_cursor, {"A_LEAF", "M_MID", "Z_ROOT"})
         self.assertEqual(ordered, ["Z_ROOT", "M_MID", "A_LEAF"])
 
+    def test_resolve_view_dependency_order_propagates_exception_on_failure(self):
+        mock_cursor = MagicMock()
+        mock_cursor.execute.side_effect = RuntimeError("Database connection lost")
+        with self.assertRaises(RuntimeError):
+            DdlExporter._resolve_view_dependency_order(mock_cursor, {"A_CHILD", "Z_BASE"})
+
     def test_export_transpiled_ddl_raises_and_saves_diagnostics_on_failure(self):
         items = [
             ("PROC_GOOD", "CREATE PROCEDURE PROC_GOOD AS BEGIN DUMMY = 1; END;"),

@@ -106,6 +106,10 @@ class TestRunDdlValidation(unittest.TestCase):
             import os
             os.remove(fpath)
 
+    def test_print_diagnostic_report_empty_returns_false(self):
+        from validate_postgres_ddl import print_diagnostic_report
+        self.assertFalse(print_diagnostic_report([]))
+
 
 if __name__ == '__main__':
     unittest.main()
