@@ -124,6 +124,8 @@ pytest
 
 - The transpiler is still a work in progress, it may not support all Firebird PSQL constructs. Objects that fail get a `[TRANSPILER FAILED]` marker in the output file.
 
+- **PL/pgSQL late validation**: PostgreSQL parses block syntax at `CREATE FUNCTION` time, but embedded SQL statements (queries, column resolution, type casting) are only prepared upon runtime execution. Successful DDL compilation confirms syntax, but executing integration calls or using `plpgsql_check` is recommended to verify operational equivalence.
+
 ## License
 
 MIT - see [LICENSE](LICENSE).

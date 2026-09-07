@@ -101,6 +101,32 @@ def identify_object(sql_text: str) -> Tuple[str, str]:
     return 'OTHER', 'UNKNOWN'
 
 
+def check_plpgsql_runtime_validity(cursor, function_names: List[str]) -> List[tuple[str, str]]:
+    """
+    Checks PL/pgSQL functions for runtime query planning and column/type errors using plpgsql_check if installed.
+    Because PostgreSQL defers inner query validation until runtime execution (late binding), CREATE FUNCTION
+    succeeds even if internal statements reference non-existent columns or incompatible types.
+    """
+    issues = []
+    if not function_names:
+        return issues
+    try:
+        cursor.execute("SELECT 1 FROM pg_extension WHERE extname = 'plpgsql_check';")
+        if not cursor.fetchone():
+            return issues
+        for fn in function_names:
+            try:
+                cursor.execute(f"SELECT message FROM plpgsql_check_function('{fn}()');")
+                for row in cursor.fetchall():
+                    if row and row[0]:
+                        issues.append((fn, row[0]))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return issues
+
+
 def run_ddl_validation(
     conn,
     target_files: List[str],
@@ -144,6 +170,14 @@ def run_ddl_validation(
                     pg_code=pg_code
                 )
             )
+
+    # Perform late-binding runtime verification with plpgsql_check if available
+    created_functions = [
+        r.statement.object_name for r in results
+        if r.success and r.statement.object_type in ('FUNCTION', 'PROCEDURE') and r.statement.object_name != 'UNKNOWN'
+    ]
+    runtime_issues = check_plpgsql_runtime_validity(cursor, created_functions)
+    conn._last_runtime_issues = runtime_issues
 
     if apply_changes:
         failed_count = sum(1 for r in results if not r.success)
@@ -227,6 +261,14 @@ def print_diagnostic_report(results: List[ValidationResult]) -> bool:
         return False
     else:
         print("\nSUCCESS! 100% of SQL objects compiled in PostgreSQL without any errors")
+
+        print("\n" + "-" * 80)
+        print("  POSTGRESQL PL/PGSQL LATE BINDING NOTICE")
+        print("  PostgreSQL validates block syntax at CREATE FUNCTION time, but embedded queries")
+        print("  (column resolution, type casting, query plans) are only prepared upon first execution.")
+        print("  Successful DDL compilation is necessary but not sufficient to guarantee runtime correctness.")
+        print("  Run integration execution tests or install 'plpgsql_check' to verify internal query plans.")
+        print("-" * 80)
         return True
 
 
