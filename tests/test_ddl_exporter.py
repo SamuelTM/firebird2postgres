@@ -50,6 +50,38 @@ class TestDdlExporterTriggers(unittest.TestCase):
             # "trg_00000_z_calcula" < "trg_00010_a_valida"
             self.assertLess("trg_00000_z_calcula", "trg_00010_a_valida")
 
+    def test_export_firebird_triggers_propagates_domain_map(self):
+        mock_fb_con = MagicMock()
+        mock_cursor = MagicMock()
+        mock_fb_con.cursor.return_value = mock_cursor
+
+        # Trigger uses domain CLIENTE which collides with table CLIENTE and is mapped to cliente_dom
+        mock_cursor.fetchall.side_effect = [
+            # 1. triggers query
+            [("BI_PED", "PEDIDOS", 1, "AS DECLARE VARIABLE V CLIENTE; BEGIN V = NEW.C; END;", 0)],
+            # 2. _fetch_all_column_symbols
+            [],
+            # 3. _fetch_domain_map relation_names
+            [("CLIENTE",), ("PEDIDOS",)],
+            # 4. _fetch_domain_map domain_names
+            [("CLIENTE",)],
+            # 5. _fetch_all_sequence_increments
+            [],
+        ]
+
+        exporter = DdlExporter(mock_fb_con)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fb_out = os.path.join(tmpdir, "fb_triggers.sql")
+            pg_out = os.path.join(tmpdir, "pg_triggers.sql")
+
+            exporter.export_firebird_triggers(output_file=fb_out, converted_file=pg_out)
+
+            with open(pg_out, "r", encoding="utf-8") as f:
+                pg_content = f.read()
+
+            self.assertIn("V cliente_dom;", pg_content)
+
     def test_export_firebird_generators(self):
         mock_fb_con = MagicMock()
         mock_cursor = MagicMock()

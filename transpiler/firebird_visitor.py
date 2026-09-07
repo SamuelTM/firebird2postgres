@@ -1752,6 +1752,9 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
             u = cleaned.strip().upper()
             if u in self.domain_map:
                 return self.domain_map[u]
+            u_clean = u.strip('"')
+            if u_clean in self.domain_map:
+                return self.domain_map[u_clean]
         return cleaned
 
     def visitUnit_statement(self, ctx: FirebirdParser.Unit_statementContext):

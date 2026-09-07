@@ -179,4 +179,24 @@ class TestTranspilerTriggers(unittest.TestCase):
         self.assertIn("NEW.STATUS <> OLD.STATUS", pg_sql)
         self.assertIn('\'"old".status alterado para "new".status\'', pg_sql)
 
+    def test_trigger_variables_translate_collision_renamed_domains(self):
+        fb_sql = """
+        CREATE TRIGGER BI_ORDERS FOR ORDERS BEFORE INSERT
+        AS
+        DECLARE VARIABLE V_STATUS STATUS_TYPE;
+        DECLARE VARIABLE V_CLIENT "CLIENTE";
+        BEGIN
+            V_STATUS = NEW.STATUS;
+            V_CLIENT = NEW.CLIENTE;
+        END
+        """
+        domain_map = {
+            "STATUS_TYPE": "dm_status_type",
+            "CLIENTE": "cliente_dom",
+        }
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql, domain_map=domain_map)
+        self.assertIn("V_STATUS dm_status_type;", pg_sql)
+        self.assertIn("V_CLIENT cliente_dom;", pg_sql)
+
+
 

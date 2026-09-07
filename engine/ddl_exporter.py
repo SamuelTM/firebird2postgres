@@ -149,6 +149,10 @@ class DdlExporter:
         fb_cursor.execute(query)
         triggers = fb_cursor.fetchall()
 
+        symbols = self._fetch_all_column_symbols(fb_cursor)
+        domain_map = self._fetch_domain_map(fb_cursor)
+        seq_increments = self._fetch_all_sequence_increments(fb_cursor)
+
         items = []
         for trigger in triggers:
             trigger_name = trigger[0].strip() if trigger[0] else 'UNKNOWN'
@@ -160,7 +164,7 @@ class DdlExporter:
             fb_sql = self._format_trigger_firebird_ddl(trigger_name, relation_name, trigger_type, source)
             pg_trg_name = f"trg_{trigger_sequence:05d}_{trigger_name.lower()}"
             transpile_sql = self._format_trigger_firebird_ddl(pg_trg_name, relation_name, trigger_type, source)
-            items.append((trigger_name, fb_sql, transpile_sql))
+            items.append((trigger_name, fb_sql, transpile_sql, domain_map, symbols, seq_increments))
 
         self._export_transpiled_ddl(
             items,
@@ -201,6 +205,7 @@ class DdlExporter:
         fb_cursor.execute(query)
         procedures = fb_cursor.fetchall()
 
+        symbols = self._fetch_all_column_symbols(fb_cursor)
         domain_map = self._fetch_domain_map(fb_cursor)
         seq_increments = self._fetch_all_sequence_increments(fb_cursor)
 
@@ -211,7 +216,7 @@ class DdlExporter:
 
             input_params, output_params = self._fetch_procedure_parameters(fb_cursor, proc_name, domain_map=domain_map)
             fb_sql = self._format_procedure_firebird_ddl(proc_name, input_params, output_params, source)
-            items.append((proc_name, fb_sql, fb_sql, domain_map, None, seq_increments))
+            items.append((proc_name, fb_sql, fb_sql, domain_map, symbols, seq_increments))
 
         self._export_transpiled_ddl(
             items,
