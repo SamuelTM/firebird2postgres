@@ -1174,9 +1174,10 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
     Visitor that traverses the Firebird AST and translates it into PostgreSQL PL/pgSQL code.
     """
 
-    def __init__(self, rewriter: TokenStreamRewriter = None):
+    def __init__(self, rewriter: TokenStreamRewriter = None, domain_map: dict[str, str] = None):
         super().__init__()
         self.rewriter = rewriter
+        self.domain_map = {k.strip().upper(): v.strip() for k, v in domain_map.items()} if domain_map else {}
 
     @classmethod
     def _normalize_sql(cls, sql: str) -> str:
@@ -1235,7 +1236,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         return _normalize_procedure_params(sql)
 
     @classmethod
-    def transpile(cls, firebird_sql_string: str, symbols: dict[str, str] = None) -> str:
+    def transpile(cls, firebird_sql_string: str, symbols: dict[str, str] = None, domain_map: dict[str, str] = None) -> str:
         """
         Parses Firebird SQL using Two-Stage Parsing (SLL -> LL), traverses the AST with the visitor,
         and applies dialect token rewriting to produce clean PostgreSQL SQL.
@@ -1287,7 +1288,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         dialect_rewriter.visit(tree)
 
         # Pass 2: High-level PL/pgSQL structure visitor
-        visitor = cls(rewriter=rewriter)
+        visitor = cls(rewriter=rewriter, domain_map=domain_map)
         pg_sql = visitor.visit(tree)
 
         if pg_sql:
@@ -1381,13 +1382,16 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
                 statements.append(result)
         return "\n\n".join(statements)
 
-    @staticmethod
-    def _convert_type(raw_type: str) -> str:
+    def _convert_type(self, raw_type: str) -> str:
         if not raw_type:
             return ""
         cleaned = re.sub(r'(?i)\bBLOB\s+SUBTYPE\s+(?:1|TEXT)\b', 'TEXT', raw_type)
         cleaned = re.sub(r'(?i)\bBLOB\s+SUBTYPE\s+(?:0|BINARY)\b', 'BYTEA', cleaned)
         cleaned = re.sub(r'(?i)\bBLOB\b', 'BYTEA', cleaned)
+        if hasattr(self, 'domain_map') and self.domain_map:
+            u = cleaned.strip().upper()
+            if u in self.domain_map:
+                return self.domain_map[u]
         return cleaned
 
     def visitUnit_statement(self, ctx: FirebirdParser.Unit_statementContext):

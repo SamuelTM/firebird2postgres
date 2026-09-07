@@ -9,6 +9,7 @@ from models import (
     get_postgres_type,
     resolve_firebird_type,
     resolve_pg_domain_name,
+    build_domain_mapping,
     decode_trigger_type,
 )
 
@@ -51,6 +52,15 @@ class TestFirebirdTypes(unittest.TestCase):
         # Cascading collision resolution
         relation_names_collision = {'users', 'users_dom'}
         self.assertEqual(resolve_pg_domain_name('USERS', relation_names_collision), 'users_dom_dom')
+
+    def test_build_domain_mapping_avoids_domain_and_table_collisions(self):
+        relation_names = {'foo', 'orders'}
+        domain_names = ['FOO', 'FOO_DOM', 'STATUS']
+        mapping = build_domain_mapping(domain_names, relation_names)
+        self.assertEqual(mapping['STATUS'], 'status')
+        self.assertEqual(mapping['FOO_DOM'], 'foo_dom')
+        self.assertEqual(mapping['FOO'], 'foo_dom_dom')
+        self.assertNotEqual(mapping['FOO'], mapping['FOO_DOM'])
 
     def test_decode_trigger_type(self):
         # 1 = BEFORE INSERT, 2 = AFTER INSERT, 3 = BEFORE UPDATE, 4 = AFTER UPDATE, 5 = BEFORE DELETE, 6 = AFTER DELETE

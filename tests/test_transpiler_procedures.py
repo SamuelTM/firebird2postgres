@@ -746,3 +746,20 @@ class TestTranspilerProcedures(unittest.TestCase):
         self.assertIn("WD := EXTRACT(DOW FROM D);", pg_sql)
         self.assertIn("YD := ((EXTRACT(DOY FROM D))::integer - 1);", pg_sql)
         self.assertIn("MS := (FLOOR(EXTRACT(MILLISECOND FROM TS))::integer % 1000);", pg_sql)
+
+    def test_procedure_with_domain_map(self):
+        fb_sql = """
+        CREATE PROCEDURE SP_TEST_DOMAIN (IN_A FOO)
+        RETURNS (OUT_B FOO)
+        AS
+        DECLARE VARIABLE V_TEMP FOO;
+        BEGIN
+            V_TEMP = IN_A;
+            OUT_B = V_TEMP;
+        END;
+        """
+        domain_map = {"FOO": "foo_dom_dom"}
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql, domain_map=domain_map)
+        self.assertIn("IN_A foo_dom_dom", pg_sql)
+        self.assertIn("OUT_B foo_dom_dom", pg_sql)
+        self.assertIn("V_TEMP foo_dom_dom;", pg_sql)

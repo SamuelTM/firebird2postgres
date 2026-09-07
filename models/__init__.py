@@ -4,6 +4,7 @@ from .firebird_types import (
     get_firebird_data_type_name,
     resolve_firebird_type,
     resolve_pg_domain_name,
+    build_domain_mapping,
     decode_trigger_type,
 )
 
@@ -21,6 +22,7 @@ __all__ = [
     'get_firebird_data_type_name',
     'resolve_firebird_type',
     'resolve_pg_domain_name',
+    'build_domain_mapping',
     'decode_trigger_type',
 ]
 

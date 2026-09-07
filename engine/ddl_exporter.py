@@ -8,6 +8,7 @@ from models import (
     get_postgres_type,
     resolve_firebird_type,
     resolve_pg_domain_name,
+    build_domain_mapping,
     decode_trigger_type,
 )
 from transpiler import FirebirdToPostgresVisitor
@@ -24,12 +25,14 @@ def _ensure_parent_dir(file_path: str):
 def _transpile_worker(item: tuple) -> tuple[str | None, str | None]:
     """
     Worker function for multiprocessing pool.
-    Takes (item_name, fb_sql) or (item_name, fb_sql, transpile_sql) and returns (pg_sql, error_msg).
+    Takes (item_name, fb_sql), (item_name, fb_sql, transpile_sql), or (item_name, fb_sql, transpile_sql, domain_map)
+    and returns (pg_sql, error_msg).
     Avoids returning fb_sql across IPC to minimize pickle overhead.
     """
     sql_to_transpile = item[2] if len(item) > 2 else item[1]
+    domain_map = item[3] if len(item) > 3 else None
     try:
-        pg_sql = FirebirdToPostgresVisitor.transpile(sql_to_transpile)
+        pg_sql = FirebirdToPostgresVisitor.transpile(sql_to_transpile, domain_map=domain_map)
         return pg_sql, None
     except Exception as e:
         return None, str(e)
@@ -187,14 +190,16 @@ class DdlExporter:
         fb_cursor.execute(query)
         procedures = fb_cursor.fetchall()
 
+        domain_map = self._fetch_domain_map(fb_cursor)
+
         items = []
         for proc in procedures:
             proc_name = proc[0].strip() if proc[0] else 'UNKNOWN'
             source = proc[1]
 
-            input_params, output_params = self._fetch_procedure_parameters(fb_cursor, proc_name)
+            input_params, output_params = self._fetch_procedure_parameters(fb_cursor, proc_name, domain_map=domain_map)
             fb_sql = self._format_procedure_firebird_ddl(proc_name, input_params, output_params, source)
-            items.append((proc_name, fb_sql))
+            items.append((proc_name, fb_sql, fb_sql, domain_map))
 
         self._export_transpiled_ddl(
             items,
@@ -208,7 +213,18 @@ class DdlExporter:
         )
 
     @staticmethod
-    def _fetch_procedure_parameters(cursor, proc_name: str) -> tuple[list[str], list[str]]:
+    def _fetch_domain_map(cursor) -> dict[str, str]:
+        cursor.execute('SELECT RDB$RELATION_NAME FROM RDB$RELATIONS WHERE RDB$SYSTEM_FLAG = 0;')
+        relation_names = {r[0].strip() for r in cursor.fetchall() if r[0]}
+        cursor.execute("""
+            SELECT DISTINCT RDB$FIELD_NAME FROM RDB$FIELDS
+            WHERE RDB$SYSTEM_FLAG = 0 AND RDB$FIELD_NAME NOT STARTING WITH 'RDB$';
+        """)
+        domain_names = [r[0].strip() for r in cursor.fetchall() if r[0]]
+        return build_domain_mapping(domain_names, relation_names)
+
+    @staticmethod
+    def _fetch_procedure_parameters(cursor, proc_name: str, domain_map: dict[str, str] = None) -> tuple[list[str], list[str]]:
         params_query = """
             SELECT
                 pp.RDB$PARAMETER_NAME,
@@ -260,7 +276,10 @@ class DdlExporter:
 
             # Preserve user-defined domain if not a system domain (RDB$...)
             if field_source and not field_source.startswith('RDB$'):
-                type_name = field_source
+                if domain_map and field_source.upper() in domain_map:
+                    type_name = domain_map[field_source.upper()]
+                else:
+                    type_name = field_source
             else:
                 type_name = resolve_firebird_type(
                     field_type=field_type,
@@ -510,6 +529,9 @@ class DdlExporter:
         fb_cursor.execute('SELECT RDB$RELATION_NAME FROM RDB$RELATIONS WHERE RDB$SYSTEM_FLAG = 0;')
         relation_names = {r[0].strip() for r in fb_cursor.fetchall() if r[0]}
 
+        domain_names = [d[0].strip() for d in domains if d[0]]
+        domain_map = build_domain_mapping(domain_names, relation_names)
+
         _ensure_parent_dir(out_file)
         _ensure_parent_dir(conv_file)
 
@@ -544,12 +566,11 @@ class DdlExporter:
                 f.write(fb_ddl)
 
                 # PostgreSQL DDL
-                pg_domain_name = resolve_pg_domain_name(domain_name, relation_names)
+                pg_domain_name = domain_map.get(domain_name.upper(), domain_name.lower())
                 if pg_domain_name != domain_name.lower():
-                    logger.info(f'  [RENAMED] Domain "{domain_name}" collides with a table/view name; '
-                                f'exported as "{pg_domain_name}".')
+                    logger.info(f'  [RENAMED] Domain "{domain_name}" -> "{pg_domain_name}".')
                     conv_f.write(f'-- [RENAMED] DOMAIN "{domain_name}" -> "{pg_domain_name}" '
-                                 f'(collides with a table/view name)\n')
+                                 f'(collides with a table/view name or another domain)\n')
 
                 pg_ddl = self._format_domain_postgres_ddl(
                     pg_domain_name, pg_type, default_source, not_null, validation_source

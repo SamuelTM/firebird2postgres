@@ -1,5 +1,5 @@
 import re
-from models import Table, Column, ForeignKey, UniqueKey, Index, Sequence, CheckConstraint, resolve_firebird_type, resolve_pg_domain_name
+from models import Table, Column, ForeignKey, UniqueKey, Index, Sequence, CheckConstraint, resolve_firebird_type, resolve_pg_domain_name, build_domain_mapping
 from transpiler import FirebirdToPostgresVisitor, validate_immutable_expression
 
 
@@ -19,11 +19,12 @@ class SchemaExtractor:
         fb_cursor = self.fb_con.cursor()
         tables = self._fetch_user_tables(fb_cursor)
         relation_names = self._fetch_relation_names(fb_cursor)
+        domain_map = self._fetch_domain_map(fb_cursor, relation_names)
 
         table_objs: list[Table] = []
         for table_name in tables:
             table_obj = Table(table_name)
-            table_obj.columns = self._extract_columns(fb_cursor, table_name, relation_names)
+            table_obj.columns = self._extract_columns(fb_cursor, table_name, relation_names, domain_map=domain_map)
             table_obj.foreign_keys = self._extract_foreign_keys(fb_cursor, table_name)
             table_obj.unique_keys = self._extract_unique_keys(fb_cursor, table_name)
             col_symbols = {col.name.lower(): col.column_type for col in table_obj.columns}
@@ -61,7 +62,19 @@ class SchemaExtractor:
         return {r[0].strip() for r in cursor.fetchall() if r[0]}
 
     @staticmethod
-    def _extract_columns(cursor, table_name: str, relation_names: set[str]) -> list[Column]:
+    def _fetch_domain_map(cursor, relation_names: set[str]) -> dict[str, str]:
+        """
+        Fetches all user-defined domains and builds a collision-free mapping.
+        """
+        cursor.execute("""
+            SELECT DISTINCT RDB$FIELD_NAME FROM RDB$FIELDS
+            WHERE RDB$SYSTEM_FLAG = 0 AND RDB$FIELD_NAME NOT STARTING WITH 'RDB$';
+        """)
+        domain_names = [r[0].strip() for r in cursor.fetchall() if r[0]]
+        return build_domain_mapping(domain_names, relation_names)
+
+    @staticmethod
+    def _extract_columns(cursor, table_name: str, relation_names: set[str], domain_map: dict[str, str] = None) -> list[Column]:
         """
         Extracts all columns for a given table, resolving types and domain mappings.
         """
@@ -116,7 +129,10 @@ class SchemaExtractor:
             # Anything else is a user-defined domain, referenced in PostgreSQL.
             domain_name = None
             if field_source and not field_source.startswith('RDB$'):
-                domain_name = resolve_pg_domain_name(field_source, relation_names)
+                if domain_map and field_source.upper() in domain_map:
+                    domain_name = domain_map[field_source.upper()]
+                else:
+                    domain_name = resolve_pg_domain_name(field_source, relation_names)
                 default_value = column_default
             else:
                 default_value = column_default or domain_default
