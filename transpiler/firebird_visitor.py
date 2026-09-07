@@ -1318,6 +1318,43 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
             )
             raise RuntimeError(f"Failed to transpile Firebird expression '{expr_clean}' to PostgreSQL: {e}") from e
 
+    @classmethod
+    def transpile_default_clause(cls, default_str: str | None, symbols: dict[str, str] = None) -> str | None:
+        if not default_str:
+            return None
+        s = default_str.strip()
+        m = re.match(r'^\s*DEFAULT\s+(.*)$', s, re.IGNORECASE | re.DOTALL)
+        if m:
+            expr = m.group(1).strip()
+            has_default_kw = True
+        else:
+            expr = s
+            has_default_kw = False
+        try:
+            pg_expr = cls.transpile_expression(expr, symbols=symbols)
+            return f"DEFAULT {pg_expr}" if has_default_kw else pg_expr
+        except Exception as e:
+            logger.warning("Could not transpile default expression '%s': %s", s, e)
+            return s
+
+    @classmethod
+    def transpile_check_clause(cls, check_str: str | None, symbols: dict[str, str] = None) -> str | None:
+        if not check_str:
+            return None
+        s = check_str.strip()
+        m = re.match(r'^\s*CHECK\s*\((.*)\)\s*$', s, re.IGNORECASE | re.DOTALL)
+        if m:
+            expr = m.group(1).strip()
+        else:
+            m2 = re.match(r'^\s*CHECK\s+(.*)$', s, re.IGNORECASE | re.DOTALL)
+            expr = m2.group(1).strip() if m2 else s
+        try:
+            pg_expr = cls.transpile_expression(expr, symbols=symbols)
+            return f"CHECK ({pg_expr})"
+        except Exception as e:
+            logger.warning("Could not transpile check expression '%s': %s", s, e)
+            return f"CHECK ({expr})" if not s.upper().startswith("CHECK") else s
+
     @staticmethod
     def _clean_sql(pg_sql: str) -> str:
         """

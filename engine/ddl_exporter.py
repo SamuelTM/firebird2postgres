@@ -578,15 +578,14 @@ class DdlExporter:
                                     validation_source: str | None) -> str:
         pg_domain_ident = f'public."{pg_domain_name}"'
         create_ddl = f'CREATE DOMAIN {pg_domain_ident} AS {pg_type}'
-        if default_source:
-            create_ddl += f' {default_source}'
+        transpiled_default = FirebirdToPostgresVisitor.transpile_default_clause(default_source)
+        if transpiled_default:
+            create_ddl += f' {transpiled_default}'
         if not_null:
             create_ddl += ' NOT NULL'
-        if validation_source:
-            check = validation_source
-            if not check.upper().startswith('CHECK'):
-                check = f'CHECK ({check})'
-            create_ddl += f'\n{check}'
+        transpiled_check = FirebirdToPostgresVisitor.transpile_check_clause(validation_source)
+        if transpiled_check:
+            create_ddl += f'\n{transpiled_check}'
         create_ddl += ';'
 
         escaped_name = pg_domain_name.replace("'", "''")

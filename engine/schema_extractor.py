@@ -121,6 +121,9 @@ class SchemaExtractor:
             else:
                 default_value = column_default or domain_default
 
+            if default_value:
+                default_value = FirebirdToPostgresVisitor.transpile_default_clause(default_value, symbols=symbols)
+
             columns.append(
                 Column(
                     name=column_name,

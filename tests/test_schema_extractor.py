@@ -82,6 +82,17 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
         self.assertFalse(columns[0].nullable)
         self.assertEqual(columns[0].computed_source, "CASE WHEN STATUS = 1 THEN 100 ELSE 0 END")
 
+    def test_extract_columns_transpiles_default_value(self):
+        mock_cursor = MagicMock()
+        # column tuple: name, type, subtype, length, null_flag, prec, scale, col_def, dom_def, fld_src, comp_src
+        mock_cursor.fetchall.return_value = [
+            ("STATUS", 8, 0, 4, 1, None, None, "DEFAULT IIF(1=1, 1, 0)", None, "RDB$1", None),
+        ]
+
+        columns = SchemaExtractor._extract_columns(mock_cursor, "T", {"T"})
+        self.assertEqual(len(columns), 1)
+        self.assertEqual(columns[0].default_value, "DEFAULT CASE WHEN 1=1 THEN 1 ELSE 0 END")
+
     def test_extract_columns_passes_symbols_for_time_expressions(self):
         mock_cursor = MagicMock()
         # column tuple: name, type, subtype, length, null_flag, prec, scale, col_def, dom_def, fld_src, comp_src

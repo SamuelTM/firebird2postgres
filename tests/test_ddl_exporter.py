@@ -193,6 +193,18 @@ class TestDdlExporterViews(unittest.TestCase):
         self.assertIn("P_NAME VARCHAR(50) DEFAULT 'ANON'", in_params[1])
         self.assertIn("OUT_STATUS DM_STATUS", out_params[0])
 
+    def test_format_domain_postgres_ddl_transpiles_check_and_default(self):
+        pg_ddl = DdlExporter._format_domain_postgres_ddl(
+            pg_domain_name="dm_test",
+            pg_type="INTEGER",
+            default_source="DEFAULT IIF(1=1, 1, 0)",
+            not_null=False,
+            validation_source="CHECK (IIF(VALUE > 0, 1, 0) = 1)",
+        )
+        self.assertIn("DEFAULT CASE WHEN 1=1 THEN 1 ELSE 0 END", pg_ddl)
+        self.assertIn("CHECK (CASE WHEN VALUE > 0 THEN 1 ELSE 0 END = 1)", pg_ddl)
+        self.assertNotIn("IIF", pg_ddl)
+
 
 if __name__ == '__main__':
     unittest.main()
