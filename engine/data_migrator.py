@@ -141,12 +141,50 @@ class DataMigrator:
                          f"Re-enable them manually with ALTER TABLE ... ENABLE TRIGGER ALL.")
             raise
 
+    def check_source_consistency(self) -> dict:
+        """
+        Checks whether the source Firebird database is frozen (read-only or shutdown)
+        or has active concurrent client attachments that could compromise snapshot
+        consistency across parallel workers.
+        """
+        info = {'is_read_only': False, 'is_shutdown': False, 'active_attachments': 0}
+        try:
+            cur = self.fb_con.cursor()
+            try:
+                cur.execute("SELECT MON$READ_ONLY, MON$SHUTDOWN_MODE FROM MON$DATABASE;")
+                row = cur.fetchone()
+                if row:
+                    info['is_read_only'] = bool(row[0])
+                    info['is_shutdown'] = (row[1] is not None and row[1] > 0)
+            except Exception:
+                pass
+
+            try:
+                cur.execute("SELECT COUNT(*) FROM MON$ATTACHMENTS WHERE MON$ATTACHMENT_ID <> CURRENT_CONNECTION AND (MON$SYSTEM_FLAG = 0 OR MON$SYSTEM_FLAG IS NULL);")
+                row = cur.fetchone()
+                if row and row[0] is not None:
+                    info['active_attachments'] = int(row[0])
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        if not info['is_read_only'] and not info['is_shutdown'] and info['active_attachments'] > 0:
+            logger.warning(
+                f"Source Firebird database is LIVE (read-write) with {info['active_attachments']} active "
+                f"external attachment(s). Parallel table workers cannot share a single transactional snapshot; "
+                f"concurrent writes during migration may cause relational inconsistencies. "
+                f"For guaranteed consistency, freeze the source database ('gfix -mode read_only') or migrate from a backup copy."
+            )
+        return info
+
     def import_data(self, table_objs: list[Table], max_workers: int = 4, executor: Executor = None) -> bool:
         """
         Reads data from Firebird and bulk inserts into PostgreSQL using a multi-process worker pool.
         Tables are prioritized by complexity (LPT scheduling) so heavy BLOB tables run concurrently.
         Returns True if all tables were imported successfully, False if any table failed.
         """
+        self.check_source_consistency()
         logger.info(f"Starting data migration for {len(table_objs)} tables (workers={max_workers})...")
         pg_cur = self.pg_con.cursor()
 

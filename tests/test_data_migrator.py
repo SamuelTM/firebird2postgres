@@ -207,4 +207,25 @@ class TestDataMigrator(unittest.TestCase):
         self.assertIn('IS NOT NULL', query)
         self.assertIn('s.is_called', query)
 
+    def test_check_source_consistency_read_only(self):
+        self.mock_fb_cur.fetchone.side_effect = [
+            (1, 0),  # MON$READ_ONLY = 1, MON$SHUTDOWN_MODE = 0
+            (0,),    # active_attachments = 0
+        ]
+        info = self.migrator.check_source_consistency()
+        self.assertTrue(info['is_read_only'])
+        self.assertFalse(info['is_shutdown'])
+        self.assertEqual(info['active_attachments'], 0)
+
+    def test_check_source_consistency_warns_on_live_source(self):
+        self.mock_fb_cur.fetchone.side_effect = [
+            (0, 0),  # MON$READ_ONLY = 0, MON$SHUTDOWN_MODE = 0
+            (3,),    # active_attachments = 3
+        ]
+        with self.assertLogs('engine.data_migrator', level='WARNING') as cm:
+            info = self.migrator.check_source_consistency()
+            self.assertFalse(info['is_read_only'])
+            self.assertEqual(info['active_attachments'], 3)
+            self.assertTrue(any('Source Firebird database is LIVE' in msg for msg in cm.output))
+
 
