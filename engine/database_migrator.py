@@ -124,8 +124,8 @@ class DatabaseMigrator:
         """
         return self.ddl_exporter.inventory_unsupported_objects()
 
-    def apply_sql_file(self, file_path: str, continue_on_error: bool = False) -> int:
+    def apply_sql_file(self, file_path: str, continue_on_error: bool = False, allow_empty: bool = False) -> int:
         """
         Executes a PostgreSQL SQL file against the connected database.
         """
-        return self.sql_runner.apply_file(file_path, continue_on_error=continue_on_error)
+        return self.sql_runner.apply_file(file_path, continue_on_error=continue_on_error, allow_empty=allow_empty)

@@ -14,10 +14,12 @@ class SqlRunner:
     def __init__(self, pg_con):
         self.pg_con = pg_con
 
-    def apply_file(self, file_path: str, continue_on_error: bool = False) -> int:
+    def apply_file(self, file_path: str, continue_on_error: bool = False, allow_empty: bool = False) -> int:
         """
         Executes a PostgreSQL SQL file against the connected database.
         Returns the number of successfully executed statements.
+        Raises FileNotFoundError if file does not exist.
+        Raises ValueError if file contains no executable statements and allow_empty is False.
         """
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"SQL file '{file_path}' not found.")
@@ -26,6 +28,15 @@ class SqlRunner:
             content = f.read()
 
         statements = [sql for sql, _ in split_sql_statements(content)]
+
+        if not statements:
+            if not allow_empty:
+                raise ValueError(
+                    f"SQL file '{file_path}' contains 0 executable statements (empty or comments only). "
+                    f"Set allow_empty=True if this is expected."
+                )
+            logger.info(f"SQL file '{file_path}' contains 0 executable statements (empty allowed).")
+            return 0
 
         pg_cur = self.pg_con.cursor()
         success_count = 0

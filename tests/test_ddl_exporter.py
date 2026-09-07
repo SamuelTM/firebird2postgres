@@ -285,13 +285,14 @@ class TestDdlExporterViews(unittest.TestCase):
         mock_cur = MagicMock()
         mock_con.cursor.return_value = mock_cur
 
-        # Side effects for the 5 queries: functions, packages, exceptions, db triggers, roles
+        # Side effects for the 6 queries: functions, packages, exceptions, db triggers, roles, grants
         mock_cur.fetchall.side_effect = [
             [("FN_CUSTOM",)],
             [("PKG_SALES",)],
             [("EXC_INVALID_DOC",)],
             [("TRG_ON_CONNECT",)],
             [("ROLE_ADMIN",)],
+            [("USER1", "S", "CLIENTES")],
         ]
         exporter = DdlExporter(mock_con)
         inventory = exporter.inventory_unsupported_objects()
@@ -300,6 +301,30 @@ class TestDdlExporterViews(unittest.TestCase):
         self.assertEqual(inventory['EXCEPTIONS'], ['EXC_INVALID_DOC'])
         self.assertEqual(inventory['DATABASE_TRIGGERS'], ['TRG_ON_CONNECT'])
         self.assertEqual(inventory['ROLES'], ['ROLE_ADMIN'])
+        self.assertEqual(inventory['GRANTS'], ['USER1 -> S ON CLIENTES'])
+
+    def test_inventory_differentiates_query_errors_and_unsupported_version(self):
+        mock_con = MagicMock()
+        mock_cur = MagicMock()
+        mock_con.cursor.return_value = mock_cur
+
+        def execute_side_effect(sql):
+            if "RDB$PACKAGES" in sql:
+                raise RuntimeError("Dynamic SQL Error: Table unknown RDB$PACKAGES")
+            elif "RDB$ROLES" in sql:
+                raise RuntimeError("Connection lost during query")
+
+        mock_cur.execute.side_effect = execute_side_effect
+        mock_cur.fetchall.return_value = []
+
+        exporter = DdlExporter(mock_con)
+        inventory = exporter.inventory_unsupported_objects()
+
+        self.assertIn('NOT_SUPPORTED_BY_VERSION', inventory)
+        self.assertTrue(any('PACKAGES' in s for s in inventory['NOT_SUPPORTED_BY_VERSION']))
+
+        self.assertIn('QUERY_ERRORS', inventory)
+        self.assertTrue(any('ROLES' in s for s in inventory['QUERY_ERRORS']))
 
 
 if __name__ == '__main__':

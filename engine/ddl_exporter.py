@@ -528,90 +528,87 @@ class DdlExporter:
     def inventory_unsupported_objects(self) -> dict[str, list[str]]:
         """
         Scans the Firebird database for objects that are not automatically transpiled
-        (functions/UDFs, packages, exceptions, database triggers, roles) and returns
+        (functions/UDFs, packages, exceptions, database triggers, roles, grants) and returns
         a dictionary mapping object categories to lists of object names.
+        Explicitly distinguishes between empty categories, features not supported by the
+        Firebird version (e.g. PACKAGES in FB 2.5), and actual catalog query errors.
         """
         cursor = self.fb_con.cursor()
         unsupported: dict[str, list[str]] = {}
 
-        # 1. Functions / UDFs
-        try:
-            cursor.execute("""
+        queries = [
+            ("FUNCTIONS", """
                 SELECT RDB$FUNCTION_NAME
                 FROM RDB$FUNCTIONS
                 WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
                 ORDER BY RDB$FUNCTION_NAME;
-            """)
-            funcs = [r[0].strip() for r in cursor.fetchall() if r[0]]
-            if funcs:
-                unsupported['FUNCTIONS'] = funcs
-        except Exception:
-            pass
-
-        # 2. Packages (FB 3.0+)
-        try:
-            cursor.execute("""
+            """),
+            ("PACKAGES", """
                 SELECT RDB$PACKAGE_NAME
                 FROM RDB$PACKAGES
                 WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
                 ORDER BY RDB$PACKAGE_NAME;
-            """)
-            pkgs = [r[0].strip() for r in cursor.fetchall() if r[0]]
-            if pkgs:
-                unsupported['PACKAGES'] = pkgs
-        except Exception:
-            pass
-
-        # 3. Exceptions
-        try:
-            cursor.execute("""
+            """),
+            ("EXCEPTIONS", """
                 SELECT RDB$EXCEPTION_NAME
                 FROM RDB$EXCEPTIONS
                 WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
                 ORDER BY RDB$EXCEPTION_NAME;
-            """)
-            exc = [r[0].strip() for r in cursor.fetchall() if r[0]]
-            if exc:
-                unsupported['EXCEPTIONS'] = exc
-        except Exception:
-            pass
-
-        # 4. Database-level triggers (non-table triggers)
-        try:
-            cursor.execute("""
+            """),
+            ("DATABASE_TRIGGERS", """
                 SELECT RDB$TRIGGER_NAME
                 FROM RDB$TRIGGERS
                 WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
                   AND (RDB$RELATION_NAME IS NULL OR RDB$TRIGGER_TYPE > 8192)
                 ORDER BY RDB$TRIGGER_NAME;
-            """)
-            db_trgs = [r[0].strip() for r in cursor.fetchall() if r[0]]
-            if db_trgs:
-                unsupported['DATABASE_TRIGGERS'] = db_trgs
-        except Exception:
-            pass
-
-        # 5. Roles
-        try:
-            cursor.execute("""
+            """),
+            ("ROLES", """
                 SELECT RDB$ROLE_NAME
                 FROM RDB$ROLES
                 WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
                   AND RDB$ROLE_NAME NOT STARTING WITH 'RDB$'
                 ORDER BY RDB$ROLE_NAME;
-            """)
-            roles = [r[0].strip() for r in cursor.fetchall() if r[0]]
-            if roles:
-                unsupported['ROLES'] = roles
-        except Exception:
-            pass
+            """),
+            ("GRANTS", """
+                SELECT DISTINCT TRIM(RDB$USER), TRIM(RDB$PRIVILEGE), TRIM(RDB$RELATION_NAME)
+                FROM RDB$USER_PRIVILEGES
+                WHERE RDB$USER NOT STARTING WITH 'RDB$'
+                  AND RDB$USER NOT IN ('SYSDBA')
+                ORDER BY RDB$RELATION_NAME, RDB$USER;
+            """),
+        ]
+
+        for cat, sql in queries:
+            try:
+                cursor.execute(sql)
+                rows = cursor.fetchall()
+                if cat == "GRANTS":
+                    items = [f"{r[0]} -> {r[1]} ON {r[2]}" for r in rows if r and r[0] and r[2]]
+                else:
+                    items = [r[0].strip() for r in rows if r and r[0]]
+                if items:
+                    unsupported[cat] = items
+            except Exception as e:
+                err_str = str(e).strip()
+                # Table unknown or feature not in this Firebird dialect/version
+                if "Table unknown" in err_str or "42S02" in err_str or "does not exist" in err_str.lower():
+                    logger.info(f"Firebird catalog category '{cat}' is not supported by this database version: {err_str}")
+                    unsupported.setdefault('NOT_SUPPORTED_BY_VERSION', []).append(f"{cat}: {err_str}")
+                else:
+                    logger.error(f"Catalog query failed for category '{cat}': {err_str}")
+                    unsupported.setdefault('QUERY_ERRORS', []).append(f"{cat}: {err_str}")
 
         if unsupported:
             for cat, items in unsupported.items():
-                logger.warning(
-                    f"Found {len(items)} {cat.lower()} in Firebird requiring manual review/migration: "
-                    f"{', '.join(items[:10])}{'...' if len(items) > 10 else ''}"
-                )
+                if cat == 'QUERY_ERRORS':
+                    logger.error(f"Failed to query catalog for {len(items)} category(ies): {items}")
+                elif cat == 'NOT_SUPPORTED_BY_VERSION':
+                    logger.info(f"Firebird version does not support: {items}")
+                else:
+                    logger.warning(
+                        f"Found {len(items)} {cat.lower()} in Firebird requiring manual review/migration: "
+                        f"{', '.join(items[:10])}{'...' if len(items) > 10 else ''}"
+                    )
         return unsupported
 
     def export_all_firebird_ddl(self, output_dir: str = None):

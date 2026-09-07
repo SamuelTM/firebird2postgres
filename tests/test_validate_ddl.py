@@ -155,6 +155,32 @@ class TestRunDdlValidation(unittest.TestCase):
         from validate_postgres_ddl import print_diagnostic_report
         self.assertFalse(print_diagnostic_report([]))
 
+    def test_run_ddl_validation_missing_target_file_fails(self):
+        from unittest.mock import MagicMock
+        from validate_postgres_ddl import run_ddl_validation, print_diagnostic_report
+        mock_conn = MagicMock()
+        results, _ = run_ddl_validation(mock_conn, ["/nonexistent/missing_dump.sql"])
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0].success)
+        self.assertEqual(results[0].pg_code, "FILE_NOT_FOUND")
+        self.assertFalse(print_diagnostic_report(results))
+
+    def test_run_ddl_validation_empty_target_file_fails_by_default(self):
+        import tempfile, os
+        from unittest.mock import MagicMock
+        from validate_postgres_ddl import run_ddl_validation, print_diagnostic_report
+        with tempfile.NamedTemporaryFile("w+", suffix=".sql", delete=False) as f:
+            f.write("-- comment only\n")
+            temp_path = f.name
+        self.addCleanup(os.remove, temp_path)
+
+        mock_conn = MagicMock()
+        results, _ = run_ddl_validation(mock_conn, [temp_path], allow_empty_files=False)
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0].success)
+        self.assertEqual(results[0].pg_code, "FILE_EMPTY")
+        self.assertFalse(print_diagnostic_report(results))
+
 
 if __name__ == '__main__':
     unittest.main()

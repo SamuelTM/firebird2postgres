@@ -73,6 +73,25 @@ class TestSqlRunner(unittest.TestCase):
         self.assertIn("SAVEPOINT stmt_sp_2;", executed_queries)
         self.assertIn("RELEASE SAVEPOINT stmt_sp_2;", executed_queries)
 
+    def test_apply_file_empty_raises_valueerror_by_default(self):
+        with tempfile.NamedTemporaryFile("w+", suffix=".sql", delete=False) as f:
+            f.write("-- Just a comment, no executable SQL\n\n")
+            temp_path = f.name
+        self.addCleanup(os.remove, temp_path)
+
+        with self.assertRaises(ValueError) as ctx:
+            self.runner.apply_file(temp_path, allow_empty=False)
+        self.assertIn("contains 0 executable statements", str(ctx.exception))
+
+    def test_apply_file_empty_allowed(self):
+        with tempfile.NamedTemporaryFile("w+", suffix=".sql", delete=False) as f:
+            f.write("-- Just a comment\n")
+            temp_path = f.name
+        self.addCleanup(os.remove, temp_path)
+
+        res = self.runner.apply_file(temp_path, allow_empty=True)
+        self.assertEqual(res, 0)
+
 
 if __name__ == '__main__':
     unittest.main()

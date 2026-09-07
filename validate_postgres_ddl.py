@@ -36,12 +36,14 @@ class ValidationResult:
     pg_code: Optional[str] = None
 
 
-def split_sql_statements(file_path: str) -> List[SQLStatement]:
+def split_sql_statements(file_path: str, allow_missing: bool = False) -> List[SQLStatement]:
     """
     Parses a PostgreSQL SQL file into individual SQLStatement objects.
     The low-level splitting (quotes, comments, dollar-quoting) lives in sql_splitter.
     """
     if not os.path.exists(file_path):
+        if not allow_missing:
+            raise FileNotFoundError(f"Target SQL file '{file_path}' not found.")
         print(f"[WARNING] File '{file_path}' not found. Skipping.")
         return []
 
@@ -203,7 +205,9 @@ def check_plpgsql_runtime_validity(
 def run_ddl_validation(
     conn,
     target_files: List[str],
-    apply_changes: bool = False
+    apply_changes: bool = False,
+    allow_missing_files: bool = False,
+    allow_empty_files: bool = False
 ) -> tuple[List[ValidationResult], List[tuple[str, str]]]:
     """
     Executes each statement in sequence inside a PostgreSQL transaction using SAVEPOINTS.
@@ -213,16 +217,54 @@ def run_ddl_validation(
     conn.autocommit = False
     cursor = conn.cursor()
     try:
-        # Load and collect statements
+        results: List[ValidationResult] = []
         all_statements: List[SQLStatement] = []
         for fpath in target_files:
-            stmts = split_sql_statements(fpath)
+            if not os.path.exists(fpath):
+                if not allow_missing_files:
+                    results.append(
+                        ValidationResult(
+                            statement=SQLStatement(
+                                file_name=os.path.basename(fpath),
+                                object_type="FILE",
+                                object_name=fpath,
+                                sql="",
+                                start_line=0
+                            ),
+                            success=False,
+                            error_message=f"Target file not found: '{fpath}'",
+                            pg_code="FILE_NOT_FOUND"
+                        )
+                    )
+                else:
+                    print(f"[WARNING] File '{fpath}' not found. Skipping.")
+                continue
+
+            stmts = split_sql_statements(fpath, allow_missing=True)
+            if not stmts:
+                if not allow_empty_files:
+                    results.append(
+                        ValidationResult(
+                            statement=SQLStatement(
+                                file_name=os.path.basename(fpath),
+                                object_type="FILE",
+                                object_name=fpath,
+                                sql="",
+                                start_line=0
+                            ),
+                            success=False,
+                            error_message=f"Target file '{fpath}' contains 0 SQL statements (empty file). Set allow_empty_files=True if permitted.",
+                            pg_code="FILE_EMPTY"
+                        )
+                    )
+                else:
+                    print(f"[INFO] File '{fpath}' contains 0 statements (empty allowed).")
+                continue
+
             all_statements.extend(stmts)
 
         print(f"[INFO] Total DDL statements loaded: {len(all_statements)}")
         print(f"[INFO] Mode: {'APPLY (CHANGES WILL BE PERSISTED)' if apply_changes else 'DRY-RUN (ROLLBACK AT THE END - SAFE)'}\n")
-
-        results: List[ValidationResult] = []
 
         for idx, stmt in enumerate(all_statements, 1):
             sp_name = f"sp_validate_{idx}"
@@ -359,7 +401,9 @@ def print_diagnostic_report(results: List[ValidationResult]) -> bool:
 def validate_postgres_ddl(
     pg_connection=None,
     target_files: Optional[List[str]] = None,
-    apply_changes: bool = False
+    apply_changes: bool = False,
+    allow_missing_files: bool = False,
+    allow_empty_files: bool = False
 ) -> bool:
     """
     Validates the generated PostgreSQL DDL files against a PostgreSQL instance.
@@ -383,7 +427,9 @@ def validate_postgres_ddl(
         results, runtime_issues = run_ddl_validation(
             conn=pg_connection,
             target_files=target_files,
-            apply_changes=apply_changes
+            apply_changes=apply_changes,
+            allow_missing_files=allow_missing_files,
+            allow_empty_files=allow_empty_files
         )
         return print_diagnostic_report(results, runtime_issues=runtime_issues)
     finally:
