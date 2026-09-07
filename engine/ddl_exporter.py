@@ -251,14 +251,39 @@ class DdlExporter:
                 pp.RDB$DEFAULT_SOURCE,
                 pp.RDB$NULL_FLAG,
                 f.RDB$NULL_FLAG,
-                f.RDB$DEFAULT_SOURCE
+                f.RDB$DEFAULT_SOURCE,
+                pp.RDB$PARAMETER_MECHANISM
             FROM RDB$PROCEDURE_PARAMETERS pp
             JOIN RDB$FIELDS f ON pp.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
             WHERE pp.RDB$PROCEDURE_NAME = ?
             ORDER BY pp.RDB$PARAMETER_TYPE, pp.RDB$PARAMETER_NUMBER;
         """
-        cursor.execute(params_query, (proc_name,))
-        params = cursor.fetchall()
+        try:
+            cursor.execute(params_query, (proc_name,))
+            params = cursor.fetchall()
+        except Exception:
+            legacy_query = """
+                SELECT
+                    pp.RDB$PARAMETER_NAME,
+                    pp.RDB$PARAMETER_TYPE,
+                    pp.RDB$PARAMETER_NUMBER,
+                    f.RDB$FIELD_TYPE,
+                    f.RDB$FIELD_SUB_TYPE,
+                    COALESCE(f.RDB$CHARACTER_LENGTH, f.RDB$FIELD_LENGTH),
+                    f.RDB$FIELD_PRECISION,
+                    f.RDB$FIELD_SCALE,
+                    pp.RDB$FIELD_SOURCE,
+                    pp.RDB$DEFAULT_SOURCE,
+                    pp.RDB$NULL_FLAG,
+                    f.RDB$NULL_FLAG,
+                    f.RDB$DEFAULT_SOURCE
+                FROM RDB$PROCEDURE_PARAMETERS pp
+                JOIN RDB$FIELDS f ON pp.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
+                WHERE pp.RDB$PROCEDURE_NAME = ?
+                ORDER BY pp.RDB$PARAMETER_TYPE, pp.RDB$PARAMETER_NUMBER;
+            """
+            cursor.execute(legacy_query, (proc_name,))
+            params = cursor.fetchall()
 
         def _clean_str(val):
             if val is None:
@@ -285,9 +310,10 @@ class DdlExporter:
             param_null_flag = param[10] if len(param) > 10 else None
             field_null_flag = param[11] if len(param) > 11 else None
             field_default = _clean_str(param[12]) if len(param) > 12 else None
+            param_mechanism = param[13] if len(param) > 13 else None
 
-            # Preserve user-defined domain if not a system domain (RDB$...)
-            if field_source and not field_source.startswith('RDB$'):
+            # Preserve user-defined domain if not a system domain (RDB$...) and not TYPE OF domain (mechanism = 1)
+            if field_source and not field_source.startswith('RDB$') and param_mechanism != 1:
                 if domain_map and field_source.upper() in domain_map:
                     type_name = domain_map[field_source.upper()]
                 else:
@@ -306,7 +332,13 @@ class DdlExporter:
                         f"field_subtype={field_subtype}) for parameter '{param_name}' in procedure '{proc_name}'."
                     )
 
-            raw_default = param_default or field_default
+            if param_mechanism == 1:
+                raw_default = param_default
+                is_not_null = (param_null_flag == 1)
+            else:
+                raw_default = param_default or field_default
+                is_not_null = (param_null_flag == 1) or (field_null_flag == 1)
+
             default_clause = ""
             if raw_default:
                 if raw_default.upper().startswith('DEFAULT'):
@@ -316,7 +348,6 @@ class DdlExporter:
                 else:
                     default_clause = f" DEFAULT {raw_default}"
 
-            is_not_null = (param_null_flag == 1) or (field_null_flag == 1)
             not_null_clause = " NOT NULL" if is_not_null else ""
 
             if param_type_flag == 0:

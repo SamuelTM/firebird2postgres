@@ -208,6 +208,21 @@ class TestDdlExporterViews(unittest.TestCase):
             DdlExporter._fetch_procedure_parameters(mock_cursor, "SP_TEST")
         self.assertIn("Unsupported or unrecognized Firebird data type", str(cm.exception))
 
+    def test_fetch_procedure_parameters_with_type_of_domain(self):
+        mock_cursor = MagicMock()
+        # Parameter defined as TYPE OF DM_ID (mechanism=1)
+        # Domain DM_ID has field_null_flag=1 and field_default="DEFAULT 99",
+        # but parameter itself has param_null_flag=0 and param_default=None.
+        # TYPE OF domain must resolve base physical type (INTEGER) and discard domain constraints/defaults.
+        mock_cursor.fetchall.return_value = [
+            ("P_VAL", 0, 0, 8, 0, 4, 0, 0, "DM_ID", None, 0, 1, "DEFAULT 99", 1),
+        ]
+        in_params, out_params = DdlExporter._fetch_procedure_parameters(
+            mock_cursor, "SP_TEST", domain_map={"DM_ID": "dm_id"}
+        )
+        self.assertEqual(len(in_params), 1)
+        self.assertEqual(in_params[0].strip(), "P_VAL INTEGER")
+
     def test_format_domain_postgres_ddl_transpiles_check_and_default(self):
         pg_ddl = DdlExporter._format_domain_postgres_ddl(
             pg_domain_name="dm_test",
