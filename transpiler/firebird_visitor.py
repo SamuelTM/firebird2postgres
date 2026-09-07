@@ -509,6 +509,157 @@ def _normalize_procedure_params(sql: str) -> str:
     return "".join(result)
 
 
+def _parse_first_skip_val(s: str, pos: int) -> tuple[Optional[str], int]:
+    while pos < len(s) and s[pos].isspace():
+        pos += 1
+    if pos >= len(s):
+        return None, pos
+    if s[pos] == '(':
+        start = pos
+        depth = 1
+        pos += 1
+        in_str = False
+        while pos < len(s) and depth > 0:
+            c = s[pos]
+            if c == "'":
+                if not in_str:
+                    in_str = True
+                elif pos + 1 < len(s) and s[pos + 1] == "'":
+                    pos += 1
+                else:
+                    in_str = False
+            elif not in_str:
+                if c == '(':
+                    depth += 1
+                elif c == ')':
+                    depth -= 1
+            pos += 1
+        return s[start:pos], pos
+    elif s[pos] == ':':
+        m = re.match(r"^:[a-zA-Z0-9_$]+", s[pos:])
+        if m:
+            return m.group(0), pos + m.end()
+    else:
+        m = re.match(r"^[0-9]+", s[pos:])
+        if m:
+            return m.group(0), pos + m.end()
+    return None, pos
+
+
+def _normalize_first_skip(sql: str, expr_map: dict[str, str]) -> str:
+    start_pat = re.compile(
+        r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|(\bSELECT\b)",
+        flags=re.IGNORECASE
+    )
+    pos = 0
+    result = []
+    while pos < len(sql):
+        m = start_pat.search(sql, pos)
+        if not m:
+            result.append(sql[pos:])
+            break
+        result.append(sql[pos:m.start()])
+        if m.group(1):
+            result.append(m.group(1))
+            pos = m.end()
+            continue
+
+        sel_kw = m.group(2)
+        cur = m.end()
+        first_expr, skip_expr = None, None
+        matched_any = False
+        for _ in range(2):
+            while cur < len(sql) and sql[cur].isspace():
+                cur += 1
+            m_kw = re.match(r"^(FIRST|SKIP)\b", sql[cur:], re.IGNORECASE)
+            if m_kw:
+                matched_any = True
+                kw = m_kw.group(1).upper()
+                val, cur = _parse_first_skip_val(sql, cur + m_kw.end())
+                if kw == "FIRST":
+                    first_expr = val
+                else:
+                    skip_expr = val
+            else:
+                break
+
+        if not matched_any:
+            result.append(sel_kw)
+            pos = m.end()
+            continue
+
+        def process_val(val):
+            if val is None:
+                return None
+            val_clean = val.strip()
+            if val_clean.isdigit():
+                return val_clean
+            sentinel = f"888{len(expr_map):09d}"
+            cleaned = re.sub(r":([a-zA-Z0-9_$]+)", r"\1", val_clean)
+            expr_map[sentinel] = cleaned
+            return sentinel
+
+        f_num = process_val(first_expr)
+        s_num = process_val(skip_expr)
+
+        parts = [sel_kw]
+        if f_num is not None:
+            parts.append(f"FIRST {f_num}")
+        if s_num is not None:
+            parts.append(f"SKIP {s_num}")
+        parts.append("")
+        result.append(" ".join(parts))
+        pos = cur
+
+    return "".join(result)
+
+
+def _normalize_type_of(sql: str) -> str:
+    pat = re.compile(
+        r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|(\bTYPE\s+OF\s+(?:COLUMN\s+)?(([a-zA-Z0-9_$]+|\"[^\"]+\")(?:\s*\.\s*([a-zA-Z0-9_$]+|\"[^\"]+\"))?))",
+        flags=re.IGNORECASE
+    )
+    def repl(m):
+        if m.group(1):
+            return m.group(1)
+        full_kw = m.group(2)
+        m_col = re.match(r'^\bTYPE\s+OF\s+COLUMN\s+(([a-zA-Z0-9_$]+|\"[^\"]+\")\s*\.\s*([a-zA-Z0-9_$]+|\"[^\"]+\"))', full_kw, re.IGNORECASE)
+        if m_col:
+            return f"{m_col.group(2)}.{m_col.group(3)}%TYPE"
+        m_dom = re.match(r'^\bTYPE\s+OF\s+([a-zA-Z0-9_$]+|\"[^\"]+\")', full_kw, re.IGNORECASE)
+        if m_dom:
+            return m_dom.group(1)
+        return full_kw
+    return pat.sub(repl, sql)
+
+
+def _normalize_when_any(sql: str) -> str:
+    pat = re.compile(
+        r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|(\bWHEN\s+ANY\s+DO\b)",
+        flags=re.IGNORECASE
+    )
+    def repl(m):
+        if m.group(1):
+            return m.group(1)
+        return "/* __FB_WHEN_ANY__ */"
+    return pat.sub(repl, sql)
+
+
+def _normalize_returning_values(sql: str) -> str:
+    pat = re.compile(
+        r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|(\bEXECUTE\s+PROCEDURE\s+([a-zA-Z0-9_$]+|\"[^\"]+\")(?:\s*(\([^;]*?\)))?\s+RETURNING_VALUES\s+([^;]+);)",
+        flags=re.IGNORECASE
+    )
+    def repl(m):
+        if m.group(1):
+            return m.group(1)
+        proc_name = m.group(3)
+        args = m.group(4) if m.group(4) else "()"
+        vars_part = m.group(5).strip()
+        return f"SELECT * FROM {proc_name}{args} INTO {vars_part};"
+    return pat.sub(repl, sql)
+
+
 def _split_top_level_args(s: str) -> list[str]:
     parts = []
     depth = 0
@@ -673,11 +824,12 @@ class ASTDialectRewriter(FirebirdParserVisitor):
     are performed in semantic context, leaving string literals and comments 100% untouched.
     """
 
-    def __init__(self, rewriter: TokenStreamRewriter, symbols: dict[str, str] = None):
+    def __init__(self, rewriter: TokenStreamRewriter, symbols: dict[str, str] = None, expr_map: dict[str, str] = None):
         super().__init__()
         self.rewriter = rewriter
         self.handled_qbs = set()
         self.symbols: dict[str, str] = {k.strip('":').lower(): v.upper() for k, v in symbols.items()} if symbols else {}
+        self.expr_map: dict[str, str] = expr_map or {}
         self.is_trigger = False
         self.trigger_return = "RETURN NEW"
 
@@ -1010,13 +1162,37 @@ class ASTDialectRewriter(FirebirdParserVisitor):
         as LIMIT n [OFFSET m] to the end of the enclosing select_statement or subquery.
         """
         qb = _find_node(ctx, FirebirdParser.Query_blockContext)
-        if qb and qb.FIRST() and id(qb) not in self.handled_qbs:
+        if qb and (qb.FIRST() or qb.SKIP_()) and id(qb) not in self.handled_qbs:
             self.handled_qbs.add(id(qb))
-            first_val = qb.numeric(0).getText()
-            skip_val = qb.numeric(1).getText() if qb.SKIP_() else None
-            end_token = qb.numeric(1).stop if qb.SKIP_() else qb.numeric(0).stop
-            self.rewriter.replaceRangeTokens(qb.FIRST().symbol, end_token, '')
-            limit_clause = f' LIMIT {first_val}' + (f' OFFSET {skip_val}' if skip_val else '')
+            if qb.FIRST() and qb.SKIP_():
+                first_val = qb.numeric(0).getText()
+                skip_val = qb.numeric(1).getText()
+                start_token = qb.FIRST().symbol
+                end_token = qb.numeric(1).stop
+            elif qb.FIRST():
+                first_val = qb.numeric(0).getText()
+                skip_val = None
+                start_token = qb.FIRST().symbol
+                end_token = qb.numeric(0).stop
+            else:
+                first_val = None
+                skip_val = qb.numeric(0).getText()
+                start_token = qb.SKIP_().symbol
+                end_token = qb.numeric(0).stop
+
+            if first_val and first_val in self.expr_map:
+                first_val = self.expr_map[first_val]
+            if skip_val and skip_val in self.expr_map:
+                skip_val = self.expr_map[skip_val]
+
+            if first_val and skip_val:
+                limit_clause = f' LIMIT {first_val} OFFSET {skip_val}'
+            elif first_val:
+                limit_clause = f' LIMIT {first_val}'
+            else:
+                limit_clause = f' OFFSET {skip_val}'
+
+            self.rewriter.replaceRangeTokens(start_token, end_token, '')
 
             into_ctx = _find_node(ctx, FirebirdParser.Into_clauseContext)
             if into_ctx:
@@ -1186,7 +1362,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         self.domain_map = {k.strip().upper(): v.strip() for k, v in domain_map.items()} if domain_map else {}
 
     @classmethod
-    def _normalize_sql(cls, sql: str) -> str:
+    def _normalize_sql(cls, sql: str, expr_map: dict[str, str] = None) -> str:
         """
         Pre-parse normalization:
         1. Firebird allows custom exception messages: `EXCEPTION <name> '<msg>';`.
@@ -1200,6 +1376,8 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         3. Normalizes keywords directly attached to colon bind variables without
            whitespace (e.g. `into:vid` -> `into :vid`).
         """
+        if expr_map is None:
+            expr_map = {}
 
         # Step 1: Normalize custom exception messages (e.g. EXCEPTION EX_ERR 'custom msg';)
         def ex_repl(match):
@@ -1235,11 +1413,23 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         # Step 4: Normalize alternative Firebird syntax DATEADD(...) and DATEDIFF(...)
         sql = _normalize_date_funcs(sql)
 
-        # Step 5: Normalize variable declarations (= initializers, DEFAULT ... NOT NULL, etc.)
+        # Step 5: Normalize TYPE OF COLUMN and TYPE OF domain
+        sql = _normalize_type_of(sql)
+
+        # Step 6: Normalize variable declarations (= initializers, DEFAULT ... NOT NULL, etc.)
         sql = _normalize_variable_declarations(sql)
 
-        # Step 6: Normalize procedure parameters (= to DEFAULT, strip NOT NULL)
-        return _normalize_procedure_params(sql)
+        # Step 7: Normalize procedure parameters (= to DEFAULT, strip NOT NULL)
+        sql = _normalize_procedure_params(sql)
+
+        # Step 8: Normalize EXECUTE PROCEDURE ... RETURNING_VALUES ...
+        sql = _normalize_returning_values(sql)
+
+        # Step 9: Normalize WHEN ANY DO exception handlers
+        sql = _normalize_when_any(sql)
+
+        # Step 10: Normalize FIRST/SKIP pagination (expressions, variable parameters, standalone SKIP, ordering)
+        return _normalize_first_skip(sql, expr_map)
 
     @classmethod
     def transpile(cls, firebird_sql_string: str, symbols: dict[str, str] = None, domain_map: dict[str, str] = None) -> str:
@@ -1247,7 +1437,8 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         Parses Firebird SQL using Two-Stage Parsing (SLL -> LL), traverses the AST with the visitor,
         and applies dialect token rewriting to produce clean PostgreSQL SQL.
         """
-        normalized_sql = cls._normalize_sql(firebird_sql_string)
+        expr_map = {}
+        normalized_sql = cls._normalize_sql(firebird_sql_string, expr_map=expr_map)
 
         error_listener = _CollectingErrorListener()
 
@@ -1290,7 +1481,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         rewriter = TokenStreamRewriter(stream)
 
         # Pass 1: Semantic token rewriting on AST
-        dialect_rewriter = ASTDialectRewriter(rewriter, symbols=symbols)
+        dialect_rewriter = ASTDialectRewriter(rewriter, symbols=symbols, expr_map=expr_map)
         dialect_rewriter.visit(tree)
 
         # Pass 2: High-level PL/pgSQL structure visitor
@@ -1378,6 +1569,9 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
 
         # Step 2: Strip protective double-quotes on trigger pseudo-records
         pg_sql = re.sub(r'"(old|new)"\.', r'\1.', pg_sql, flags=re.IGNORECASE)
+
+        # Step 3: Restore WHEN ANY exception handling
+        pg_sql = re.sub(r"/\*\s*__FB_WHEN_ANY__\s*\*/", "EXCEPTION\n    WHEN OTHERS THEN", pg_sql)
         return pg_sql
 
     def visitSql_script(self, ctx: FirebirdParser.Sql_scriptContext):

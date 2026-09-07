@@ -763,3 +763,87 @@ class TestTranspilerProcedures(unittest.TestCase):
         self.assertIn("IN_A foo_dom_dom", pg_sql)
         self.assertIn("OUT_B foo_dom_dom", pg_sql)
         self.assertIn("V_TEMP foo_dom_dom;", pg_sql)
+
+    def test_procedure_standalone_skip_pagination(self):
+        fb_sql = """
+        CREATE PROCEDURE SP_TEST_SKIP
+        AS
+        DECLARE VARIABLE V INT;
+        BEGIN
+            SELECT SKIP 2 ID FROM CLIENTES INTO :V;
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("OFFSET 2 INTO STRICT V;", pg_sql)
+        self.assertNotIn("SKIP 2", pg_sql)
+
+    def test_procedure_dynamic_first_skip_expressions(self):
+        fb_sql = """
+        CREATE PROCEDURE SP_TEST_DYN_PAG (P_LIM INT, P_OFF INT)
+        AS
+        DECLARE VARIABLE V INT;
+        BEGIN
+            SELECT FIRST (1 + 1) ID FROM CLIENTES INTO :V;
+            SELECT FIRST :P_LIM SKIP :P_OFF ID FROM CLIENTES INTO :V;
+            SELECT SKIP (5 * 2) FIRST (10) ID FROM CLIENTES INTO :V;
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("LIMIT (1 + 1) INTO STRICT V;", pg_sql)
+        self.assertIn("LIMIT P_LIM OFFSET P_OFF INTO STRICT V;", pg_sql)
+        self.assertIn("LIMIT (10) OFFSET (5 * 2) INTO STRICT V;", pg_sql)
+
+    def test_procedure_type_of_column_and_domain(self):
+        fb_sql = """
+        CREATE PROCEDURE SP_TEST_TYPE_OF (
+            P_NAME TYPE OF COLUMN CLIENTES.NOME,
+            P_STATUS TYPE OF DOM_STATUS
+        )
+        AS
+        DECLARE VARIABLE V_ID TYPE OF COLUMN CLIENTES.ID;
+        DECLARE VARIABLE V_DOM TYPE OF DOM_CUSTOM;
+        BEGIN
+            V_ID = 1;
+        END;
+        """
+        domain_map = {"DOM_STATUS": "dom_status", "DOM_CUSTOM": "dom_custom_type"}
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql, domain_map=domain_map)
+        self.assertIn("P_NAME CLIENTES.NOME%TYPE", pg_sql)
+        self.assertIn("P_STATUS dom_status", pg_sql)
+        self.assertIn("V_ID CLIENTES.ID%TYPE;", pg_sql)
+        self.assertIn("V_DOM dom_custom_type;", pg_sql)
+        self.assertNotIn("TYPE OF", pg_sql)
+
+    def test_procedure_when_any_exception_handler(self):
+        fb_sql = """
+        CREATE PROCEDURE SP_TEST_WHEN_ANY
+        AS
+        BEGIN
+            INSERT INTO LOGS(MSG) VALUES ('START');
+            WHEN ANY DO
+            BEGIN
+                INSERT INTO LOGS(MSG) VALUES ('ERROR');
+            END
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("EXCEPTION", pg_sql)
+        self.assertIn("WHEN OTHERS THEN", pg_sql)
+        self.assertNotIn("WHEN ANY", pg_sql)
+
+    def test_procedure_execute_procedure_returning_values(self):
+        fb_sql = """
+        CREATE PROCEDURE SP_TEST_RET
+        AS
+        DECLARE VARIABLE V1 INT;
+        DECLARE VARIABLE V2 VARCHAR(10);
+        BEGIN
+            EXECUTE PROCEDURE OTHER_P(1, 2) RETURNING_VALUES :V1, :V2;
+            EXECUTE PROCEDURE NO_ARG_P RETURNING_VALUES :V1;
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("SELECT * FROM OTHER_P(1, 2) INTO STRICT V1, V2;", pg_sql)
+        self.assertIn("SELECT * FROM NO_ARG_P() INTO STRICT V1;", pg_sql)
+        self.assertNotIn("RETURNING_VALUES", pg_sql)
+
