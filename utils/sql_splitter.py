@@ -11,6 +11,23 @@ Splits a SQL script into individual statements, correctly handling:
 import re
 
 
+def choose_dollar_tag(content: str, base_tag: str = "") -> str:
+    """
+    Returns a dollar-quoting tag (e.g. '$$' or '$body$') that does not occur within content.
+    """
+    tag = f"${base_tag}$"
+    if tag not in content:
+        return tag
+    candidate = base_tag if base_tag else "body"
+    tag = f"${candidate}$"
+    if tag not in content:
+        return tag
+    counter = 1
+    while f"${candidate}{counter}$" in content:
+        counter += 1
+    return f"${candidate}{counter}$"
+
+
 def split_sql_statements(content: str) -> list[tuple[str, int]]:
     """
     Splits SQL script content into individual statements.

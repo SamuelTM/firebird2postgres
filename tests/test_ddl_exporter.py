@@ -204,9 +204,23 @@ class TestDdlExporterViews(unittest.TestCase):
         self.assertIn("DEFAULT CASE WHEN 1=1 THEN 1 ELSE 0 END", pg_ddl)
         self.assertIn("CHECK (CASE WHEN VALUE > 0 THEN 1 ELSE 0 END = 1)", pg_ddl)
         self.assertNotIn("IIF", pg_ddl)
+        self.assertIn("DO $$", pg_ddl)
+
+    def test_format_domain_postgres_ddl_safe_dollar_tag(self):
+        pg_ddl = DdlExporter._format_domain_postgres_ddl(
+            pg_domain_name="dm_test",
+            pg_type="VARCHAR(10)",
+            default_source="DEFAULT '$$'",
+            not_null=False,
+            validation_source=None,
+        )
+        self.assertIn("DO $body$", pg_ddl)
+        self.assertIn("END $body$;", pg_ddl)
+        self.assertNotIn("DO $$", pg_ddl)
 
 
 if __name__ == '__main__':
     unittest.main()
+
 
 

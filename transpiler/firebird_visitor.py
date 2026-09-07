@@ -16,6 +16,7 @@ from antlr4.TokenStreamRewriter import TokenStreamRewriter
 
 from .firebird_grammar import FirebirdParserVisitor, FirebirdParser, FirebirdLexer
 from models import pg_quote_ident
+from utils import choose_dollar_tag
 
 logger = logging.getLogger(__name__)
 
@@ -1662,9 +1663,10 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
 
         # DROP first to guarantee idempotency, since changing an existing function's
         # signature (parameter types or return type) requires recreating it
+        tag = choose_dollar_tag(f"{decl_str}{body_str}")
         return (f'DROP FUNCTION IF EXISTS "{proc_name.lower()}" CASCADE;\n'
-                f'CREATE FUNCTION "{proc_name.lower()}"({params_str}) {return_type} AS $$\n{decl_str}{body_str}\n'
-                f'$$ LANGUAGE plpgsql;')
+                f'CREATE FUNCTION "{proc_name.lower()}"({params_str}) {return_type} AS {tag}\n{decl_str}{body_str}\n'
+                f'{tag} LANGUAGE plpgsql;')
 
     def visitParameter(self, ctx: FirebirdParser.ParameterContext):
         param_name = _normalize_ident_case(ctx.parameter_name().getText())
@@ -1745,7 +1747,8 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         # Postgres uses a function for the trigger body, and then CREATE TRIGGER
         func_name = f"{trigger_name}_func"
 
-        func_sql = f'CREATE OR REPLACE FUNCTION "{func_name}"() RETURNS TRIGGER AS $$\n{body_str}\n$$ LANGUAGE plpgsql;'
+        tag = choose_dollar_tag(body_str)
+        func_sql = f'CREATE OR REPLACE FUNCTION "{func_name}"() RETURNS TRIGGER AS {tag}\n{body_str}\n{tag} LANGUAGE plpgsql;'
         trigger_sql = (f'DROP TRIGGER IF EXISTS "{trigger_name}" ON "{table_name.lower()}";\n'
                        f'CREATE TRIGGER "{trigger_name}" {timing} {events} ON "{table_name.lower()}" '
                        f'FOR EACH ROW{when_clause} EXECUTE FUNCTION "{func_name}"();')

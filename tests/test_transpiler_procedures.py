@@ -847,3 +847,18 @@ class TestTranspilerProcedures(unittest.TestCase):
         self.assertIn("SELECT * FROM NO_ARG_P() INTO STRICT V1;", pg_sql)
         self.assertNotIn("RETURNING_VALUES", pg_sql)
 
+    def test_procedure_with_dollar_quote_in_body(self):
+        fb_sql = """
+        CREATE PROCEDURE SP_TEST_DOLLAR
+        AS
+        DECLARE VARIABLE R VARCHAR(10);
+        BEGIN
+            R = '$$';
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("AS $body$", pg_sql)
+        self.assertIn("$body$ LANGUAGE plpgsql;", pg_sql)
+        self.assertIn("R := '$$';", pg_sql)
+
+

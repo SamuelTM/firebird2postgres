@@ -12,6 +12,7 @@ from models import (
     decode_trigger_type,
 )
 from transpiler import FirebirdToPostgresVisitor
+from utils import choose_dollar_tag
 
 logger = logging.getLogger(__name__)
 
@@ -611,8 +612,7 @@ class DdlExporter:
 
         escaped_name = pg_domain_name.replace("'", "''")
         escaped_ddl = create_ddl.replace("'", "''")
-        return (
-            'DO $$\n'
+        inner_block = (
             'BEGIN\n'
             '    IF NOT EXISTS (SELECT 1 FROM pg_type t\n'
             '                   JOIN pg_namespace n ON n.oid = t.typnamespace\n'
@@ -620,5 +620,7 @@ class DdlExporter:
             f"                     AND t.typname = '{escaped_name}') THEN\n"
             f"        EXECUTE '{escaped_ddl}';\n"
             '    END IF;\n'
-            'END $$;\n'
+            'END'
         )
+        tag = choose_dollar_tag(inner_block + f" {escaped_ddl}", base_tag="")
+        return f'DO {tag}\n{inner_block} {tag};\n'
