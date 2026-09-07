@@ -30,18 +30,31 @@ class SqlRunner:
 
         pg_cur = self.pg_con.cursor()
         success_count = 0
-        for stmt in statements:
-            try:
-                logger.debug(stmt)
-                pg_cur.execute(stmt)
-                success_count += 1
-            except Exception as e:
-                self.pg_con.rollback()
-                logger.error(f"Error executing statement: {e}")
-                logger.debug(f"Failed query: {stmt}")
-                if not continue_on_error:
+        for i, stmt in enumerate(statements):
+            if continue_on_error:
+                savepoint = f"stmt_sp_{i}"
+                pg_cur.execute(f"SAVEPOINT {savepoint};")
+                try:
+                    logger.debug(stmt)
+                    pg_cur.execute(stmt)
+                    pg_cur.execute(f"RELEASE SAVEPOINT {savepoint};")
+                    success_count += 1
+                except Exception as e:
+                    pg_cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint};")
+                    logger.error(f"Error executing statement: {e}")
+                    logger.debug(f"Failed query: {stmt}")
+            else:
+                try:
+                    logger.debug(stmt)
+                    pg_cur.execute(stmt)
+                    success_count += 1
+                except Exception as e:
+                    self.pg_con.rollback()
+                    logger.error(f"Error executing statement: {e}")
+                    logger.debug(f"Failed query: {stmt}")
                     raise e
 
         self.pg_con.commit()
         logger.info(f"Successfully applied {success_count} statements from '{file_path}'.")
         return success_count
+
