@@ -688,6 +688,23 @@ class TestTranspilerProcedures(unittest.TestCase):
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
         self.assertIn("SELECT MY_ALIAS.ID FROM T MY_ALIAS WHERE MY_ALIAS.ID = ID INTO STRICT ID;", pg_sql)
 
+    def test_procedure_with_suspend_literal_does_not_return_setof(self):
+        fb_sql = """
+        CREATE PROCEDURE SP_NO_SETOF
+        RETURNS (
+            MSG VARCHAR(50)
+        )
+        AS
+        BEGIN
+            -- This comment contains suspend
+            MSG = 'suspend';
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("RETURNS VARCHAR(50)", pg_sql)
+        self.assertNotIn("RETURNS SETOF", pg_sql)
+
+
 
 
 

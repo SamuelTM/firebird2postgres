@@ -1215,6 +1215,20 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
     def visitUnit_statement(self, ctx: FirebirdParser.Unit_statementContext):
         return self.visitChildren(ctx)
 
+    def _has_suspend_node(self, node) -> bool:
+        if node is None:
+            return False
+        if hasattr(node, 'symbol') and hasattr(node.symbol, 'type'):
+            if node.symbol.type == FirebirdParser.SUSPEND:
+                return True
+        if hasattr(node, 'SUSPEND') and callable(node.SUSPEND) and node.SUSPEND():
+            return True
+        if hasattr(node, 'children') and node.children:
+            for child in node.children:
+                if self._has_suspend_node(child):
+                    return True
+        return False
+
     def visitCreate_procedure_body(self, ctx: FirebirdParser.Create_procedure_bodyContext):
         proc_name = ctx.procedure_name().getText().strip('"')
 
@@ -1250,7 +1264,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         body_str = self.visit(ctx.body()) if ctx.body() else ""
 
         # Determine correct return type for PostgreSQL
-        has_return_next = "RETURN NEXT" in body_str or "suspend" in body_str.lower()
+        has_return_next = self._has_suspend_node(ctx.body()) if ctx.body() else False
         if not out_params:
             return_type = "RETURNS void"
             # In void functions, SUSPEND / RETURN NEXT must be a plain RETURN;
