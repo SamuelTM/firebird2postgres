@@ -164,3 +164,19 @@ class TestTranspilerTriggers(unittest.TestCase):
         self.assertNotIn("WHEN", pg_sql)
         self.assertIn('CREATE TRIGGER "BI_MIXED" BEFORE INSERT ON "clientes" FOR EACH ROW EXECUTE FUNCTION "BI_MIXED_func"();', pg_sql)
 
+    def test_trigger_preserves_old_new_in_string_literals(self):
+        fb_sql = """
+        CREATE TRIGGER BU_AUDIT FOR CLIENTES BEFORE UPDATE
+        AS
+        BEGIN
+            IF (NEW.STATUS <> OLD.STATUS) THEN
+            BEGIN
+                INSERT INTO LOGS (MSG) VALUES ('"old".status alterado para "new".status');
+            END
+        END
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("NEW.STATUS <> OLD.STATUS", pg_sql)
+        self.assertIn('\'"old".status alterado para "new".status\'', pg_sql)
+
+

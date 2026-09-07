@@ -1567,8 +1567,12 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         )
         pg_sql = ex_clean.sub(r"RAISE EXCEPTION '\1: %', \2;", pg_sql)
 
-        # Step 2: Strip protective double-quotes on trigger pseudo-records
-        pg_sql = re.sub(r'"(old|new)"\.', r'\1.', pg_sql, flags=re.IGNORECASE)
+        # Step 2: Strip protective double-quotes on trigger pseudo-records (preserving strings and comments)
+        clean_pattern = re.compile(
+            r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|(\"(old|new)\"\.)",
+            flags=re.IGNORECASE
+        )
+        pg_sql = clean_pattern.sub(lambda m: m.group(1) if m.group(1) else f"{m.group(3)}.", pg_sql)
 
         # Step 3: Restore WHEN ANY exception handling
         pg_sql = re.sub(r"/\*\s*__FB_WHEN_ANY__\s*\*/", "EXCEPTION\n    WHEN OTHERS THEN", pg_sql)
