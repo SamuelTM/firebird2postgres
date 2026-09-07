@@ -28,7 +28,7 @@ An ANTLR-based transpiler converts triggers, stored procedures and views to PL/p
 
 - Streams bulk data directly into PostgreSQL using the native `COPY` protocol (`copy_expert`).
 
-- Adjusts the batch size for tables with BLOB columns to save memory.
+- Enforces a byte-volume memory budget (32 MB) with incremental buffer flushes and smaller fetch slices (100 rows) for BLOB tables to prevent OOM across parallel workers.
 
 - Disables triggers during the load (`DISABLE TRIGGER ALL`). No foreign-key sort is necessary.
 

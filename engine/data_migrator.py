@@ -10,12 +10,16 @@ from models import Table, pg_quote_ident
 logger = logging.getLogger(__name__)
 
 
-def _import_single_table(table: Table, fb_cur, pg_cur, pg_con) -> tuple[int, dict[str, int]]:
+DEFAULT_MAX_BUFFER_BYTES = 32 * 1024 * 1024  # 32 MB buffer budget per worker
+
+
+def _import_single_table(table: Table, fb_cur, pg_cur, pg_con, max_buffer_bytes: int = DEFAULT_MAX_BUFFER_BYTES) -> tuple[int, dict[str, int]]:
     """
     Imports data for a single table:
     1. Truncates table in PostgreSQL (no CASCADE)
-    2. Queries Firebird and fetches rows in adaptive batches
-    3. Streams rows into PostgreSQL using native COPY protocol (copy_expert)
+    2. Queries Firebird and fetches rows in adaptive slices
+    3. Streams rows into PostgreSQL using native COPY protocol (copy_expert),
+       flushing incrementally whenever memory volume reaches max_buffer_bytes
     4. Commits table transaction in PostgreSQL
 
     Data transformation policy:
@@ -32,10 +36,11 @@ def _import_single_table(table: Table, fb_cur, pg_cur, pg_con) -> tuple[int, dic
     pg_cur.execute(f'TRUNCATE TABLE {pg_quote_ident(table.pg_name)};')
 
     blob_count = sum(1 for col in table.columns if 'BLOB' in col.column_type)
-    batch_size = 10000
+    # Tables with BLOBs fetch in smaller row slices (100 rows) to prevent the Firebird client
+    # and Python runtime from buffering gigabytes of binary data before serialization
+    fetch_size = 100 if blob_count > 0 else 10000
     if blob_count > 0:
-        batch_size = max(1000, 10000 // (blob_count * 2))
-        logger.debug(f"Found {blob_count} BLOB column(s) in '{table.name}'. Adjusted batch size to {batch_size}.")
+        logger.debug(f"Found {blob_count} BLOB column(s) in '{table.name}'. Adjusted fetch slice to {fetch_size} rows with {max_buffer_bytes // (1024 * 1024)}MB memory buffer budget.")
 
     # Explicitly list columns to ensure it perfectly matches the postgres insert order.
     # Exclude computed (GENERATED ALWAYS) columns, as PostgreSQL forbids inserting into them directly.
@@ -54,12 +59,13 @@ def _import_single_table(table: Table, fb_cur, pg_cur, pg_con) -> tuple[int, dic
 
     total_rows = 0
     nul_stats: dict[str, int] = {}
+    buf = io.StringIO()
+
     while True:
-        rows = fb_cur.fetchmany(batch_size)
+        rows = fb_cur.fetchmany(fetch_size)
         if not rows:
             break
 
-        buf = io.StringIO()
         for row in rows:
             line = []
             for col_idx, val in enumerate(row):
@@ -80,9 +86,18 @@ def _import_single_table(table: Table, fb_cur, pg_cur, pg_con) -> tuple[int, dic
                     line.append(str(val))
             buf.write('\t'.join(line) + '\n')
 
+            # Flush buffer incrementally via COPY as soon as accumulated text volume exceeds memory budget
+            if buf.tell() >= max_buffer_bytes:
+                buf.seek(0)
+                pg_cur.copy_expert(copy_sql, buf)
+                buf = io.StringIO()
+
+        total_rows += len(rows)
+
+    # Flush any remaining rows in buffer
+    if buf.tell() > 0:
         buf.seek(0)
         pg_cur.copy_expert(copy_sql, buf)
-        total_rows += len(rows)
 
     pg_con.commit()
     if nul_stats:

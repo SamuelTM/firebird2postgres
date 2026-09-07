@@ -246,4 +246,24 @@ class TestDataMigrator(unittest.TestCase):
             self.assertEqual(info['active_attachments'], 3)
             self.assertTrue(any('Source Firebird database is LIVE' in msg for msg in cm.output))
 
+    def test_blob_memory_budget_flushes_incrementally_by_bytes(self):
+        from engine.data_migrator import _import_single_table
+
+        table = Table('TAB_BLOB')
+        table.columns.append(Column('ID', 'INTEGER', nullable=False))
+        table.columns.append(Column('ARQUIVO', 'BLOB SUBTYPE 0', nullable=True))
+
+        # 4 rows of 300 bytes each -> total serialized ~ 2400 hex chars + overhead
+        raw_rows = [(i, b'X' * 300) for i in range(1, 5)]
+        self.mock_fb_cur.fetchmany.side_effect = [raw_rows, []]
+
+        # Set a small budget (400 bytes) so each row or two triggers a flush
+        rows_imported, _ = _import_single_table(
+            table, self.mock_fb_cur, self.mock_pg_cur, self.mock_pg_con, max_buffer_bytes=400
+        )
+        self.assertEqual(rows_imported, 4)
+        # copy_expert should have been called multiple times (flushes) rather than once
+        self.assertGreaterEqual(self.mock_pg_cur.copy_expert.call_count, 3)
+
+
 
