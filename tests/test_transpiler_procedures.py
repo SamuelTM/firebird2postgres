@@ -904,6 +904,45 @@ class TestTranspilerProcedures(unittest.TestCase):
         self.assertIn("LANGUAGE plpgsql VOLATILE;", pg_seq)
         self.assertIn("Volatility: VOLATILE (sequence generator access)", pg_seq)
 
+        # 4. Procedure calling another procedure (EXECUTE PROCEDURE / PERFORM) -> VOLATILE
+        fb_call = """
+        CREATE OR ALTER PROCEDURE SP_INVOKE_OTHER
+        AS
+        BEGIN
+            EXECUTE PROCEDURE SP_AUDIT_LOG(1);
+        END;
+        """
+        pg_call = FirebirdToPostgresVisitor.transpile(fb_call)
+        self.assertIn("LANGUAGE plpgsql VOLATILE;", pg_call)
+        self.assertIn("procedure call (PERFORM)", pg_call)
+
+        # 5. Procedure with DECLARE initializer calling sequence -> VOLATILE
+        fb_decl_init = """
+        CREATE OR ALTER PROCEDURE SP_INIT_VAR
+        AS
+        DECLARE VARIABLE X INTEGER = GEN_ID(GEN_FOO, 1);
+        BEGIN
+            SUSPEND;
+        END;
+        """
+        pg_decl_init = FirebirdToPostgresVisitor.transpile(fb_decl_init)
+        self.assertIn("LANGUAGE plpgsql VOLATILE;", pg_decl_init)
+        self.assertIn("sequence generator access", pg_decl_init)
+
+        # 6. Procedure calling arbitrary external function -> VOLATILE
+        fb_ext_func = """
+        CREATE OR ALTER PROCEDURE SP_WITH_EXT_FUNC (P_IN INTEGER)
+        RETURNS (P_OUT INTEGER)
+        AS
+        BEGIN
+            P_OUT = SOME_EXTERNAL_FUNC(P_IN);
+            SUSPEND;
+        END;
+        """
+        pg_ext_func = FirebirdToPostgresVisitor.transpile(fb_ext_func)
+        self.assertIn("LANGUAGE plpgsql VOLATILE;", pg_ext_func)
+        self.assertIn("external function call", pg_ext_func)
+
     def test_disambiguation_with_table_alias_and_variable_conflict(self):
         fb_sql = """
         CREATE OR ALTER PROCEDURE SP_DISAMBIGUATION_TEST (ID INTEGER, VALOR NUMERIC(15,2))

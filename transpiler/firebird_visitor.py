@@ -1463,6 +1463,30 @@ class _CollectingErrorListener(ErrorListener):
     def syntaxError(self, recognizer, offendingSymbol, line, column, msg, e):
         self.errors.append(f"line {line}:{column} {msg}")
 
+_SAFE_PROC_CALLS = {
+    'if', 'while', 'loop', 'for', 'in', 'case', 'when', 'then', 'else', 'end',
+    'select', 'from', 'where', 'into', 'values', 'set', 'join', 'on',
+    'group', 'by', 'having', 'order', 'limit', 'offset', 'exists', 'between',
+    'like', 'similar', 'not', 'and', 'or', 'is', 'null',
+    'raise', 'format', 'return', 'exit', 'continue', 'declare', 'begin',
+    'coalesce', 'nullif', 'iif', 'greatest', 'least',
+    'abs', 'round', 'ceil', 'ceiling', 'floor', 'trunc', 'sign', 'power', 'sqrt', 'mod', 'exp', 'ln', 'log',
+    'sin', 'cos', 'tan', 'asin', 'acos', 'atan', 'atan2',
+    'upper', 'lower', 'initcap', 'length', 'char_length', 'character_length', 'octet_length', 'bit_length',
+    'trim', 'btrim', 'ltrim', 'rtrim', 'left', 'right', 'lpad', 'rpad', 'repeat', 'replace', 'reverse',
+    'substr', 'substring', 'position', 'strpos', 'concat', 'concat_ws', 'split_part',
+    'cast', 'extract', 'date_part', 'date_trunc', 'age',
+    'dateadd', 'datediff',
+    'to_char', 'to_date', 'to_timestamp', 'to_number',
+    'count', 'sum', 'avg', 'min', 'max', 'stddev', 'variance',
+    'row_number', 'rank', 'dense_rank',
+    'quote_ident', 'quote_literal', 'quote_nullable',
+    'varchar', 'char', 'numeric', 'decimal', 'float', 'double', 'int', 'integer',
+    'smallint', 'bigint', 'timestamp', 'date', 'time', 'boolean', 'text', 'bytea',
+    'interval', 'blob', 'clob', 'precision',
+    'nextval', 'gen_id', 'setval', 'currval'
+}
+
 
 class FirebirdToPostgresVisitor(FirebirdParserVisitor):
     """
@@ -1731,31 +1755,42 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         return False
 
     @staticmethod
-    def _classify_procedure_volatility(body_str: str) -> tuple[str, list[str]]:
+    def _classify_procedure_volatility(body_str: str, decl_str: str = "") -> tuple[str, list[str]]:
         """
-        Analyzes transpiled PL/pgSQL procedure body to determine volatility (STABLE vs VOLATILE).
+        Analyzes transpiled PL/pgSQL procedure body and declarations to determine volatility.
         Returns (volatility, reasons).
 
-        - Functions with DML (INSERT, UPDATE, DELETE, MERGE), sequence mutations (nextval, gen_id),
-          dynamic SQL (EXECUTE), or autonomous transactions are classified as VOLATILE.
-        - Read-only functions (no side effects) are classified as STABLE.
-        - Per PostgreSQL best practices, read-only functions reading tables must NOT be marked
-          IMMUTABLE (table state changes across transactions) nor PARALLEL SAFE automatically
-          without concurrency verification.
+        Per PostgreSQL safety requirements:
+        - Default volatility is VOLATILE.
+        - Functions with DML (INSERT, UPDATE, DELETE, MERGE, TRUNCATE), procedure calls (PERFORM),
+          dynamic SQL (EXECUTE), sequence mutations (nextval, gen_id), autonomous transactions,
+          transaction control (COMMIT, ROLLBACK), volatile built-ins, or unverified external function calls
+          are classified as VOLATILE.
+        - STABLE is restricted strictly to trivial read-only bodies without side effects and without external calls.
         """
-        clean_code = re.sub(r'--[^\n]*', '', body_str)
+        full_code = f"{decl_str}\n{body_str}" if decl_str else body_str
+        clean_code = re.sub(r'--[^\n]*', '', full_code)
         clean_code = re.sub(r'/\*.*?\*/', '', clean_code, flags=re.DOTALL)
         clean_code = re.sub(r"'(?:''|[^'])*'", "''", clean_code)
 
         side_effects = []
-        if re.search(r'\b(INSERT\s+INTO|UPDATE\b|DELETE\s+FROM|DELETE\b|MERGE\s+INTO)\b', clean_code, re.IGNORECASE):
+        if re.search(r'\b(INSERT\s+INTO|UPDATE\b|DELETE\s+FROM|DELETE\b|MERGE\s+INTO|TRUNCATE\b)\b', clean_code, re.IGNORECASE):
             side_effects.append("data modification (DML)")
-        if re.search(r'\bEXECUTE\b', clean_code, re.IGNORECASE):
+        if re.search(r'\b(PERFORM|EXECUTE\s+PROCEDURE)\b', clean_code, re.IGNORECASE):
+            side_effects.append("procedure call (PERFORM)")
+        if re.search(r'\bEXECUTE\s+(?!PROCEDURE\b)', clean_code, re.IGNORECASE):
             side_effects.append("dynamic SQL / external execution")
-        if re.search(r'\b(NEXT\s+VALUE\s+FOR|GEN_ID|nextval)\b', clean_code, re.IGNORECASE):
+        if re.search(r'\b(NEXT\s+VALUE\s+FOR|GEN_ID|nextval|setval|currval)\b', clean_code, re.IGNORECASE):
             side_effects.append("sequence generator access")
-        if re.search(r'\bAUTONOMOUS\b', clean_code, re.IGNORECASE):
-            side_effects.append("autonomous transaction")
+        if re.search(r'\b(AUTONOMOUS|COMMIT|ROLLBACK)\b', clean_code, re.IGNORECASE):
+            side_effects.append("autonomous transaction / transaction control")
+        if re.search(r'\b(random|gen_random_uuid|clock_timestamp|timeofday)\s*\(', clean_code, re.IGNORECASE):
+            side_effects.append("volatile built-in function")
+
+        calls = re.findall(r'\b([a-zA-Z_][a-zA-Z0-9_$]*)\s*\(', clean_code)
+        unknown_calls = sorted({c for c in calls if c.lower() not in _SAFE_PROC_CALLS})
+        if unknown_calls:
+            side_effects.append(f"external function call ({', '.join(unknown_calls)})")
 
         if side_effects:
             return "VOLATILE", side_effects
@@ -1827,7 +1862,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
             return_type = "RETURNS SETOF record" if has_return_next else "RETURNS record"
 
         # Classify volatility (STABLE vs VOLATILE) and generate optimization advisory
-        volatility, reasons = self._classify_procedure_volatility(body_str)
+        volatility, reasons = self._classify_procedure_volatility(body_str, decl_str)
 
         clean_code = re.sub(r'--[^\n]*', '', body_str)
         clean_code = re.sub(r'/\*.*?\*/', '', clean_code, flags=re.DOTALL)
