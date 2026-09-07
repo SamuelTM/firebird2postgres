@@ -1036,6 +1036,23 @@ class TestTranspilerProcedures(unittest.TestCase):
         self.assertIn('V_BIG NUMERIC(39);', pg_sql)
         self.assertIn('V_BYTES BYTEA;', pg_sql)
 
+    def test_first_skip_expressions_are_transpiled(self):
+        fb_sql = """
+        CREATE PROCEDURE SP_PAGINATE (N INTEGER, M INTEGER)
+        AS
+        DECLARE VARIABLE X INTEGER;
+        BEGIN
+            SELECT FIRST (IIF(:N > 0, :N, 1)) SKIP (IIF(:M > 0, :M, 0)) ID
+            FROM TAB
+            INTO :X;
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("LIMIT (CASE WHEN N > 0 THEN N ELSE 1 END)", pg_sql)
+        self.assertIn("OFFSET (CASE WHEN M > 0 THEN M ELSE 0 END)", pg_sql)
+        self.assertNotIn("IIF", pg_sql)
+
+
 
 
 

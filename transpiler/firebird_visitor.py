@@ -1321,9 +1321,21 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                 end_token = qb.numeric(0).stop
 
             if first_val and first_val in self.expr_map:
-                first_val = self.expr_map[first_val]
+                raw_expr = self.expr_map[first_val]
+                try:
+                    first_val = FirebirdToPostgresVisitor.transpile_expression(
+                        raw_expr, symbols=self.symbols, sequence_increments=self.sequence_increments
+                    )
+                except Exception:
+                    first_val = raw_expr
             if skip_val and skip_val in self.expr_map:
-                skip_val = self.expr_map[skip_val]
+                raw_expr = self.expr_map[skip_val]
+                try:
+                    skip_val = FirebirdToPostgresVisitor.transpile_expression(
+                        raw_expr, symbols=self.symbols, sequence_increments=self.sequence_increments
+                    )
+                except Exception:
+                    skip_val = raw_expr
 
             if first_val and skip_val:
                 limit_clause = f' LIMIT {first_val} OFFSET {skip_val}'
