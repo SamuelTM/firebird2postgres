@@ -21,8 +21,8 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
         mock_cursor.fetchall.return_value = [
             # Lowercase relation & column, mixed-case gen_id
             ("clientes", "AS BEGIN if (new.id is null) then new.id = gen_id(gen_clientes_id, 1); END;"),
-            # Upper relation, multiple assignments in same trigger including NEXT VALUE FOR
-            ("PEDIDOS", "AS BEGIN NEW.NUMERO = GEN_ID(GEN_PEDIDOS, 1); new.codigo_externo = next value for GEN_COD_EXT; END;"),
+            # Upper relation, multiple guarded assignments in same trigger including NEXT VALUE FOR and <= 0
+            ("PEDIDOS", "AS BEGIN if (NEW.NUMERO is null) then NEW.NUMERO = GEN_ID(GEN_PEDIDOS, 1); if (new.codigo_externo is null or new.codigo_externo <= 0) then new.codigo_externo = next value for GEN_COD_EXT; END;"),
         ]
 
         SchemaExtractor._bind_sequence_generators(mock_cursor, [table1, table2])
@@ -50,18 +50,24 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
         col_id = Column('ID', 'INTEGER', nullable=False)
         col_ext = Column('EXT_ID', 'INTEGER', nullable=True)
         col_audit = Column('AUDIT_ID', 'INTEGER', nullable=True)
-        table.columns.extend([col_id, col_ext, col_audit])
+        col_notnull = Column('NOTNULL_ID', 'INTEGER', nullable=True)
+        col_uncond = Column('UNCOND_ID', 'INTEGER', nullable=True)
+        table.columns.extend([col_id, col_ext, col_audit, col_notnull, col_uncond])
 
         mock_cursor = MagicMock()
         mock_cursor.fetchall.return_value = [
             # Commented out code should NOT bind
             ("USERS", "AS BEGIN /* NEW.ID = GEN_ID(GEN_COMMENTED, 1); */ -- NEW.ID = GEN_ID(GEN_SINGLE, 1);\n END;", 1),
             # Step 0 (inspect current value) should NOT bind
-            ("USERS", "AS BEGIN NEW.ID = GEN_ID(GEN_CURRENT, 0); END;", 1),
+            ("USERS", "AS BEGIN IF (NEW.ID IS NULL) THEN NEW.ID = GEN_ID(GEN_CURRENT, 0); END;", 1),
             # Condition on another column should NOT bind (arbitrary business logic)
             ("USERS", "AS BEGIN IF (NEW.STATUS = 'SPECIAL') THEN NEW.EXT_ID = GEN_ID(GEN_SPECIAL, 1); END;", 1),
             # Non-BEFORE INSERT trigger (e.g. trigger_type 3 = BEFORE UPDATE) should NOT bind
-            ("USERS", "AS BEGIN NEW.AUDIT_ID = GEN_ID(GEN_AUDIT, 1); END;", 3),
+            ("USERS", "AS BEGIN IF (NEW.AUDIT_ID IS NULL) THEN NEW.AUDIT_ID = GEN_ID(GEN_AUDIT, 1); END;", 3),
+            # IS NOT NULL guard should NOT bind (not an absent-value check)
+            ("USERS", "AS BEGIN IF (NEW.NOTNULL_ID IS NOT NULL) THEN NEW.NOTNULL_ID = GEN_ID(GEN_NOTNULL, 1); END;", 1),
+            # Unconditional assignment should NOT bind (prevent double increments with active trigger)
+            ("USERS", "AS BEGIN NEW.UNCOND_ID = GEN_ID(GEN_UNCOND, 1); END;", 1),
         ]
 
         SchemaExtractor._bind_sequence_generators(mock_cursor, [table])
@@ -69,6 +75,8 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
         self.assertIsNone(col_id.sequence_name)
         self.assertIsNone(col_ext.sequence_name)
         self.assertIsNone(col_audit.sequence_name)
+        self.assertIsNone(col_notnull.sequence_name)
+        self.assertIsNone(col_uncond.sequence_name)
 
     def test_extract_columns_transpiles_computed_source(self):
         mock_cursor = MagicMock()

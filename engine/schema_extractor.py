@@ -476,12 +476,8 @@ class SchemaExtractor:
         triggers = cursor.fetchall()
         tables_by_name = {t.name.upper(): t for t in table_objs}
 
-        uncond_re = re.compile(
-            r"^(?:(?:AS\s+)?BEGIN\s+)?NEW\.(?:\"|\s)*([A-Za-z0-9_]+)(?:\"|\s)*=\s*(?:GEN_ID\s*\(\s*([A-Za-z0-9_]+)\s*,\s*1\s*\)|NEXT\s+VALUE\s+FOR\s+([A-Za-z0-9_]+))\s*(?:END)?$",
-            re.IGNORECASE
-        )
         if_re = re.compile(
-            r"^(?:(?:AS\s+)?BEGIN\s+)?IF\s*\((.*?)\)\s*THEN\s*(?:BEGIN\s+)?NEW\.(?:\"|\s)*([A-Za-z0-9_]+)(?:\"|\s)*=\s*(?:GEN_ID\s*\(\s*([A-Za-z0-9_]+)\s*,\s*1\s*\)|NEXT\s+VALUE\s+FOR\s+([A-Za-z0-9_]+))\s*(?:END)?$",
+            r"^(?:(?:AS\s+)?BEGIN\s+)?IF\s*(?:\((.*?)\)|(.*?))\s+THEN\s*(?:BEGIN\s+)?NEW\.(?:\"|\s)*([A-Za-z0-9_]+)(?:\"|\s)*=\s*(?:GEN_ID\s*\(\s*([A-Za-z0-9_]+)\s*,\s*1\s*\)|NEXT\s+VALUE\s+FOR\s+([A-Za-z0-9_]+))\s*(?:END)?$",
             re.IGNORECASE | re.DOTALL
         )
 
@@ -505,21 +501,18 @@ class SchemaExtractor:
                 col_name = None
                 seq_name = None
 
-                m_uncond = uncond_re.match(stmt)
-                if m_uncond:
-                    col_name = m_uncond.group(1).strip()
-                    seq_name = (m_uncond.group(2) or m_uncond.group(3)).strip().lower()
-                else:
-                    m_if = if_re.match(stmt)
-                    if m_if:
-                        cond = m_if.group(1).strip()
-                        c = m_if.group(2).strip()
-                        s = (m_if.group(3) or m_if.group(4)).strip().lower()
-                        cond_cols = re.findall(r"NEW\.(?:\"|\s)*([A-Za-z0-9_]+)(?:\"|\s)*", cond, re.IGNORECASE)
-                        # Verify condition only guards this same column (e.g. NEW.ID IS NULL or NEW.ID = 0)
-                        if cond_cols and all(col.upper() == c.upper() for col in cond_cols):
-                            col_name = c
-                            seq_name = s
+                m_if = if_re.match(stmt)
+                if m_if:
+                    cond = (m_if.group(1) or m_if.group(2)).strip()
+                    c = m_if.group(3).strip()
+                    s = (m_if.group(4) or m_if.group(5)).strip().lower()
+                    cond_cols = re.findall(r"NEW\.(?:\"|\s)*([A-Za-z0-9_]+)(?:\"|\s)*", cond, re.IGNORECASE)
+                    # Verify condition strictly guards absence of value on this same column (e.g. NEW.ID IS NULL or NEW.ID <= 0)
+                    if cond_cols and all(col.upper() == c.upper() for col in cond_cols):
+                        if not re.search(r"\bNOT\b", cond, re.IGNORECASE) and not re.search(r"!=|<>|>\s*0\b", cond):
+                            if re.search(r"\bIS\s+NULL\b", cond, re.IGNORECASE) or re.search(r"(?:<=?|=)\s*0\b", cond):
+                                col_name = c
+                                seq_name = s
 
                 if col_name and seq_name:
                     column = next((c for c in table.columns if c.name.upper() == col_name.upper()), None)
