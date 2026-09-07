@@ -41,11 +41,12 @@ def get_firebird_data_type_name(data_type_value: int, subtype: int = None) -> st
 
 def resolve_firebird_type(field_type: int, field_subtype: int = None,
                           field_length: int = None, field_precision: int = None,
-                          field_scale: int = None) -> str | None:
+                          field_scale: int = None, character_length: int = None) -> str | None:
     """
     Resolves the full Firebird type declaration for a field, column or parameter:
     NUMERIC precision/scale for integer-based numeric subtypes, and length for
-    CHAR/VARCHAR. Returns the base type name otherwise (None if unknown).
+    CHAR/VARCHAR (prefers character_length over byte field_length).
+    Returns the base type name otherwise (None if unknown).
     """
     type_name = get_firebird_data_type_name(field_type, field_subtype)
 
@@ -56,8 +57,9 @@ def resolve_firebird_type(field_type: int, field_subtype: int = None,
             return f'NUMERIC({field_precision}, {scale})'
         return 'NUMERIC'
 
-    if field_type in (FirebirdDataType.CHAR, FirebirdDataType.VARCHAR) and field_length:
-        return f'{type_name}({field_length})'
+    eff_length = character_length or field_length
+    if field_type in (FirebirdDataType.CHAR, FirebirdDataType.VARCHAR) and eff_length:
+        return f'{type_name}({eff_length})'
 
     return type_name
 

@@ -30,7 +30,9 @@ class TestFirebirdTypes(unittest.TestCase):
         self.assertEqual(resolve_firebird_type(field_type=8), 'INTEGER')
         self.assertEqual(resolve_firebird_type(field_type=7), 'SMALLINT')
         self.assertEqual(resolve_firebird_type(field_type=37, field_length=50), 'VARCHAR(50)')
+        self.assertEqual(resolve_firebird_type(field_type=37, field_length=40, character_length=10), 'VARCHAR(10)')
         self.assertEqual(resolve_firebird_type(field_type=14, field_length=10), 'CHAR(10)')
+        self.assertEqual(resolve_firebird_type(field_type=14, field_length=40, character_length=10), 'CHAR(10)')
         # Numeric with precision and scale
         self.assertEqual(resolve_firebird_type(field_type=16, field_subtype=1, field_precision=15, field_scale=-2),
                          'NUMERIC(15, 2)')

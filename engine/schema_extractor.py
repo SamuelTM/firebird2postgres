@@ -80,7 +80,8 @@ class SchemaExtractor:
         Extracts all columns for a given table, resolving types and domain mappings.
         """
         cursor.execute("""
-            SELECT rf.RDB$FIELD_NAME, f.RDB$FIELD_TYPE, f.RDB$FIELD_SUB_TYPE, f.RDB$FIELD_LENGTH, 
+            SELECT rf.RDB$FIELD_NAME, f.RDB$FIELD_TYPE, f.RDB$FIELD_SUB_TYPE,
+                   COALESCE(f.RDB$CHARACTER_LENGTH, f.RDB$FIELD_LENGTH),
                    COALESCE(rf.RDB$NULL_FLAG, f.RDB$NULL_FLAG),
                    f.RDB$FIELD_PRECISION, f.RDB$FIELD_SCALE,
                    rf.RDB$DEFAULT_SOURCE, f.RDB$DEFAULT_SOURCE,
