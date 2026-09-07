@@ -1268,16 +1268,26 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                         self._disambiguate_scope(ctx, table_qualifier)
         return self.visitChildren(ctx)
 
+    def _extract_table_qualifier(self, general_table_ref) -> str:
+        if not general_table_ref:
+            return ""
+        if hasattr(general_table_ref, 'table_alias') and general_table_ref.table_alias():
+            return general_table_ref.table_alias().getText().strip('" ')
+        if hasattr(general_table_ref, 'dml_table_expression_clause') and general_table_ref.dml_table_expression_clause():
+            return general_table_ref.dml_table_expression_clause().getText().strip('" ')
+        text = general_table_ref.getText().strip('" ')
+        return text.split()[0] if text else ""
+
     def visitUpdate_statement(self, ctx: FirebirdParser.Update_statementContext):
         if ctx.general_table_ref() and self.symbols and ctx.where_clause():
-            table_qualifier = ctx.general_table_ref().getText().strip()
+            table_qualifier = self._extract_table_qualifier(ctx.general_table_ref())
             if table_qualifier and table_qualifier.upper() != 'RDB$DATABASE':
                 self._disambiguate_scope(ctx.where_clause(), table_qualifier)
         return self.visitChildren(ctx)
 
     def visitDelete_statement(self, ctx: FirebirdParser.Delete_statementContext):
         if ctx.general_table_ref() and self.symbols and ctx.where_clause():
-            table_qualifier = ctx.general_table_ref().getText().strip()
+            table_qualifier = self._extract_table_qualifier(ctx.general_table_ref())
             if table_qualifier and table_qualifier.upper() != 'RDB$DATABASE':
                 self._disambiguate_scope(ctx.where_clause(), table_qualifier)
         return self.visitChildren(ctx)
@@ -1728,7 +1738,9 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         tag = choose_dollar_tag(f"{decl_str}{body_str}")
         return (f'{advisory_str}'
                 f'DROP FUNCTION IF EXISTS "{proc_name.lower()}" CASCADE;\n'
-                f'CREATE FUNCTION "{proc_name.lower()}"({params_str}) {return_type} AS {tag}\n{decl_str}{body_str}\n'
+                f'CREATE FUNCTION "{proc_name.lower()}"({params_str}) {return_type} AS {tag}\n'
+                f'#variable_conflict use_variable\n'
+                f'{decl_str}{body_str}\n'
                 f'{tag} LANGUAGE plpgsql {volatility};')
 
     def visitParameter(self, ctx: FirebirdParser.ParameterContext):
@@ -1811,7 +1823,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         func_name = f"{trigger_name}_func"
 
         tag = choose_dollar_tag(body_str)
-        func_sql = f'CREATE OR REPLACE FUNCTION "{func_name}"() RETURNS TRIGGER AS {tag}\n{body_str}\n{tag} LANGUAGE plpgsql;'
+        func_sql = f'CREATE OR REPLACE FUNCTION "{func_name}"() RETURNS TRIGGER AS {tag}\n#variable_conflict use_variable\n{body_str}\n{tag} LANGUAGE plpgsql;'
         trigger_sql = (f'DROP TRIGGER IF EXISTS "{trigger_name}" ON "{table_name.lower()}";\n'
                        f'CREATE TRIGGER "{trigger_name}" {timing} {events} ON "{table_name.lower()}" '
                        f'FOR EACH ROW{when_clause} EXECUTE FUNCTION "{func_name}"();')

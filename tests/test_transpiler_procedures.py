@@ -904,5 +904,23 @@ class TestTranspilerProcedures(unittest.TestCase):
         self.assertIn("LANGUAGE plpgsql VOLATILE;", pg_seq)
         self.assertIn("Volatility: VOLATILE (sequence generator access)", pg_seq)
 
+    def test_disambiguation_with_table_alias_and_variable_conflict(self):
+        fb_sql = """
+        CREATE OR ALTER PROCEDURE SP_DISAMBIGUATION_TEST (ID INTEGER, VALOR NUMERIC(15,2))
+        AS
+        BEGIN
+            UPDATE T X SET VALOR = :VALOR WHERE ID = :ID;
+            UPDATE T SET VALOR = :VALOR WHERE ID = :ID;
+            DELETE FROM T X WHERE ID = :ID;
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("#variable_conflict use_variable", pg_sql)
+        self.assertIn("WHERE X.ID = ID", pg_sql)
+        self.assertNotIn("TX.ID", pg_sql)
+        self.assertIn("WHERE T.ID = ID", pg_sql)
+        self.assertIn("DELETE FROM T X WHERE X.ID = ID", pg_sql)
+
+
 
 
