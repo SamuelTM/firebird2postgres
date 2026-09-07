@@ -524,11 +524,29 @@ class DdlExporter:
         increments = {}
         try:
             cursor.execute(query)
-            for row in cursor.fetchall():
-                if row[0]:
-                    increments[row[0].strip().lower()] = int(row[1]) if row[1] is not None else 1
+            rows = cursor.fetchall()
+        except firebirdsql.Error:
+            try:
+                cursor.execute("""
+                    SELECT RDB$GENERATOR_NAME, 1
+                    FROM RDB$GENERATORS
+                    WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
+                      AND RDB$GENERATOR_NAME NOT STARTING WITH 'RDB$'
+                      AND RDB$GENERATOR_NAME NOT STARTING WITH 'MON$';
+                """)
+                rows = cursor.fetchall()
+            except Exception as e:
+                raise RuntimeError(f"Failed to fetch sequence increments from Firebird: {e}") from e
         except Exception as e:
-            logger.warning("Failed to fetch sequence increments: %s", e)
+            raise RuntimeError(f"Failed to fetch sequence increments from Firebird: {e}") from e
+
+        for row in rows:
+            if row and row[0]:
+                val = row[1] if len(row) > 1 and row[1] is not None else 1
+                try:
+                    increments[row[0].strip().lower()] = int(val)
+                except (ValueError, TypeError):
+                    increments[row[0].strip().lower()] = 1
         return increments
 
     @staticmethod
@@ -741,6 +759,7 @@ class DdlExporter:
         conv_file = converted_file or get_dump_path(DumpFiles.DOMAINS_PG)
 
         fb_cursor = self.fb_con.cursor()
+        seq_increments = self._fetch_all_sequence_increments(fb_cursor)
 
         query = """
             SELECT 
@@ -812,9 +831,13 @@ class DdlExporter:
                     conv_f.write(f'-- [RENAMED] DOMAIN "{domain_name}" -> "{pg_domain_name}" '
                                  f'(collides with a table/view name or another domain)\n')
 
-                pg_ddl = self._format_domain_postgres_ddl(
-                    pg_domain_name, pg_type, default_source, not_null, validation_source
-                )
+                try:
+                    pg_ddl = self._format_domain_postgres_ddl(
+                        pg_domain_name, pg_type, default_source, not_null, validation_source,
+                        sequence_increments=seq_increments
+                    )
+                except Exception as e:
+                    raise RuntimeError(f"Failed to transpile domain '{domain_name}': {e}") from e
                 conv_f.write(pg_ddl)
 
         logger.info(f"Exported {len(domains)} domains to '{out_file}' and '{conv_file}'")
@@ -835,16 +858,21 @@ class DdlExporter:
 
     @staticmethod
     def _format_domain_postgres_ddl(pg_domain_name: str, pg_type: str,
-                                    default_source: str | None, not_null: bool,
-                                    validation_source: str | None) -> str:
+                                     default_source: str | None, not_null: bool,
+                                     validation_source: str | None,
+                                     sequence_increments: dict[str, int] = None) -> str:
         pg_domain_ident = f'public."{pg_domain_name}"'
         create_ddl = f'CREATE DOMAIN {pg_domain_ident} AS {pg_type}'
-        transpiled_default = FirebirdToPostgresVisitor.transpile_default_clause(default_source)
+        transpiled_default = FirebirdToPostgresVisitor.transpile_default_clause(
+            default_source, sequence_increments=sequence_increments
+        )
         if transpiled_default:
             create_ddl += f' {transpiled_default}'
         if not_null:
             create_ddl += ' NOT NULL'
-        transpiled_check = FirebirdToPostgresVisitor.transpile_check_clause(validation_source)
+        transpiled_check = FirebirdToPostgresVisitor.transpile_check_clause(
+            validation_source, sequence_increments=sequence_increments
+        )
         if transpiled_check:
             create_ddl += f'\n{transpiled_check}'
         create_ddl += ';'

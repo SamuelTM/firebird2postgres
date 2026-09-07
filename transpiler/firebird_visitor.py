@@ -587,6 +587,19 @@ def _parse_first_skip_val(s: str, pos: int) -> tuple[Optional[str], int]:
         m = re.match(r"^[0-9]+", s[pos:])
         if m:
             return m.group(0), pos + m.end()
+        m_ident = re.match(r"^[a-zA-Z_][a-zA-Z0-9_$]*", s[pos:])
+        if m_ident:
+            val = m_ident.group(0)
+            if val.upper() not in ("SKIP", "SELECT", "FROM", "WHERE", "GROUP", "HAVING", "ORDER", "UNION", "ROWS"):
+                end_pos = pos + m_ident.end()
+                next_pos = end_pos
+                while next_pos < len(s) and s[next_pos].isspace():
+                    next_pos += 1
+                if next_pos < len(s) and s[next_pos] == '(':
+                    fn_arg, fn_end = _parse_first_skip_val(s, next_pos)
+                    if fn_arg:
+                        return s[pos:fn_end], fn_end
+                return val, end_pos
     return None, pos
 
 
@@ -978,10 +991,16 @@ class ASTDialectRewriter(FirebirdParserVisitor):
         self.handled_qbs = set()
         self.symbols: dict[str, str] = {k.strip('":').lower(): v.upper() for k, v in symbols.items()} if symbols else {}
         self.expr_map: dict[str, str] = expr_map or {}
-        self.sequence_increments: dict[str, int] = {k.strip('":').lower(): v for k, v in sequence_increments.items()} if sequence_increments else {}
+        self.sequence_increments: dict[str, int] | None = (
+            {k.strip('":').lower(): v for k, v in sequence_increments.items()}
+            if sequence_increments is not None
+            else None
+        )
         if symbols:
             for k, v in symbols.items():
                 if k.lower().startswith("__seq_inc__"):
+                    if self.sequence_increments is None:
+                        self.sequence_increments = {}
                     seq = k.lower().replace("__seq_inc__", "").strip('":')
                     try:
                         self.sequence_increments[seq] = int(v)
@@ -1132,7 +1151,16 @@ class ASTDialectRewriter(FirebirdParserVisitor):
             raw_seq = args[0].getText()
             seq_target, quoted_seq, clean_seq = self._normalize_sequence_target(raw_seq)
             step = self._get_tokens_text(args[1]).strip()
-            seq_inc = self.sequence_increments.get(clean_seq.lower(), 1)
+
+            if self.sequence_increments is not None:
+                if clean_seq.lower() not in self.sequence_increments:
+                    raise ValueError(
+                        f"Cannot transpile GEN_ID for sequence '{clean_seq}': "
+                        f"sequence increment metadata is missing or sequence does not exist."
+                    )
+                seq_inc = self.sequence_increments[clean_seq.lower()]
+            else:
+                seq_inc = 1
 
             if step == str(seq_inc):
                 self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"nextval('{seq_target}')")
@@ -1363,27 +1391,27 @@ class ASTDialectRewriter(FirebirdParserVisitor):
 
             if first_val and first_val in self.expr_map:
                 raw_expr = self.expr_map[first_val]
-                try:
-                    first_val = FirebirdToPostgresVisitor.transpile_expression(
-                        raw_expr, symbols=self.symbols, sequence_increments=self.sequence_increments
-                    )
-                except (RuntimeError, ValueError):
-                    first_val = raw_expr
+                first_val = FirebirdToPostgresVisitor.transpile_expression(
+                    raw_expr, symbols=self.symbols, sequence_increments=self.sequence_increments
+                )
             if skip_val and skip_val in self.expr_map:
                 raw_expr = self.expr_map[skip_val]
-                try:
-                    skip_val = FirebirdToPostgresVisitor.transpile_expression(
-                        raw_expr, symbols=self.symbols, sequence_increments=self.sequence_increments
-                    )
-                except (RuntimeError, ValueError):
-                    skip_val = raw_expr
+                skip_val = FirebirdToPostgresVisitor.transpile_expression(
+                    raw_expr, symbols=self.symbols, sequence_increments=self.sequence_increments
+                )
+
+            def _wrap_limit_expr(val: str) -> str:
+                v = val.strip()
+                if " " in v and not (v.startswith("(") and v.endswith(")")):
+                    return f"({v})"
+                return v
 
             if first_val and skip_val:
-                limit_clause = f' LIMIT {first_val} OFFSET {skip_val}'
+                limit_clause = f' LIMIT {_wrap_limit_expr(first_val)} OFFSET {_wrap_limit_expr(skip_val)}'
             elif first_val:
-                limit_clause = f' LIMIT {first_val}'
+                limit_clause = f' LIMIT {_wrap_limit_expr(first_val)}'
             else:
-                limit_clause = f' OFFSET {skip_val}'
+                limit_clause = f' OFFSET {_wrap_limit_expr(skip_val)}'
 
             self.rewriter.replaceRangeTokens(start_token, end_token, '')
 
@@ -1897,7 +1925,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
             raise RuntimeError(f"Failed to transpile Firebird expression '{expr_clean}' to PostgreSQL: {e}") from e
 
     @classmethod
-    def transpile_default_clause(cls, default_str: str | None, symbols: dict[str, str] = None) -> str | None:
+    def transpile_default_clause(cls, default_str: str | None, symbols: dict[str, str] = None, sequence_increments: dict[str, int] = None) -> str | None:
         if not default_str:
             return None
         s = default_str.strip()
@@ -1908,15 +1936,11 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         else:
             expr = s
             has_default_kw = False
-        try:
-            pg_expr = cls.transpile_expression(expr, symbols=symbols)
-            return f"DEFAULT {pg_expr}" if has_default_kw else pg_expr
-        except Exception as e:
-            logger.warning("Could not transpile default expression '%s': %s", s, e)
-            return s
+        pg_expr = cls.transpile_expression(expr, symbols=symbols, sequence_increments=sequence_increments)
+        return f"DEFAULT {pg_expr}" if has_default_kw else pg_expr
 
     @classmethod
-    def transpile_check_clause(cls, check_str: str | None, symbols: dict[str, str] = None) -> str | None:
+    def transpile_check_clause(cls, check_str: str | None, symbols: dict[str, str] = None, sequence_increments: dict[str, int] = None) -> str | None:
         if not check_str:
             return None
         s = check_str.strip()
@@ -1926,12 +1950,8 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         else:
             m2 = re.match(r'^\s*CHECK\s+(.*)$', s, re.IGNORECASE | re.DOTALL)
             expr = m2.group(1).strip() if m2 else s
-        try:
-            pg_expr = cls.transpile_expression(expr, symbols=symbols)
-            return f"CHECK ({pg_expr})"
-        except Exception as e:
-            logger.warning("Could not transpile check expression '%s': %s", s, e)
-            return f"CHECK ({expr})" if not s.upper().startswith("CHECK") else s
+        pg_expr = cls.transpile_expression(expr, symbols=symbols, sequence_increments=sequence_increments)
+        return f"CHECK ({pg_expr})"
 
     @staticmethod
     def _clean_sql(pg_sql: str) -> str:
