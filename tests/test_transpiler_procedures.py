@@ -921,6 +921,30 @@ class TestTranspilerProcedures(unittest.TestCase):
         self.assertIn("WHERE T.ID = ID", pg_sql)
         self.assertIn("DELETE FROM T X WHERE X.ID = ID", pg_sql)
 
+    def test_not_null_parameter_guard_and_string_literal_preservation(self):
+        fb_sql = """
+        CREATE OR ALTER PROCEDURE SP_PARAM_NOT_NULL_TEST (
+            P_REQ INTEGER NOT NULL,
+            P_STATUS VARCHAR(20) DEFAULT 'NOT NULL',
+            P_STRICT VARCHAR(20) NOT NULL DEFAULT 'NOT NULL'
+        )
+        AS
+        BEGIN
+            UPDATE CONTAS SET STATUS = :P_STATUS WHERE ID = :P_REQ;
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        # Verify default 'NOT NULL' string literals are preserved intact without being stripped to ''
+        self.assertIn("P_STATUS VARCHAR(20) DEFAULT 'NOT NULL'", pg_sql)
+        self.assertIn("P_STRICT VARCHAR(20) DEFAULT 'NOT NULL'", pg_sql)
+        self.assertNotIn("DEFAULT ''", pg_sql)
+
+        # Verify runtime NOT NULL checks are injected for NOT NULL parameters but not for nullable ones
+        self.assertIn("IF P_REQ IS NULL THEN RAISE EXCEPTION 'Parameter \"%\" cannot be NULL', 'P_REQ'; END IF;", pg_sql)
+        self.assertIn("IF P_STRICT IS NULL THEN RAISE EXCEPTION 'Parameter \"%\" cannot be NULL', 'P_STRICT'; END IF;", pg_sql)
+        self.assertNotIn("IF P_STATUS IS NULL", pg_sql)
+
+
 
 
 

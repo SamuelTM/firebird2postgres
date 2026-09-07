@@ -377,9 +377,23 @@ def _normalize_variable_declarations(sql: str) -> str:
     return ''.join(result)
 
 
-def _normalize_procedure_params(sql: str) -> str:
+def _split_param_literals(s: str) -> list[tuple[bool, str]]:
+    chunks = []
+    pat = re.compile(r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)", flags=re.DOTALL)
+    last = 0
+    for m in pat.finditer(s):
+        if m.start() > last:
+            chunks.append((False, s[last:m.start()]))
+        chunks.append((True, m.group(0)))
+        last = m.end()
+    if last < len(s):
+        chunks.append((False, s[last:]))
+    return chunks
+
+
+def _normalize_procedure_params(sql: str, not_null_params: dict[str, list[str]] = None) -> str:
     proc_pat = re.compile(
-        r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|(\bCREATE\s+(?:OR\s+ALTER\s+)?PROCEDURE\s+([a-zA-Z0-9_$]+|\"[^\"]+\")\s*\()",
+        r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|(\b(?:CREATE(?:\s+OR\s+ALTER)?|RECREATE|ALTER)\s+PROCEDURE\s+([a-zA-Z0-9_$]+|\"[^\"]+\")\s*\()",
         flags=re.IGNORECASE
     )
     pos = 0
@@ -396,6 +410,7 @@ def _normalize_procedure_params(sql: str) -> str:
             continue
 
         result.append(m.group(2))
+        proc_name = m.group(3).strip('"').lower() if m.group(3) else ""
         header_start = m.end()
         idx = header_start
         d = 1
@@ -480,30 +495,57 @@ def _normalize_procedure_params(sql: str) -> str:
 
         norm_parts = []
         for part in parts:
-            p_clean = part
-            p_clean = re.sub(r"\bNOT\s+NULL\b", "", p_clean, flags=re.IGNORECASE)
+            chunks = _split_param_literals(part)
+            has_not_null = False
+            cleaned_chunks = []
+            param_name = None
+            for is_lit, text in chunks:
+                if is_lit:
+                    cleaned_chunks.append((is_lit, text))
+                else:
+                    if param_name is None:
+                        m_name = re.match(r'^\s*([a-zA-Z0-9_$]+|"[^"]+")', text)
+                        if m_name:
+                            param_name = m_name.group(1)
+                    if re.search(r"\bNOT\s+NULL\b", text, re.IGNORECASE):
+                        has_not_null = True
+                        text = re.sub(r"\bNOT\s+NULL\b", "", text, flags=re.IGNORECASE)
+                    cleaned_chunks.append((is_lit, text))
+
+            if has_not_null and param_name and not_null_params is not None and proc_name:
+                not_null_params.setdefault(proc_name, []).append(_normalize_ident_case(param_name))
+
             e_d = 0
-            e_str = False
-            eq_idx = None
-            for j, ch in enumerate(p_clean):
-                if ch == "'":
-                    if not e_str:
-                        e_str = True
-                    elif j + 1 < len(p_clean) and p_clean[j + 1] == "'":
-                        pass
-                    else:
-                        e_str = False
-                elif not e_str:
+            eq_chunk_idx = None
+            eq_char_idx = None
+            for c_idx, (is_lit, text) in enumerate(cleaned_chunks):
+                if is_lit:
+                    continue
+                for j, ch in enumerate(text):
                     if ch in ('(', '['):
                         e_d += 1
                     elif ch in (')', ']'):
                         e_d -= 1
                     elif ch == '=' and e_d == 0:
-                        eq_idx = j
+                        eq_chunk_idx = c_idx
+                        eq_char_idx = j
                         break
-            if eq_idx is not None and not re.search(r"\bDEFAULT\b", p_clean[:eq_idx], re.IGNORECASE):
-                p_clean = p_clean[:eq_idx] + " DEFAULT " + p_clean[eq_idx + 1:]
-            norm_parts.append(p_clean)
+                if eq_chunk_idx is not None:
+                    break
+
+            if eq_chunk_idx is not None:
+                before_eq = "".join(
+                    text if not is_lit else ""
+                    for is_lit, text in cleaned_chunks[:eq_chunk_idx]
+                ) + cleaned_chunks[eq_chunk_idx][1][:eq_char_idx]
+                if not re.search(r"\bDEFAULT\b", before_eq, re.IGNORECASE):
+                    txt = cleaned_chunks[eq_chunk_idx][1]
+                    cleaned_chunks[eq_chunk_idx] = (
+                        False,
+                        txt[:eq_char_idx] + " DEFAULT " + txt[eq_char_idx + 1:]
+                    )
+
+            norm_parts.append("".join(text for _, text in cleaned_chunks))
 
         result.append(",".join(norm_parts))
 
@@ -1367,13 +1409,14 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
     Visitor that traverses the Firebird AST and translates it into PostgreSQL PL/pgSQL code.
     """
 
-    def __init__(self, rewriter: TokenStreamRewriter = None, domain_map: dict[str, str] = None):
+    def __init__(self, rewriter: TokenStreamRewriter = None, domain_map: dict[str, str] = None, not_null_params: dict[str, list[str]] = None):
         super().__init__()
         self.rewriter = rewriter
         self.domain_map = {k.strip().upper(): v.strip() for k, v in domain_map.items()} if domain_map else {}
+        self.not_null_params = not_null_params or {}
 
     @classmethod
-    def _normalize_sql(cls, sql: str, expr_map: dict[str, str] = None) -> str:
+    def _normalize_sql(cls, sql: str, expr_map: dict[str, str] = None, not_null_params: dict[str, list[str]] = None) -> str:
         """
         Pre-parse normalization:
         1. Firebird allows custom exception messages: `EXCEPTION <name> '<msg>';`.
@@ -1431,7 +1474,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         sql = _normalize_variable_declarations(sql)
 
         # Step 7: Normalize procedure parameters (= to DEFAULT, strip NOT NULL)
-        sql = _normalize_procedure_params(sql)
+        sql = _normalize_procedure_params(sql, not_null_params=not_null_params)
 
         # Step 8: Normalize EXECUTE PROCEDURE ... RETURNING_VALUES ...
         sql = _normalize_returning_values(sql)
@@ -1449,7 +1492,8 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         and applies dialect token rewriting to produce clean PostgreSQL SQL.
         """
         expr_map = {}
-        normalized_sql = cls._normalize_sql(firebird_sql_string, expr_map=expr_map)
+        not_null_params = {}
+        normalized_sql = cls._normalize_sql(firebird_sql_string, expr_map=expr_map, not_null_params=not_null_params)
 
         error_listener = _CollectingErrorListener()
 
@@ -1496,7 +1540,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         dialect_rewriter.visit(tree)
 
         # Pass 2: High-level PL/pgSQL structure visitor
-        visitor = cls(rewriter=rewriter, domain_map=domain_map)
+        visitor = cls(rewriter=rewriter, domain_map=domain_map, not_null_params=not_null_params)
         pg_sql = visitor.visit(tree)
 
         if pg_sql:
@@ -1663,6 +1707,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         # In PostgreSQL, we translate procedures to functions
         has_returns = False
         in_params = []
+        in_param_names = []
         out_params = []
         out_types = []
         for child in ctx.children:
@@ -1675,6 +1720,8 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
                     out_params.append(f"OUT {param_name} {type_spec}".strip())
                     out_types.append(type_spec)
                 else:
+                    param_name = _normalize_ident_case(child.parameter_name().getText())
+                    in_param_names.append(param_name)
                     param_str = self.visit(child)
                     in_params.append(param_str)
 
@@ -1690,6 +1737,23 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
 
         # Translate the body
         body_str = self.visit(ctx.body()) if ctx.body() else ""
+
+        # Inject runtime NOT NULL guards for input parameters declared NOT NULL in Firebird
+        not_null_list = self.not_null_params.get(proc_name.lower(), [])
+        if not_null_list and body_str:
+            not_null_set = {p.strip('"').lower() for p in not_null_list}
+            guards = []
+            for p in in_param_names:
+                if p.strip('"').lower() in not_null_set:
+                    p_clean = p.strip('"')
+                    guards.append(f"IF {p} IS NULL THEN RAISE EXCEPTION 'Parameter \"%\" cannot be NULL', '{p_clean}'; END IF;")
+            if guards:
+                guards_str = "\n".join(f"    {g}" for g in guards)
+                m_begin = re.match(r'^(BEGIN\s*\r?\n)', body_str, re.IGNORECASE)
+                if m_begin:
+                    body_str = m_begin.group(1) + guards_str + "\n" + body_str[m_begin.end():]
+                else:
+                    body_str = re.sub(r'(\bBEGIN\b)', r'\1\n' + guards_str, body_str, count=1, flags=re.IGNORECASE)
 
         # Determine correct return type for PostgreSQL
         has_return_next = self._has_suspend_node(ctx.body()) if ctx.body() else False
