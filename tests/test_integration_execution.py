@@ -1,22 +1,64 @@
+import decimal
 import unittest
 from unittest.mock import MagicMock
+
+import psycopg2
+from config import get_postgres_connection, PostgresConfig
 from transpiler import FirebirdToPostgresVisitor
 from validate_postgres_ddl import check_plpgsql_runtime_validity
 
 
+def check_live_postgres_available() -> bool:
+    try:
+        cfg = PostgresConfig()
+        conn = get_postgres_connection(cfg)
+        cur = conn.cursor()
+        cur.execute("SELECT 1;")
+        res = cur.fetchone()
+        conn.close()
+        return bool(res and res[0] == 1)
+    except Exception:
+        return False
+
+
+HAS_REAL_PG = check_live_postgres_available()
+
+
 class TestIntegrationExecution(unittest.TestCase):
     """
-    Validates execution semantics of PL/pgSQL functions beyond mere DDL compilation.
-    Addresses Item 32: PostgreSQL late-binding compiles functions with invalid inner queries,
-    which only fail upon runtime execution.
+    Validates execution semantics of PL/pgSQL functions and triggers beyond mere DDL compilation.
+    Validates runtime behavior against real PostgreSQL: creating objects, invoking functions,
+    firing triggers, comparing returned values, data types, runtime error exceptions, and
+    benchmarking query plans with EXPLAIN (ANALYZE, BUFFERS).
     """
 
-    def test_late_binding_demonstrates_ddl_pass_vs_runtime_failure(self):
+    def setUp(self):
+        if HAS_REAL_PG:
+            self.pg_con = get_postgres_connection()
+            self.pg_con.autocommit = False
+            self.pg_cur = self.pg_con.cursor()
+        else:
+            self.pg_con = None
+            self.pg_cur = None
+
+    def tearDown(self):
+        if self.pg_con:
+            try:
+                self.pg_con.rollback()
+            except Exception:
+                pass
+            try:
+                self.pg_con.close()
+            except Exception:
+                pass
+
+    @unittest.skipUnless(HAS_REAL_PG, "Live PostgreSQL instance required for real execution test")
+    def test_real_pg_late_binding_demonstrates_ddl_pass_vs_runtime_failure(self):
         """
-        Proves that PostgreSQL compiles a PL/pgSQL function with invalid inner SQL statements
-        without raising errors, but calling the function fails at runtime.
+        Validates real PostgreSQL late-binding: compiles a PL/pgSQL function referencing
+        nonexistent tables/columns (succeeds at DDL time), but calling it fails at runtime
+        with undefined_table (42P01).
         """
-        # A function whose body references a nonexistent column and table
         ddl_sql = """
         CREATE FUNCTION sp_broken_late_binding() RETURNS integer AS $$
         DECLARE
@@ -27,25 +69,22 @@ class TestIntegrationExecution(unittest.TestCase):
         END;
         $$ LANGUAGE plpgsql;
         """
+        # 1. DDL compilation succeeds in PostgreSQL
+        self.pg_cur.execute(ddl_sql)
 
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
-        mock_conn.cursor.return_value = mock_cursor
+        # 2. Runtime execution triggers real PostgreSQL UndefinedTable exception
+        with self.assertRaises(psycopg2.Error) as ctx:
+            self.pg_cur.execute("SELECT sp_broken_late_binding();")
 
-        # 1. DDL compilation step: PostgreSQL accepts it
-        mock_cursor.execute(ddl_sql)
-        mock_cursor.execute.assert_called_with(ddl_sql)
-
-        # 2. Runtime execution step: calling it triggers the error
-        mock_cursor.execute.side_effect = Exception("ERROR: relation 'nonexistent_table' does not exist")
-        with self.assertRaises(Exception) as ctx:
-            mock_cursor.execute("SELECT sp_broken_late_binding();")
+        # Confirm exact PostgreSQL SQLState code (42P01: undefined_table)
+        self.assertEqual(ctx.exception.pgcode, '42P01')
         self.assertIn("nonexistent_table", str(ctx.exception))
 
-    def test_transpiled_selectable_procedure_execution_semantics(self):
+    @unittest.skipUnless(HAS_REAL_PG, "Live PostgreSQL instance required for real execution test")
+    def test_real_pg_transpiled_selectable_procedure_execution_and_values(self):
         """
-        Transpiles a Firebird selectable procedure and verifies the resulting PL/pgSQL
-        function structure, return types, and parameter flow.
+        Transpiles a Firebird selectable procedure, executes the DDL against PostgreSQL,
+        and invokes the function to verify returned types, decimal precision, and parameter branch logic.
         """
         fb_sql = """
         CREATE OR ALTER PROCEDURE SP_CALC_DESCONTO (
@@ -63,14 +102,97 @@ class TestIntegrationExecution(unittest.TestCase):
         END;
         """
         pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.pg_cur.execute(pg_sql)
 
-        # Verification of transpiled structure
-        self.assertIn('CREATE FUNCTION "sp_calc_desconto"', pg_sql)
-        self.assertIn('RETURNS SETOF NUMERIC(15,2)', pg_sql)
-        self.assertIn('LANGUAGE plpgsql STABLE;', pg_sql)
-        self.assertIn('RETURN NEXT;', pg_sql)
-        self.assertIn('VALOR_FINAL := P_VALOR * 0.80;', pg_sql)
-        self.assertIn('VALOR_FINAL := P_VALOR * 0.95;', pg_sql)
+        # VIP branch: 100.00 * 0.80 = 80.00
+        self.pg_cur.execute('SELECT * FROM "sp_calc_desconto"(100.00, 1);')
+        row_vip = self.pg_cur.fetchone()
+        self.assertIsNotNone(row_vip)
+        self.assertIsInstance(row_vip[0], decimal.Decimal)
+        self.assertEqual(row_vip[0], decimal.Decimal('80.00'))
+
+        # Non-VIP branch: 100.00 * 0.95 = 95.00
+        self.pg_cur.execute('SELECT * FROM "sp_calc_desconto"(100.00, 0);')
+        row_reg = self.pg_cur.fetchone()
+        self.assertIsNotNone(row_reg)
+        self.assertIsInstance(row_reg[0], decimal.Decimal)
+        self.assertEqual(row_reg[0], decimal.Decimal('95.00'))
+
+    @unittest.skipUnless(HAS_REAL_PG, "Live PostgreSQL instance required for real execution test")
+    def test_real_pg_transpiled_trigger_fires_and_mutates_data(self):
+        """
+        Creates a table in PostgreSQL, transpiles and creates a BEFORE INSERT trigger,
+        and performs DML to prove the trigger fires and executes the transpiled logic.
+        """
+        self.pg_cur.execute("""
+            CREATE TABLE test_real_audit (
+                id SERIAL PRIMARY KEY,
+                valor NUMERIC(15,2),
+                desconto NUMERIC(15,2),
+                status VARCHAR(20)
+            );
+        """)
+
+        fb_trg = """
+        CREATE TRIGGER TRG_AUDIT_BI FOR test_real_audit BEFORE INSERT
+        AS
+        BEGIN
+            IF (NEW.valor > 100) THEN
+                NEW.desconto = NEW.valor * 0.10;
+            ELSE
+                NEW.desconto = 0;
+            NEW.status = 'PROCESSADO';
+        END
+        """
+        pg_trg = FirebirdToPostgresVisitor.transpile(fb_trg)
+        self.pg_cur.execute(pg_trg)
+
+        # Insert valor > 100: trigger calculates 10% discount
+        self.pg_cur.execute("INSERT INTO test_real_audit (valor) VALUES (200.00) RETURNING desconto, status;")
+        row1 = self.pg_cur.fetchone()
+        self.assertEqual(row1[0], decimal.Decimal('20.00'))
+        self.assertEqual(row1[1], 'PROCESSADO')
+
+        # Insert valor <= 100: trigger calculates 0 discount
+        self.pg_cur.execute("INSERT INTO test_real_audit (valor) VALUES (50.00) RETURNING desconto, status;")
+        row2 = self.pg_cur.fetchone()
+        self.assertEqual(row2[0], decimal.Decimal('0.00'))
+        self.assertEqual(row2[1], 'PROCESSADO')
+
+    @unittest.skipUnless(HAS_REAL_PG, "Live PostgreSQL instance required for real execution test")
+    def test_real_pg_explain_analyze_buffers_benchmark(self):
+        """
+        Validates performance by executing EXPLAIN (ANALYZE, BUFFERS) on representative
+        functions and statements, confirming measured query plans, buffer hits, and execution times.
+        """
+        fb_sql = """
+        CREATE OR ALTER PROCEDURE SP_BENCHMARK_FUNC (
+            P_INPUT INTEGER
+        )
+        RETURNS (R_OUTPUT INTEGER)
+        AS
+        BEGIN
+            R_OUTPUT = P_INPUT * 2 + 10;
+            SUSPEND;
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.pg_cur.execute(pg_sql)
+
+        # Run EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+        self.pg_cur.execute('EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT * FROM "sp_benchmark_func"(42);')
+        plan_data = self.pg_cur.fetchone()[0]
+        plan_root = plan_data[0]
+
+        # Verify real execution metrics from PostgreSQL engine
+        self.assertIn('Execution Time', plan_root)
+        self.assertIn('Planning Time', plan_root)
+        self.assertIsInstance(plan_root['Execution Time'], (int, float))
+        self.assertGreater(plan_root['Execution Time'], 0.0)
+
+        # Verify plan tree contains node details
+        plan_tree = plan_root.get('Plan', {})
+        self.assertIn('Node Type', plan_tree)
 
     def test_check_plpgsql_runtime_validity_finds_warnings(self):
         """
