@@ -131,68 +131,78 @@ def run_ddl_validation(
     conn,
     target_files: List[str],
     apply_changes: bool = False
-) -> List[ValidationResult]:
+) -> tuple[List[ValidationResult], List[tuple[str, str]]]:
     """
     Executes each statement in sequence inside a PostgreSQL transaction using SAVEPOINTS.
     In dry-run mode (default), the entire transaction is rolled back at the end.
+    Returns (results, runtime_issues).
     """
     conn.autocommit = False
     cursor = conn.cursor()
+    try:
+        # Load and collect statements
+        all_statements: List[SQLStatement] = []
+        for fpath in target_files:
+            stmts = split_sql_statements(fpath)
+            all_statements.extend(stmts)
 
-    # Load and collect statements
-    all_statements: List[SQLStatement] = []
-    for fpath in target_files:
-        stmts = split_sql_statements(fpath)
-        all_statements.extend(stmts)
+        print(f"[INFO] Total DDL statements loaded: {len(all_statements)}")
+        print(f"[INFO] Mode: {'APPLY (CHANGES WILL BE PERSISTED)' if apply_changes else 'DRY-RUN (ROLLBACK AT THE END - SAFE)'}\n")
 
-    print(f"[INFO] Total DDL statements loaded: {len(all_statements)}")
-    print(f"[INFO] Mode: {'APPLY (CHANGES WILL BE PERSISTED)' if apply_changes else 'DRY-RUN (ROLLBACK AT THE END - SAFE)'}\n")
+        results: List[ValidationResult] = []
 
-    results: List[ValidationResult] = []
+        for idx, stmt in enumerate(all_statements, 1):
+            sp_name = f"sp_validate_{idx}"
+            cursor.execute(f"SAVEPOINT {sp_name};")
 
-    for idx, stmt in enumerate(all_statements, 1):
-        sp_name = f"sp_validate_{idx}"
-        cursor.execute(f"SAVEPOINT {sp_name};")
-
-        try:
-            cursor.execute(stmt.sql)
-            results.append(ValidationResult(statement=stmt, success=True))
-            # In dry-run we KEEP the object alive within the transaction so dependent objects can find it
-        except Exception as e:
-            cursor.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
-            error_msg = str(e).strip()
-            pg_code = getattr(e, 'pgcode', None)
-            results.append(
-                ValidationResult(
-                    statement=stmt,
-                    success=False,
-                    error_message=error_msg,
-                    pg_code=pg_code
+            try:
+                cursor.execute(stmt.sql)
+                results.append(ValidationResult(statement=stmt, success=True))
+                # In dry-run we KEEP the object alive within the transaction so dependent objects can find it
+            except Exception as e:
+                cursor.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
+                error_msg = str(e).strip()
+                pg_code = getattr(e, 'pgcode', None)
+                results.append(
+                    ValidationResult(
+                        statement=stmt,
+                        success=False,
+                        error_message=error_msg,
+                        pg_code=pg_code
+                    )
                 )
-            )
 
-    # Perform late-binding runtime verification with plpgsql_check if available
-    created_functions = [
-        r.statement.object_name for r in results
-        if r.success and r.statement.object_type in ('FUNCTION', 'PROCEDURE') and r.statement.object_name != 'UNKNOWN'
-    ]
-    runtime_issues = check_plpgsql_runtime_validity(cursor, created_functions)
-    conn._last_runtime_issues = runtime_issues
+        # Perform late-binding runtime verification with plpgsql_check if available
+        created_functions = [
+            r.statement.object_name for r in results
+            if r.success and r.statement.object_type in ('FUNCTION', 'PROCEDURE') and r.statement.object_name != 'UNKNOWN'
+        ]
+        runtime_issues = check_plpgsql_runtime_validity(cursor, created_functions)
 
-    if apply_changes:
-        failed_count = sum(1 for r in results if not r.success)
-        if failed_count > 0:
-            conn.rollback()
-            print(f"\n[ERROR] {failed_count} errors encountered. Rolled back all changes to prevent partial/corrupted DDL application.")
+        if apply_changes:
+            failed_count = sum(1 for r in results if not r.success)
+            if failed_count > 0:
+                conn.rollback()
+                print(f"\n[ERROR] {failed_count} errors encountered. Rolled back all changes to prevent partial/corrupted DDL application.")
+            else:
+                conn.commit()
+                print("[SUCCESS] Changes committed to PostgreSQL database.")
         else:
-            conn.commit()
-            print("[SUCCESS] Changes committed to PostgreSQL database.")
-    else:
-        conn.rollback()
-        print("[INFO] Test completed. Rollback executed (no changes persisted to database).")
+            conn.rollback()
+            print("[INFO] Test completed. Rollback executed (no changes persisted to database).")
 
-    cursor.close()
-    return results
+        return results, runtime_issues
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            cursor.close()
+        except Exception:
+            pass
 
 
 def print_diagnostic_report(results: List[ValidationResult]) -> bool:
@@ -296,12 +306,12 @@ def validate_postgres_ddl(
             return False
 
     try:
-        results = run_ddl_validation(
+        results, runtime_issues = run_ddl_validation(
             conn=pg_connection,
             target_files=target_files,
             apply_changes=apply_changes
         )
-        return print_diagnostic_report(results)
+        return print_diagnostic_report(results, runtime_issues=runtime_issues)
     finally:
         if close_connection:
             pg_connection.close()

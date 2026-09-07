@@ -72,7 +72,7 @@ class TestRunDdlValidation(unittest.TestCase):
 
             mock_cursor.execute.side_effect = execute_side_effect
 
-            results = run_ddl_validation(mock_conn, [fpath], apply_changes=True)
+            results, _ = run_ddl_validation(mock_conn, [fpath], apply_changes=True)
             self.assertEqual(len(results), 2)
             self.assertTrue(results[0].success)
             self.assertFalse(results[1].success)
@@ -97,11 +97,56 @@ class TestRunDdlValidation(unittest.TestCase):
             mock_cursor = MagicMock()
             mock_conn.cursor.return_value = mock_cursor
 
-            results = run_ddl_validation(mock_conn, [fpath], apply_changes=True)
+            results, _ = run_ddl_validation(mock_conn, [fpath], apply_changes=True)
             self.assertEqual(len(results), 2)
             self.assertTrue(all(r.success for r in results))
 
             mock_conn.commit.assert_called_once()
+        finally:
+            import os
+            os.remove(fpath)
+
+    def test_run_ddl_validation_safe_against_strict_connection_and_ensures_cleanup(self):
+        import tempfile
+        from unittest.mock import MagicMock
+        from validate_postgres_ddl import run_ddl_validation
+
+        with tempfile.NamedTemporaryFile('w', suffix='.sql', delete=False) as f:
+            f.write('SELECT 1;\n')
+            fpath = f.name
+
+        try:
+            # Emulate real C extension connection that rejects arbitrary attribute assignment
+            class StrictConnection:
+                def __init__(self, cursor):
+                    self.autocommit = False
+                    self._cursor = cursor
+                    self.rolled_back = False
+                    self.committed = False
+
+                def cursor(self):
+                    return self._cursor
+
+                def rollback(self):
+                    self.rolled_back = True
+
+                def commit(self):
+                    self.committed = True
+
+                def __setattr__(self, name, value):
+                    if name in ('autocommit', '_cursor', 'rolled_back', 'committed'):
+                        super().__setattr__(name, value)
+                    else:
+                        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
+            mock_cursor = MagicMock()
+            strict_conn = StrictConnection(mock_cursor)
+
+            results, runtime_issues = run_ddl_validation(strict_conn, [fpath], apply_changes=False)
+            self.assertEqual(len(results), 1)
+            self.assertTrue(results[0].success)
+            self.assertTrue(strict_conn.rolled_back)
+            mock_cursor.close.assert_called_once()
         finally:
             import os
             os.remove(fpath)
