@@ -1004,6 +1004,39 @@ class TestTranspilerProcedures(unittest.TestCase):
         self.assertIn("IF P_STRICT IS NULL THEN RAISE EXCEPTION 'Parameter \"%\" cannot be NULL', 'P_STRICT'; END IF;", pg_sql)
         self.assertNotIn("IF P_STATUS IS NULL", pg_sql)
 
+    def test_modern_and_binary_data_types_in_procedure(self):
+        fb_sql = """
+        CREATE PROCEDURE SP_MODERN_TYPES (
+            P_I128 INT128,
+            P_DEC16 DECFLOAT(16),
+            P_DEC34 DECFLOAT(34),
+            P_RAW VARCHAR(16) CHARACTER SET OCTETS
+        )
+        RETURNS (
+            OUT_I128 INT128,
+            OUT_DEC DECFLOAT
+        )
+        AS
+        DECLARE VARIABLE V_BIG INT128;
+        DECLARE VARIABLE V_BYTES CHAR(32) CHARACTER SET OCTETS;
+        BEGIN
+            V_BIG = P_I128;
+            V_BYTES = P_RAW;
+            OUT_I128 = V_BIG;
+            OUT_DEC = P_DEC16;
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn('P_I128 NUMERIC(39)', pg_sql)
+        self.assertIn('P_DEC16 NUMERIC', pg_sql)
+        self.assertIn('P_DEC34 NUMERIC', pg_sql)
+        self.assertIn('P_RAW BYTEA', pg_sql)
+        self.assertIn('OUT OUT_I128 NUMERIC(39)', pg_sql)
+        self.assertIn('OUT OUT_DEC NUMERIC', pg_sql)
+        self.assertIn('V_BIG NUMERIC(39);', pg_sql)
+        self.assertIn('V_BYTES BYTEA;', pg_sql)
+
+
 
 
 

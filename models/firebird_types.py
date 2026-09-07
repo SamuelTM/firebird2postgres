@@ -53,13 +53,20 @@ def get_firebird_data_type_name(data_type_value: int, subtype: int = None) -> st
 
 def resolve_firebird_type(field_type: int, field_subtype: int = None,
                           field_length: int = None, field_precision: int = None,
-                          field_scale: int = None, character_length: int = None) -> str | None:
+                          field_scale: int = None, character_length: int = None,
+                          character_set_id: int = None, dimensions: int = None) -> str | None:
     """
     Resolves the full Firebird type declaration for a field, column or parameter:
     NUMERIC precision/scale for integer-based numeric subtypes, and length for
     CHAR/VARCHAR (prefers character_length over byte field_length).
     Returns the base type name otherwise (None if unknown).
     """
+    if dimensions is not None and dimensions > 0:
+        raise NotImplementedError(f"Firebird array types (dimensions={dimensions}) are not supported.")
+
+    if character_set_id == 1 and field_type in (FirebirdDataType.CHAR, FirebirdDataType.VARCHAR):
+        return 'BYTEA'
+
     type_name = get_firebird_data_type_name(field_type, field_subtype)
 
     if (field_type in (FirebirdDataType.SMALLINT, FirebirdDataType.INTEGER,

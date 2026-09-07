@@ -92,10 +92,14 @@ def get_postgres_type(firebird_type: str) -> str:
         'BOOLEAN': 'BOOLEAN',
         'DECFLOAT(16)': 'NUMERIC',
         'DECFLOAT(34)': 'NUMERIC',
-        'INT128': 'NUMERIC(38)',
+        'DECFLOAT': 'NUMERIC',
+        'INT128': 'NUMERIC(39)',
         'TIME WITH TIME ZONE': 'TIMETZ',
         'TIMESTAMP WITH TIME ZONE': 'TIMESTAMPTZ',
     }
+
+    if 'OCTETS' in firebird_type.upper():
+        return 'BYTEA'
 
     return type_mapping.get(firebird_type, firebird_type)
 

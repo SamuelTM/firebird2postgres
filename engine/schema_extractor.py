@@ -87,7 +87,8 @@ class SchemaExtractor:
                        f.RDB$FIELD_PRECISION, f.RDB$FIELD_SCALE,
                        rf.RDB$DEFAULT_SOURCE, f.RDB$DEFAULT_SOURCE,
                        rf.RDB$FIELD_SOURCE, f.RDB$COMPUTED_SOURCE,
-                       rf.RDB$IDENTITY_TYPE, rf.RDB$GENERATOR_NAME
+                       rf.RDB$IDENTITY_TYPE, rf.RDB$GENERATOR_NAME,
+                       f.RDB$CHARACTER_SET_ID, f.RDB$DIMENSIONS
                 FROM RDB$RELATION_FIELDS rf
                 JOIN RDB$FIELDS f ON rf.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
                 WHERE rf.RDB$RELATION_NAME = ?
@@ -103,7 +104,8 @@ class SchemaExtractor:
                            f.RDB$FIELD_PRECISION, f.RDB$FIELD_SCALE,
                            rf.RDB$DEFAULT_SOURCE, f.RDB$DEFAULT_SOURCE,
                            rf.RDB$FIELD_SOURCE, f.RDB$COMPUTED_SOURCE,
-                           rf.RDB$IDENTITY_TYPE
+                           rf.RDB$IDENTITY_TYPE, NULL,
+                           f.RDB$CHARACTER_SET_ID, f.RDB$DIMENSIONS
                     FROM RDB$RELATION_FIELDS rf
                     JOIN RDB$FIELDS f ON rf.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
                     WHERE rf.RDB$RELATION_NAME = ?
@@ -117,7 +119,9 @@ class SchemaExtractor:
                            COALESCE(rf.RDB$NULL_FLAG, f.RDB$NULL_FLAG),
                            f.RDB$FIELD_PRECISION, f.RDB$FIELD_SCALE,
                            rf.RDB$DEFAULT_SOURCE, f.RDB$DEFAULT_SOURCE,
-                           rf.RDB$FIELD_SOURCE, f.RDB$COMPUTED_SOURCE
+                           rf.RDB$FIELD_SOURCE, f.RDB$COMPUTED_SOURCE,
+                           NULL, NULL,
+                           f.RDB$CHARACTER_SET_ID, f.RDB$DIMENSIONS
                     FROM RDB$RELATION_FIELDS rf
                     JOIN RDB$FIELDS f ON rf.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
                     WHERE rf.RDB$RELATION_NAME = ?
@@ -131,6 +135,8 @@ class SchemaExtractor:
                 field_length=row[3],
                 field_precision=row[5],
                 field_scale=row[6],
+                character_set_id=row[13] if len(row) > 13 else None,
+                dimensions=row[14] if len(row) > 14 else None,
             )
             for row in raw_rows
         }
@@ -147,6 +153,14 @@ class SchemaExtractor:
             domain_default = column[8].strip() if column[8] else None
             field_source = column[9].strip() if column[9] else None
             computed_source = column[10].strip() if column[10] else None
+            charset_id = column[13] if len(column) > 13 else None
+            dimensions = column[14] if len(column) > 14 else None
+
+            if dimensions is not None and dimensions > 0:
+                raise NotImplementedError(
+                    f"Firebird array columns are not supported (column '{column_name}' in table '{table_name}')."
+                )
+
             if computed_source:
                 computed_source = FirebirdToPostgresVisitor.transpile_expression(computed_source, symbols=symbols)
 
@@ -156,6 +170,8 @@ class SchemaExtractor:
                 field_length=field_length,
                 field_precision=field_precision,
                 field_scale=field_scale,
+                character_set_id=charset_id,
+                dimensions=dimensions,
             )
 
             # Preserve domains: if field_source is a user domain, retain its name

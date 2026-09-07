@@ -26,7 +26,9 @@ class TestFirebirdTypes(unittest.TestCase):
         self.assertEqual(get_postgres_type('BOOLEAN'), 'BOOLEAN')
         self.assertEqual(get_postgres_type('DECFLOAT(16)'), 'NUMERIC')
         self.assertEqual(get_postgres_type('DECFLOAT(34)'), 'NUMERIC')
-        self.assertEqual(get_postgres_type('INT128'), 'NUMERIC(38)')
+        self.assertEqual(get_postgres_type('DECFLOAT'), 'NUMERIC')
+        self.assertEqual(get_postgres_type('INT128'), 'NUMERIC(39)')
+        self.assertEqual(get_postgres_type('VARCHAR(16) CHARACTER SET OCTETS'), 'BYTEA')
         self.assertEqual(get_postgres_type('TIME WITH TIME ZONE'), 'TIMETZ')
         self.assertEqual(get_postgres_type('TIMESTAMP WITH TIME ZONE'), 'TIMESTAMPTZ')
         self.assertEqual(get_postgres_type('CUSTOM_TYPE'), 'CUSTOM_TYPE')
@@ -50,6 +52,12 @@ class TestFirebirdTypes(unittest.TestCase):
                          'NUMERIC(30, 4)')
         self.assertEqual(resolve_firebird_type(field_type=28), 'TIME WITH TIME ZONE')
         self.assertEqual(resolve_firebird_type(field_type=29), 'TIMESTAMP WITH TIME ZONE')
+        # OCTETS charset mapping to BYTEA
+        self.assertEqual(resolve_firebird_type(field_type=37, field_length=16, character_set_id=1), 'BYTEA')
+        self.assertEqual(resolve_firebird_type(field_type=14, field_length=32, character_set_id=1), 'BYTEA')
+        # Array types raise NotImplementedError
+        with self.assertRaises(NotImplementedError):
+            resolve_firebird_type(field_type=8, dimensions=1)
         # Numeric with precision and scale
         self.assertEqual(resolve_firebird_type(field_type=16, field_subtype=1, field_precision=15, field_scale=-2),
                          'NUMERIC(15, 2)')

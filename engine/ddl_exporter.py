@@ -468,7 +468,8 @@ class DdlExporter:
         query = """
             SELECT TRIM(RF.RDB$RELATION_NAME), TRIM(RF.RDB$FIELD_NAME),
                    F.RDB$FIELD_TYPE, F.RDB$FIELD_SUB_TYPE, F.RDB$FIELD_LENGTH,
-                   F.RDB$FIELD_PRECISION, F.RDB$FIELD_SCALE
+                   F.RDB$FIELD_PRECISION, F.RDB$FIELD_SCALE,
+                   F.RDB$CHARACTER_SET_ID, F.RDB$DIMENSIONS
             FROM RDB$RELATION_FIELDS RF
             JOIN RDB$FIELDS F ON RF.RDB$FIELD_SOURCE = F.RDB$FIELD_NAME
             WHERE (RF.RDB$SYSTEM_FLAG = 0 OR RF.RDB$SYSTEM_FLAG IS NULL);
@@ -479,13 +480,18 @@ class DdlExporter:
             for row in cursor.fetchall():
                 rel = row[0].lower() if row[0] else ""
                 col = row[1].lower() if row[1] else ""
-                pg_type = resolve_firebird_type(
-                    field_type=row[2],
-                    field_subtype=row[3],
-                    field_length=row[4],
-                    field_precision=row[5],
-                    field_scale=row[6],
-                )
+                try:
+                    pg_type = resolve_firebird_type(
+                        field_type=row[2],
+                        field_subtype=row[3],
+                        field_length=row[4],
+                        field_precision=row[5],
+                        field_scale=row[6],
+                        character_set_id=row[7] if len(row) > 7 else None,
+                        dimensions=row[8] if len(row) > 8 else None,
+                    )
+                except NotImplementedError:
+                    pg_type = None
                 if pg_type:
                     if rel and col:
                         symbols[f"{rel}.{col}"] = pg_type

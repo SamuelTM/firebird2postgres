@@ -676,6 +676,26 @@ def _normalize_type_of(sql: str) -> str:
     return pat.sub(repl, sql)
 
 
+def _normalize_data_types(sql: str) -> str:
+    pat = re.compile(
+        r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|(\bDECFLOAT(?:\s*\(\s*(?:16|34)\s*\))?|\bINT128\b|(?:CHAR|VARCHAR)(?:\s*\(\s*\d+\s*\))?\s+CHARACTER\s+SET\s+OCTETS\b)",
+        flags=re.IGNORECASE
+    )
+    def repl(m):
+        if m.group(1):
+            return m.group(1)
+        token = m.group(2)
+        token_upper = token.upper()
+        if 'OCTETS' in token_upper:
+            return 'BYTEA'
+        if token_upper.startswith('DECFLOAT'):
+            return 'NUMERIC'
+        if token_upper == 'INT128':
+            return 'NUMERIC(39)'
+        return token
+    return pat.sub(repl, sql)
+
+
 def _normalize_when_any(sql: str) -> str:
     pat = re.compile(
         r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|(\bWHEN\s+ANY\s+DO\b)",
@@ -1568,6 +1588,9 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         # Step 4: Normalize alternative Firebird syntax DATEADD(...) and DATEDIFF(...)
         sql = _normalize_date_funcs(sql)
 
+        # Step 4.5: Normalize modern and binary datatypes (DECFLOAT, INT128, OCTETS)
+        sql = _normalize_data_types(sql)
+
         # Step 5: Normalize TYPE OF COLUMN and TYPE OF domain
         sql = _normalize_type_of(sql)
 
@@ -1748,6 +1771,11 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         cleaned = re.sub(r'(?i)\bBLOB\s+SUBTYPE\s+(?:1|TEXT)\b', 'TEXT', raw_type)
         cleaned = re.sub(r'(?i)\bBLOB\s+SUBTYPE\s+(?:0|BINARY)\b', 'BYTEA', cleaned)
         cleaned = re.sub(r'(?i)\bBLOB\b', 'BYTEA', cleaned)
+        cleaned = re.sub(r'(?i)\b(?:CHAR|VARCHAR)(?:\s*\(\s*\d+\s*\))?\s+CHARACTER\s+SET\s+OCTETS\b', 'BYTEA', cleaned)
+        cleaned = re.sub(r'(?i)\bDECFLOAT(?:\s*\(\s*(?:16|34)\s*\))?\b', 'NUMERIC', cleaned)
+        cleaned = re.sub(r'(?i)\bINT128\b', 'NUMERIC(39)', cleaned)
+        cleaned = re.sub(r'(?i)\bTIME\s+WITH\s+TIME\s+ZONE\b', 'TIMETZ', cleaned)
+        cleaned = re.sub(r'(?i)\bTIMESTAMP\s+WITH\s+TIME\s+ZONE\b', 'TIMESTAMPTZ', cleaned)
         if hasattr(self, 'domain_map') and self.domain_map:
             u = cleaned.strip().upper()
             if u in self.domain_map:
