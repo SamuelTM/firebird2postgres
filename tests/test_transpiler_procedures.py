@@ -731,3 +731,18 @@ class TestTranspilerProcedures(unittest.TestCase):
         self.assertNotIn("::timestamp", pg_sql)
         self.assertIn("DATE_TRUNC('hour', COALESCE(T2, T1)) - DATE_TRUNC('hour', COALESCE(T1, T2))", pg_sql)
 
+    def test_extract_weekday_yearday_millisecond(self):
+        fb_sql = """
+        CREATE PROCEDURE SP_TEST_EXTRACT (D DATE, TS TIMESTAMP)
+        RETURNS (WD INTEGER, YD INTEGER, MS INTEGER)
+        AS
+        BEGIN
+            WD = EXTRACT(WEEKDAY FROM D);
+            YD = EXTRACT(YEARDAY FROM D);
+            MS = EXTRACT(MILLISECOND FROM TS);
+        END;
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.assertIn("WD := EXTRACT(DOW FROM D);", pg_sql)
+        self.assertIn("YD := ((EXTRACT(DOY FROM D))::integer - 1);", pg_sql)
+        self.assertIn("MS := (FLOOR(EXTRACT(MILLISECOND FROM TS))::integer % 1000);", pg_sql)

@@ -903,6 +903,19 @@ class ASTDialectRewriter(FirebirdParserVisitor):
 
         return None
 
+    def visitOther_function(self, ctx: FirebirdParser.Other_functionContext):
+        self.visitChildren(ctx)
+        if ctx.EXTRACT() and ctx.regular_id() and ctx.concatenation(0):
+            part = ctx.regular_id().getText().upper()
+            expr = self._get_tokens_text(ctx.concatenation(0)).strip()
+            if part in ('WEEKDAY', 'WEEKDAYS'):
+                self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"EXTRACT(DOW FROM {expr})")
+            elif part in ('YEARDAY', 'YEARDAYS'):
+                self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"((EXTRACT(DOY FROM {expr}))::integer - 1)")
+            elif part in ('MILLISECOND', 'MILLISECONDS'):
+                self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, f"(FLOOR(EXTRACT(MILLISECOND FROM {expr}))::integer % 1000)")
+        return None
+
     def visitUnary_expression(self, ctx: FirebirdParser.Unary_expressionContext):
         raw = ctx.getText().upper()
         if 'NEXTVALUEFOR' in raw and ctx.identifier():

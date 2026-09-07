@@ -193,6 +193,18 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
             FirebirdToPostgresVisitor.transpile_expression("DATEDIFF(DAY FROM (D1 + 1) TO (D2 - 1))"),
             "(DATE((D2 - 1)) - DATE((D1 + 1)))",
         )
+        self.assertEqual(
+            FirebirdToPostgresVisitor.transpile_expression("EXTRACT(WEEKDAY FROM D)"),
+            "EXTRACT(DOW FROM D)",
+        )
+        self.assertEqual(
+            FirebirdToPostgresVisitor.transpile_expression("EXTRACT(YEARDAY FROM D)"),
+            "((EXTRACT(DOY FROM D))::integer - 1)",
+        )
+        self.assertEqual(
+            FirebirdToPostgresVisitor.transpile_expression("EXTRACT(MILLISECOND FROM TS)"),
+            "(FLOOR(EXTRACT(MILLISECOND FROM TS))::integer % 1000)",
+        )
         with self.assertRaises(RuntimeError) as cm:
             FirebirdToPostgresVisitor.transpile_expression("FOOBAR $$$ INVALID")
         self.assertIn("Failed to transpile Firebird expression", str(cm.exception))
