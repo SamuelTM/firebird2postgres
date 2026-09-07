@@ -1,5 +1,6 @@
 import re
 from graphlib import TopologicalSorter, CycleError
+import firebirdsql
 from models import Table, Column, ForeignKey, UniqueKey, Index, Sequence, CheckConstraint, resolve_firebird_type, resolve_pg_domain_name, build_domain_mapping
 from transpiler import FirebirdToPostgresVisitor, validate_immutable_expression
 
@@ -79,6 +80,7 @@ class SchemaExtractor:
         """
         Extracts all columns for a given table, resolving types and domain mappings.
         """
+        _ = domain_map
         try:
             cursor.execute("""
                 SELECT rf.RDB$FIELD_NAME, f.RDB$FIELD_TYPE, f.RDB$FIELD_SUB_TYPE,
@@ -95,7 +97,7 @@ class SchemaExtractor:
                 ORDER BY rf.RDB$FIELD_POSITION;
             """, (table_name,))
             raw_rows = cursor.fetchall()
-        except Exception:
+        except firebirdsql.Error:
             try:
                 cursor.execute("""
                     SELECT rf.RDB$FIELD_NAME, f.RDB$FIELD_TYPE, f.RDB$FIELD_SUB_TYPE,
@@ -112,7 +114,7 @@ class SchemaExtractor:
                     ORDER BY rf.RDB$FIELD_POSITION;
                 """, (table_name,))
                 raw_rows = cursor.fetchall()
-            except Exception:
+            except firebirdsql.Error:
                 cursor.execute("""
                     SELECT rf.RDB$FIELD_NAME, f.RDB$FIELD_TYPE, f.RDB$FIELD_SUB_TYPE,
                            COALESCE(f.RDB$CHARACTER_LENGTH, f.RDB$FIELD_LENGTH),
@@ -204,14 +206,14 @@ class SchemaExtractor:
                         cursor.execute("SELECT COALESCE(RDB$GENERATOR_INCREMENT, 1) FROM RDB$GENERATORS WHERE RDB$GENERATOR_NAME = ?;", (gen_name,))
                         grow = cursor.fetchone()
                         identity_increment = int(grow[0]) if grow and grow[0] is not None else 1
-                    except Exception:
+                    except (firebirdsql.Error, ValueError, TypeError):
                         identity_increment = 1
                     try:
                         safe_gen = gen_name.replace('"', '""')
                         cursor.execute(f'SELECT GEN_ID("{safe_gen}", 0) FROM RDB$DATABASE;')
                         vrow = cursor.fetchone()
                         identity_current = int(vrow[0]) if vrow and vrow[0] is not None else None
-                    except Exception:
+                    except (firebirdsql.Error, ValueError, TypeError):
                         identity_current = None
 
             columns.append(
@@ -250,7 +252,7 @@ class SchemaExtractor:
         )
 
         def find_referenced_columns(expr: str) -> set[str]:
-            refs = set()
+            col_refs = set()
             for m in token_pat.finditer(expr):
                 if m.group(1):
                     continue
@@ -259,12 +261,12 @@ class SchemaExtractor:
                     continue
                 parts = re.split(r"\s*\.\s*", ident_full)
                 if len(parts) == 1:
-                    refs.add(parts[0].strip('"').lower())
+                    col_refs.add(parts[0].strip('"').lower())
                 elif len(parts) == 2:
                     tbl_part = parts[0].strip('"').lower()
                     if tbl_part == table_name.lower():
-                        refs.add(parts[1].strip('"').lower())
-            return refs
+                        col_refs.add(parts[1].strip('"').lower())
+            return col_refs
 
         def replace_col_ident(expr: str, col_target: str, repl_sql: str) -> str:
             def repl(m):
@@ -415,7 +417,7 @@ class SchemaExtractor:
                 ORDER BY i.RDB$INDEX_NAME, seg.RDB$FIELD_POSITION;
             """, (table_name,))
             rows = cursor.fetchall()
-        except Exception:
+        except firebirdsql.Error:
             cursor.execute("""
                 SELECT 
                     i.RDB$INDEX_NAME AS index_name,
@@ -587,7 +589,7 @@ class SchemaExtractor:
                   AND RDB$GENERATOR_NAME NOT STARTING WITH 'MON$';
             """)
             seq_rows = cursor.fetchall()
-        except Exception:
+        except firebirdsql.Error:
             cursor.execute("""
                 SELECT RDB$GENERATOR_NAME, 1
                 FROM RDB$GENERATORS

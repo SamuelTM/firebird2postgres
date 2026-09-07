@@ -2,6 +2,7 @@ import logging
 import os
 from concurrent.futures import ProcessPoolExecutor
 from graphlib import TopologicalSorter
+import firebirdsql
 
 from config import DUMP_DIR, DumpFiles, get_dump_path
 from models import (
@@ -266,7 +267,7 @@ class DdlExporter:
         try:
             cursor.execute(params_query, (proc_name,))
             params = cursor.fetchall()
-        except Exception:
+        except firebirdsql.Error:
             legacy_query = """
                 SELECT
                     pp.RDB$PARAMETER_NAME,
@@ -689,7 +690,7 @@ class DdlExporter:
                   AND RDB$GENERATOR_NAME NOT STARTING WITH 'MON$';
             """)
             rows = cursor.fetchall()
-        except Exception:
+        except firebirdsql.Error:
             cursor.execute("""
                 SELECT RDB$GENERATOR_NAME, 1
                 FROM RDB$GENERATORS

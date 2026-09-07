@@ -117,10 +117,10 @@ class TestDataMigrator(unittest.TestCase):
             def __init__(self):
                 self._fetched = False
 
-            def execute(self, query):
+            def execute(self, _query):
                 self._fetched = False
 
-            def fetchmany(self, batch_size):
+            def fetchmany(self, _batch_size):
                 if not self._fetched:
                     self._fetched = True
                     return [(1,), (2,)]

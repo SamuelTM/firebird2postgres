@@ -1,5 +1,7 @@
 import unittest
 
+import psycopg2
+
 from validate_postgres_ddl import identify_object
 
 
@@ -194,7 +196,7 @@ class TestPlpgsqlCheckValidationUnit(unittest.TestCase):
             [],
         ]
 
-        def execute_side_effect(sql, *args):
+        def execute_side_effect(sql, *_args):
             if 'plpgsql_check_function_tb' in str(sql):
                 raise RuntimeError("plpgsql_check internal error / cache lookup failed")
 
@@ -215,7 +217,7 @@ class TestPlpgsqlCheckValidationUnit(unittest.TestCase):
         mock_cursor = MagicMock()
         mock_cursor.fetchone.return_value = (1,)
 
-        def execute_side_effect(sql, *args):
+        def execute_side_effect(sql, *_args):
             if 'FROM pg_proc p' in str(sql):
                 raise RuntimeError("permission denied for table pg_proc")
 
@@ -288,7 +290,7 @@ def check_live_postgres_available() -> bool:
         res = cur.fetchone()
         conn.close()
         return bool(res and res[0] == 1)
-    except Exception:
+    except psycopg2.Error:
         return False
 
 
@@ -375,7 +377,7 @@ class TestValidatePostgresDdlRegression(unittest.TestCase):
                 cur = self.conn.cursor()
                 cur.execute(f"DROP SCHEMA IF EXISTS {self.schema_name} CASCADE;")
                 self.conn.commit()
-            except Exception:
+            except psycopg2.Error:
                 pass
             finally:
                 self.conn.close()
@@ -629,7 +631,6 @@ class TestValidatePostgresDdlRegression(unittest.TestCase):
 
     def test_checker_exception_blocks_commit_in_apply_mode(self):
         import tempfile, os
-        from unittest.mock import patch
         from validate_postgres_ddl import validate_postgres_ddl
 
         with tempfile.NamedTemporaryFile("w+", suffix=".sql", delete=False) as f:
@@ -649,7 +650,7 @@ class TestValidatePostgresDdlRegression(unittest.TestCase):
                 raise RuntimeError("Simulated checker runtime exception")
             return real_cur.execute(sql, params) if params is not None else real_cur.execute(sql)
 
-        proxy_conn = DbConnProxy(self.conn, lambda cur: DbCursorProxy(cur, execute_hook=execute_hook))
+        proxy_conn = DbConnProxy(self.conn, lambda c: DbCursorProxy(c, execute_hook=execute_hook))
         success = validate_postgres_ddl(
             pg_connection=proxy_conn,
             target_files=[fpath],

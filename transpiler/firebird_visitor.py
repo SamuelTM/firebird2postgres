@@ -109,7 +109,7 @@ def validate_immutable_expression(expr: str, context: str = "expression") -> Non
     volatile/stable functions (e.g. CURRENT_DATE, RANDOM(), nextval()) or dynamic date casts.
     Ignores plain string literals and comments to prevent false positives.
     """
-    no_comments = _STRIP_COMMENTS_PRESERVING_STRINGS.sub(lambda m: m.group(1) if m.group(1) else " ", expr)
+    no_comments = _STRIP_COMMENTS_PRESERVING_STRINGS.sub(lambda match: match.group(1) if match.group(1) else " ", expr)
     m_cast = _CAST_DYNAMIC_DATE_PATTERN.search(no_comments)
     if m_cast:
         raise ValueError(
@@ -632,10 +632,10 @@ def _normalize_first_skip(sql: str, expr_map: dict[str, str]) -> str:
             pos = m.end()
             continue
 
-        def process_val(val):
-            if val is None:
+        def process_val(v):
+            if v is None:
                 return None
-            val_clean = val.strip()
+            val_clean = v.strip()
             if val_clean.isdigit():
                 return val_clean
             sentinel = f"888{len(expr_map):09d}"
@@ -1367,7 +1367,7 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                     first_val = FirebirdToPostgresVisitor.transpile_expression(
                         raw_expr, symbols=self.symbols, sequence_increments=self.sequence_increments
                     )
-                except Exception:
+                except (RuntimeError, ValueError):
                     first_val = raw_expr
             if skip_val and skip_val in self.expr_map:
                 raw_expr = self.expr_map[skip_val]
@@ -1375,7 +1375,7 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                     skip_val = FirebirdToPostgresVisitor.transpile_expression(
                         raw_expr, symbols=self.symbols, sequence_increments=self.sequence_increments
                     )
-                except Exception:
+                except (RuntimeError, ValueError):
                     skip_val = raw_expr
 
             if first_val and skip_val:

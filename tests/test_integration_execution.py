@@ -17,7 +17,7 @@ def check_live_postgres_available() -> bool:
         res = cur.fetchone()
         conn.close()
         return bool(res and res[0] == 1)
-    except Exception:
+    except psycopg2.Error:
         return False
 
 
@@ -45,11 +45,11 @@ class TestIntegrationExecution(unittest.TestCase):
         if self.pg_con:
             try:
                 self.pg_con.rollback()
-            except Exception:
+            except psycopg2.Error:
                 pass
             try:
                 self.pg_con.close()
-            except Exception:
+            except psycopg2.Error:
                 pass
 
     @unittest.skipUnless(HAS_REAL_PG, "Live PostgreSQL instance required for real execution test")

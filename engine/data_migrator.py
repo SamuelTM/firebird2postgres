@@ -1,12 +1,13 @@
 import io
 import os
 import logging
+from typing import Any
 from concurrent.futures import ProcessPoolExecutor, as_completed, Executor
 import firebirdsql
 import psycopg2
 import psycopg2.extras
 from config import get_firebird_connection, get_postgres_connection
-from models import Table, pg_quote_ident
+from models import Table, Column, pg_quote_ident
 
 logger = logging.getLogger(__name__)
 
@@ -231,7 +232,7 @@ class DataMigrator:
         Captures and reports catalog query errors instead of silently ignoring them.
         When require_frozen is True, raises RuntimeError if the source is not proven frozen.
         """
-        info = {
+        info: dict[str, Any] = {
             'is_read_only': False,
             'is_shutdown': False,
             'active_attachments': 0,
@@ -441,7 +442,7 @@ class DataMigrator:
                     )
                     inc_row = pg_cur.fetchone()
                     seq_inc = int(inc_row[0]) if inc_row and inc_row[0] is not None else 1
-                except Exception:
+                except (psycopg2.Error, ValueError, TypeError):
                     seq_inc = 1
 
                 if seq_inc < 0:

@@ -8,6 +8,8 @@ import sys
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+import psycopg2
+
 from config import get_postgres_connection, PostgresConfig, get_dump_path, DumpFiles
 from utils import split_sql_statements as split_sql_content
 
@@ -129,17 +131,16 @@ def check_plpgsql_runtime_validity(
     runtime_issues: List[tuple[str, str]] = []
 
     # 1. Extension presence check wrapped in SAVEPOINT
-    has_ext = False
     try:
         cursor.execute("SAVEPOINT sp_check_ext;")
         cursor.execute("SELECT 1 FROM pg_extension WHERE extname = 'plpgsql_check';")
         row = cursor.fetchone()
         has_ext = bool(row and row[0] == 1)
         cursor.execute("RELEASE SAVEPOINT sp_check_ext;")
-    except Exception:
+    except psycopg2.Error:
         try:
             cursor.execute("ROLLBACK TO SAVEPOINT sp_check_ext;")
-        except Exception:
+        except psycopg2.Error:
             pass
         has_ext = False
 
@@ -195,7 +196,7 @@ def check_plpgsql_runtime_validity(
     except Exception as e:
         try:
             cursor.execute("ROLLBACK TO SAVEPOINT sp_discover_funcs;")
-        except Exception:
+        except psycopg2.Error:
             pass
         err_msg = str(e).strip()
         validation_results.append(
@@ -234,7 +235,7 @@ def check_plpgsql_runtime_validity(
     except Exception as e:
         try:
             cursor.execute("ROLLBACK TO SAVEPOINT sp_discover_triggers;")
-        except Exception:
+        except psycopg2.Error:
             pass
         err_msg = str(e).strip()
         validation_results.append(
@@ -302,7 +303,7 @@ def check_plpgsql_runtime_validity(
         except Exception as e:
             try:
                 cursor.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
-            except Exception:
+            except psycopg2.Error:
                 pass
             err_msg = str(e).strip()
             has_errors = True
@@ -448,13 +449,13 @@ def run_ddl_validation(
     except Exception:
         try:
             conn.rollback()
-        except Exception:
+        except psycopg2.Error:
             pass
         raise
     finally:
         try:
             cursor.close()
-        except Exception:
+        except psycopg2.Error:
             pass
 
 
@@ -612,7 +613,7 @@ def validate_postgres_ddl(
         if close_connection and pg_connection is not None:
             try:
                 pg_connection.close()
-            except Exception:
+            except psycopg2.Error:
                 pass
 
     try:

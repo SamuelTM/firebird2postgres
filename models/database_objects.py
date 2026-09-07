@@ -1,3 +1,6 @@
+from typing import Optional
+
+
 class Column:
     def __init__(self, name: str, column_type: str, nullable: bool, default_value: str = None,
                  sequence_name: str = None, domain_name: str = None, computed_source: str = None,
@@ -71,7 +74,7 @@ class CheckConstraint:
         return f'[CHECK CONSTRAINT] Name: {self.name} - Expression: {self.expression}'
 
 
-def get_postgres_type(firebird_type: str) -> str:
+def get_postgres_type(firebird_type: Optional[str]) -> str:
     if not firebird_type:
         raise ValueError("Cannot resolve PostgreSQL type for empty or None Firebird type.")
 
@@ -322,7 +325,7 @@ class Table:
 
 
 class Sequence:
-    def __init__(self, name: str, current_value: int = 0, increment: int = 1):
+    def __init__(self, name: str, current_value: Optional[int] = 0, increment: int = 1):
         self.name = name.strip()
         self.current_value = current_value
         self.increment = increment or 1
