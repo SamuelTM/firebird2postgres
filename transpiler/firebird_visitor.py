@@ -748,6 +748,12 @@ def _unwrap_outer_parens(s: str) -> str:
     return s
 
 
+def _is_timestamp_type(type_str: str) -> bool:
+    if not type_str:
+        return False
+    return 'TIMESTAMP' in type_str.strip().upper()
+
+
 def _is_date_type(type_str: str) -> bool:
     if not type_str:
         return False
@@ -755,7 +761,53 @@ def _is_date_type(type_str: str) -> bool:
     return ('DATE' in u) and ('TIMESTAMP' not in u)
 
 
+def _is_timestamp_expr(expr: str, symbols: dict[str, str] = None) -> bool:
+    s = _unwrap_outer_parens(expr)
+    upper = s.upper()
+    if (
+        upper.startswith("TIMESTAMP ")
+        or upper.startswith("TIMESTAMP'")
+        or upper in ("CURRENT_TIMESTAMP", "NOW()", "LOCALTIMESTAMP")
+        or bool(re.search(r"\bAS\s+TIMESTAMP\b", upper))
+        or upper.endswith("::TIMESTAMP")
+    ):
+        return True
+
+    m_fn = re.match(r"^(COALESCE|NULLIF|IIF)\s*\((.*)\)$", s, re.IGNORECASE | re.DOTALL)
+    if m_fn:
+        fn = m_fn.group(1).upper()
+        args = _split_top_level_args(m_fn.group(2))
+        if fn == "NULLIF" and args:
+            return _is_timestamp_expr(args[0], symbols)
+        if fn == "IIF" and len(args) >= 3:
+            return _is_timestamp_expr(args[1], symbols) or _is_timestamp_expr(args[2], symbols)
+        if fn == "COALESCE" and args:
+            return any(_is_timestamp_expr(arg, symbols) for arg in args)
+
+    if upper.startswith("CASE") and upper.endswith("END"):
+        then_parts = re.findall(r"\bTHEN\b\s+(.*?)\s+(?=\bWHEN\b|\bELSE\b|\bEND\b)", s, re.IGNORECASE | re.DOTALL)
+        else_match = re.search(r"\bELSE\b\s+(.*?)\s+\bEND\b", s, re.IGNORECASE | re.DOTALL)
+        branch_exprs = list(then_parts)
+        if else_match:
+            branch_exprs.append(else_match.group(1))
+        if branch_exprs and any(_is_timestamp_expr(b, symbols) for b in branch_exprs):
+            return True
+
+    if symbols:
+        clean = s.lstrip(':').strip('"').lower()
+        if _is_timestamp_type(symbols.get(clean, '')):
+            return True
+        if '.' in clean:
+            col_part = clean.split('.')[-1].strip('"')
+            if _is_timestamp_type(symbols.get(col_part, '')) or _is_timestamp_type(symbols.get(clean, '')):
+                return True
+
+    return False
+
+
 def _is_date_expr(expr: str, symbols: dict[str, str] = None) -> bool:
+    if _is_timestamp_expr(expr, symbols):
+        return False
     s = _unwrap_outer_parens(expr)
     upper = s.upper()
     if (
@@ -774,9 +826,12 @@ def _is_date_expr(expr: str, symbols: dict[str, str] = None) -> bool:
         if fn == "NULLIF" and args:
             return _is_date_expr(args[0], symbols)
         if fn == "IIF" and len(args) >= 3:
-            return _is_date_expr(args[1], symbols) or _is_date_expr(args[2], symbols)
+            branches = [args[1], args[2]]
+            b_non_null = [b for b in branches if b.strip().upper() != "NULL"]
+            return bool(b_non_null) and all(_is_date_expr(b, symbols) for b in b_non_null)
         if fn == "COALESCE" and args:
-            return any(_is_date_expr(arg, symbols) for arg in args)
+            non_null = [a for a in args if a.strip().upper() != "NULL"]
+            return bool(non_null) and all(_is_date_expr(arg, symbols) for arg in non_null)
 
     if upper.startswith("CASE") and upper.endswith("END"):
         then_parts = re.findall(r"\bTHEN\b\s+(.*?)\s+(?=\bWHEN\b|\bELSE\b|\bEND\b)", s, re.IGNORECASE | re.DOTALL)
@@ -784,8 +839,8 @@ def _is_date_expr(expr: str, symbols: dict[str, str] = None) -> bool:
         branch_exprs = list(then_parts)
         if else_match:
             branch_exprs.append(else_match.group(1))
-        if branch_exprs and any(_is_date_expr(b, symbols) for b in branch_exprs):
-            return True
+        b_non_null = [b for b in branch_exprs if b.strip().upper() != "NULL"]
+        return bool(b_non_null) and all(_is_date_expr(b, symbols) for b in b_non_null)
 
     if symbols:
         clean = s.lstrip(':').strip('"').lower()
@@ -807,6 +862,8 @@ def _is_time_type(type_str: str) -> bool:
 
 
 def _is_time_expr(expr: str, symbols: dict[str, str] = None) -> bool:
+    if _is_timestamp_expr(expr, symbols):
+        return False
     s = _unwrap_outer_parens(expr)
     upper = s.upper()
     if (
@@ -825,9 +882,12 @@ def _is_time_expr(expr: str, symbols: dict[str, str] = None) -> bool:
         if fn == "NULLIF" and args:
             return _is_time_expr(args[0], symbols)
         if fn == "IIF" and len(args) >= 3:
-            return _is_time_expr(args[1], symbols) or _is_time_expr(args[2], symbols)
+            branches = [args[1], args[2]]
+            b_non_null = [b for b in branches if b.strip().upper() != "NULL"]
+            return bool(b_non_null) and all(_is_time_expr(b, symbols) for b in b_non_null)
         if fn == "COALESCE" and args:
-            return any(_is_time_expr(arg, symbols) for arg in args)
+            non_null = [a for a in args if a.strip().upper() != "NULL"]
+            return bool(non_null) and all(_is_time_expr(arg, symbols) for arg in non_null)
 
     if upper.startswith("CASE") and upper.endswith("END"):
         then_parts = re.findall(r"\bTHEN\b\s+(.*?)\s+(?=\bWHEN\b|\bELSE\b|\bEND\b)", s, re.IGNORECASE | re.DOTALL)
@@ -835,8 +895,8 @@ def _is_time_expr(expr: str, symbols: dict[str, str] = None) -> bool:
         branch_exprs = list(then_parts)
         if else_match:
             branch_exprs.append(else_match.group(1))
-        if branch_exprs and any(_is_time_expr(b, symbols) for b in branch_exprs):
-            return True
+        b_non_null = [b for b in branch_exprs if b.strip().upper() != "NULL"]
+        return bool(b_non_null) and all(_is_time_expr(b, symbols) for b in b_non_null)
 
     if symbols:
         clean = s.lstrip(':').strip('"').lower()

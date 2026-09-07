@@ -26,14 +26,16 @@ def _ensure_parent_dir(file_path: str):
 def _transpile_worker(item: tuple) -> tuple[str | None, str | None]:
     """
     Worker function for multiprocessing pool.
-    Takes (item_name, fb_sql), (item_name, fb_sql, transpile_sql), or (item_name, fb_sql, transpile_sql, domain_map)
+    Takes (item_name, fb_sql), (item_name, fb_sql, transpile_sql), (item_name, fb_sql, transpile_sql, domain_map),
+    or (item_name, fb_sql, transpile_sql, domain_map, symbols)
     and returns (pg_sql, error_msg).
     Avoids returning fb_sql across IPC to minimize pickle overhead.
     """
-    sql_to_transpile = item[2] if len(item) > 2 else item[1]
+    sql_to_transpile = item[2] if len(item) > 2 and item[2] is not None else item[1]
     domain_map = item[3] if len(item) > 3 else None
+    symbols = item[4] if len(item) > 4 else None
     try:
-        pg_sql = FirebirdToPostgresVisitor.transpile(sql_to_transpile, domain_map=domain_map)
+        pg_sql = FirebirdToPostgresVisitor.transpile(sql_to_transpile, domain_map=domain_map, symbols=symbols)
         return pg_sql, None
     except Exception as e:
         return None, str(e)
@@ -352,13 +354,16 @@ class DdlExporter:
         fb_cursor.execute(query)
         views = fb_cursor.fetchall()
 
+        symbols = self._fetch_all_column_symbols(fb_cursor)
+        domain_map = self._fetch_domain_map(fb_cursor)
+
         view_map = {}
         for view in views:
             view_name = view[0].strip() if view[0] else 'UNKNOWN'
             source = view[1]
             col_names = self._fetch_view_columns(fb_cursor, view_name)
             fb_sql = self._format_view_firebird_ddl(view_name, col_names, source)
-            view_map[view_name] = (view_name, fb_sql)
+            view_map[view_name] = (view_name, fb_sql, None, domain_map, symbols)
 
         ordered_names = self._resolve_view_dependency_order(fb_cursor, set(view_map.keys()))
         items = [view_map[name] for name in ordered_names if name in view_map]
@@ -407,6 +412,42 @@ class DdlExporter:
                 clean = col[0].strip().replace('"', '""')
                 cols.append(f'"{clean}"')
         return cols
+
+    @staticmethod
+    def _fetch_all_column_symbols(cursor) -> dict[str, str]:
+        """
+        Queries all column data types for user relations in Firebird to provide
+        type inference context (symbols) during DDL transpilation.
+        """
+        query = """
+            SELECT TRIM(RF.RDB$RELATION_NAME), TRIM(RF.RDB$FIELD_NAME),
+                   F.RDB$FIELD_TYPE, F.RDB$FIELD_SUB_TYPE, F.RDB$FIELD_LENGTH,
+                   F.RDB$FIELD_PRECISION, F.RDB$FIELD_SCALE
+            FROM RDB$RELATION_FIELDS RF
+            JOIN RDB$FIELDS F ON RF.RDB$FIELD_SOURCE = F.RDB$FIELD_NAME
+            WHERE (RF.RDB$SYSTEM_FLAG = 0 OR RF.RDB$SYSTEM_FLAG IS NULL);
+        """
+        symbols = {}
+        try:
+            cursor.execute(query)
+            for row in cursor.fetchall():
+                rel = row[0].lower() if row[0] else ""
+                col = row[1].lower() if row[1] else ""
+                pg_type = resolve_firebird_type(
+                    field_type=row[2],
+                    field_subtype=row[3],
+                    field_length=row[4],
+                    field_precision=row[5],
+                    field_scale=row[6],
+                )
+                if pg_type:
+                    if rel and col:
+                        symbols[f"{rel}.{col}"] = pg_type
+                    if col and col not in symbols:
+                        symbols[col] = pg_type
+        except Exception as e:
+            logger.warning("Failed to fetch column symbols for DDL export: %s", e)
+        return symbols
 
     @staticmethod
     def _format_view_firebird_ddl(view_name: str, col_names: list[str], source: str) -> str:

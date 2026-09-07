@@ -69,3 +69,16 @@ class TestTranspilerViews(unittest.TestCase):
         self.assertIn('DROP VIEW IF EXISTS "v_orders" CASCADE;', pg_sql)
         self.assertIn('CREATE VIEW "v_orders" ("order total", "select", "col ""special""") AS SELECT', pg_sql)
 
+    def test_dateadd_timestamp_precedence_in_coalesce(self):
+        expr = "DATEADD(DAY, 1, COALESCE(CAST(NULL AS DATE), TIMESTAMP '2020-01-01 12:00:00'))"
+        res = FirebirdToPostgresVisitor.transpile_expression(expr)
+        self.assertNotIn("::date", res)
+        self.assertIn("INTERVAL '1 day'", res)
+
+    def test_view_transpilation_propagates_column_symbols(self):
+        fb_sql = "CREATE VIEW V AS SELECT DATEADD(DAY, 1, D) - D AS DIFF FROM T;"
+        symbols = {"d": "DATE", "t.d": "DATE"}
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql, symbols=symbols)
+        self.assertIn("((T.D + (1) * INTERVAL '1 day')::date) - T.D", pg_sql)
+
+
