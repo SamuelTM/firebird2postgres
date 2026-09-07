@@ -78,6 +78,73 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
         self.assertIsNone(col_notnull.sequence_name)
         self.assertIsNone(col_uncond.sequence_name)
 
+    def test_item_g_trigger_conditional_does_not_become_unconditional_default(self):
+        """
+        Validates Item G acceptance criteria:
+        - Whole condition is recognized (finding IS NULL inside is not sufficient).
+        - Conditions depending on CURRENT_USER, other columns, or external state are not promoted.
+        - Triggers with commands/logic prior to assignment are not promoted.
+        - Unconditional triggers are not promoted (avoiding double-generation).
+        - Multiple triggers affecting the same column prevent promotion.
+        - Genuine auto-increment triggers (IS NULL, <= 0, = 0, COALESCE) are promoted.
+        """
+        table_cond = Table('TEST_COND')
+        col_admin = Column('ID_ADMIN', 'INTEGER', nullable=True)
+        col_status = Column('ID_STATUS', 'INTEGER', nullable=True)
+        col_ext = Column('ID_EXT', 'INTEGER', nullable=True)
+        col_cmd = Column('ID_CMD', 'INTEGER', nullable=True)
+        col_multi = Column('ID_MULTI', 'INTEGER', nullable=True)
+        col_uncond = Column('ID_UNCOND', 'INTEGER', nullable=True)
+
+        col_pure1 = Column('ID_PURE1', 'INTEGER', nullable=True)
+        col_pure2 = Column('ID_PURE2', 'INTEGER', nullable=True)
+        col_pure3 = Column('ID_PURE3', 'INTEGER', nullable=True)
+        col_pure4 = Column('ID_PURE4', 'INTEGER', nullable=True)
+
+        table_cond.columns.extend([
+            col_admin, col_status, col_ext, col_cmd, col_multi, col_uncond,
+            col_pure1, col_pure2, col_pure3, col_pure4
+        ])
+
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [
+            # 1. Condition with CURRENT_USER = 'ADMIN' must NOT be promoted
+            ("TEST_COND", "AS BEGIN IF (NEW.ID_ADMIN IS NULL AND CURRENT_USER = 'ADMIN') THEN NEW.ID_ADMIN = GEN_ID(G_ADMIN, 1); END;", 1),
+            # 2. Condition on another column must NOT be promoted
+            ("TEST_COND", "AS BEGIN IF (NEW.ID_STATUS IS NULL AND NEW.STATUS = 1) THEN NEW.ID_STATUS = GEN_ID(G_STATUS, 1); END;", 1),
+            # 3. Disjunction with condition on another column must NOT be promoted
+            ("TEST_COND", "AS BEGIN IF (NEW.ID_EXT IS NULL OR NEW.EXT_FLAG = 'Y') THEN NEW.ID_EXT = GEN_ID(G_EXT, 1); END;", 1),
+            # 4. Trigger with commands prior to assignment must NOT be promoted
+            ("TEST_COND", "AS BEGIN INSERT INTO AUDIT (ACTION) VALUES ('INS'); IF (NEW.ID_CMD IS NULL) THEN NEW.ID_CMD = GEN_ID(G_CMD, 1); END;", 1),
+            # 5. Multiple triggers touching ID_MULTI must NOT be promoted
+            ("TEST_COND", "AS BEGIN IF (NEW.ID_MULTI IS NULL) THEN NEW.ID_MULTI = GEN_ID(G_MULTI, 1); END;", 1),
+            ("TEST_COND", "AS BEGIN IF (NEW.FLAG = 'SPECIAL') THEN NEW.ID_MULTI = 999; END;", 1),
+            # 6. Unconditional trigger must NOT be promoted
+            ("TEST_COND", "AS BEGIN NEW.ID_UNCOND = GEN_ID(G_UNCOND, 1); END;", 1),
+
+            # 7. Pure auto-increment patterns SHOULD be promoted
+            ("TEST_COND", "AS BEGIN IF (NEW.ID_PURE1 IS NULL) THEN NEW.ID_PURE1 = GEN_ID(G_PURE1, 1); END;", 1),
+            ("TEST_COND", "AS BEGIN IF (NEW.ID_PURE2 IS NULL OR NEW.ID_PURE2 <= 0) THEN NEW.ID_PURE2 = GEN_ID(G_PURE2, 1); END;", 1),
+            ("TEST_COND", "AS BEGIN IF (NEW.ID_PURE3 IS NULL OR NEW.ID_PURE3 = 0) THEN NEW.ID_PURE3 = NEXT VALUE FOR G_PURE3; END;", 1),
+            ("TEST_COND", "AS BEGIN IF (COALESCE(NEW.ID_PURE4, 0) <= 0) THEN NEW.ID_PURE4 = GEN_ID(G_PURE4, 1); END;", 1),
+        ]
+
+        SchemaExtractor._bind_sequence_generators(mock_cursor, [table_cond])
+
+        # Negative assertions: conditional / mixed / multi-trigger columns are NOT promoted
+        self.assertIsNone(col_admin.sequence_name)
+        self.assertIsNone(col_status.sequence_name)
+        self.assertIsNone(col_ext.sequence_name)
+        self.assertIsNone(col_cmd.sequence_name)
+        self.assertIsNone(col_multi.sequence_name)
+        self.assertIsNone(col_uncond.sequence_name)
+
+        # Positive assertions: genuine auto-increment columns ARE promoted
+        self.assertEqual(col_pure1.sequence_name, "g_pure1")
+        self.assertEqual(col_pure2.sequence_name, "g_pure2")
+        self.assertEqual(col_pure3.sequence_name, "g_pure3")
+        self.assertEqual(col_pure4.sequence_name, "g_pure4")
+
     def test_extract_columns_transpiles_computed_source(self):
         mock_cursor = MagicMock()
         # column tuple: name, type, subtype, length, null_flag, prec, scale, col_def, dom_def, fld_src, comp_src

@@ -551,13 +551,73 @@ class SchemaExtractor:
         return checks
 
     @staticmethod
-    def _bind_sequence_generators(cursor, table_objs: list[Table]) -> None:
+    def _strip_outer_parens(s: str) -> str:
+        s = s.strip()
+        while s.startswith("(") and s.endswith(")"):
+            depth = 0
+            enclosing = True
+            for ch in s[:-1]:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        enclosing = False
+                        break
+            if enclosing and depth == 1:
+                s = s[1:-1].strip()
+            else:
+                break
+        return s
+
+    @classmethod
+    def _is_equivalent_absent_condition(cls, cond: str, col_name: str) -> bool:
+        if not cond:
+            return False
+        cond = cls._strip_outer_parens(cond)
+        # Disallow AND conjunctions (any AND restricts the generation to a subset of cases)
+        if re.search(r"\bAND\b", cond, re.IGNORECASE):
+            return False
+        # Disallow NOT (negations)
+        if re.search(r"\bNOT\b", cond, re.IGNORECASE):
+            return False
+        # Disallow inequality operators
+        if re.search(r"!=|<>|>", cond):
+            return False
+        # Disallow user/context variables or functions (e.g. CURRENT_USER = 'ADMIN')
+        if re.search(r"\b(CURRENT_USER|CURRENT_ROLE|USER|CURRENT_DATE|CURRENT_TIME|CURRENT_TIMESTAMP)\b", cond, re.IGNORECASE):
+            return False
+
+        col_esc = re.escape(col_name)
+        col_ref_pat = rf'(?:\"?NEW\"?\s*\.\s*\"?{col_esc}\"?)'
+        branch_patterns = [
+            rf'^{col_ref_pat}\s+IS\s+NULL$',
+            rf'^{col_ref_pat}\s*(?:<=?|=)\s*0$',
+            rf'^{col_ref_pat}\s*<\s*1$',
+            rf'^COALESCE\s*\(\s*{col_ref_pat}\s*,\s*0\s*\)\s*(?:<=?|=)\s*0$',
+            rf'^COALESCE\s*\(\s*{col_ref_pat}\s*,\s*0\s*\)\s*<\s*1$',
+        ]
+
+        branches = re.split(r"\bOR\b", cond, flags=re.IGNORECASE)
+        if not branches:
+            return False
+
+        for b in branches:
+            b_clean = cls._strip_outer_parens(b)
+            if not any(re.match(p, b_clean, re.IGNORECASE) for p in branch_patterns):
+                return False
+
+        return True
+
+    @classmethod
+    def _bind_sequence_generators(cls, cursor, table_objs: list[Table]) -> None:
         """
         Inspects trigger bodies for GEN_ID / NEXT VALUE FOR usage and binds identified
         sequences to table columns only for genuine auto-increment / identity defaults
         on BEFORE INSERT triggers (RDB$TRIGGER_TYPE = 1).
         Ignores commented-out code, step != 1 (e.g. GEN_ID(..., 0)), non-BEFORE-INSERT triggers,
-        and assignments conditioned on other columns.
+        conditional triggers dependent on user/context or other columns, unconditional triggers,
+        triggers with preceding or procedural commands, and columns affected by multiple triggers.
         """
         cursor.execute("""
             SELECT RDB$RELATION_NAME, RDB$TRIGGER_SOURCE, RDB$TRIGGER_TYPE
@@ -570,45 +630,71 @@ class SchemaExtractor:
         tables_by_name = {t.name.upper(): t for t in table_objs}
 
         if_re = re.compile(
-            r"^(?:(?:AS\s+)?BEGIN\s+)?IF\s*(?:\((.*?)\)|(.*?))\s+THEN\s*(?:BEGIN\s+)?NEW\.(?:\"|\s)*([A-Za-z0-9_]+)(?:\"|\s)*=\s*(?:GEN_ID\s*\(\s*([A-Za-z0-9_]+)\s*,\s*1\s*\)|NEXT\s+VALUE\s+FOR\s+([A-Za-z0-9_]+))\s*(?:END)?$",
+            r"^(?:(?:AS\s+)?BEGIN\s+)?IF\s*(?:\((.*)\)|(.*?))\s+THEN\s*(?:BEGIN\s+)?NEW\.(?:\"|\s)*([A-Za-z0-9_]+)(?:\"|\s)*=\s*(?:GEN_ID\s*\(\s*([A-Za-z0-9_]+)\s*,\s*1\s*\)|NEXT\s+VALUE\s+FOR\s+([A-Za-z0-9_]+))\s*(?:END)?$",
             re.IGNORECASE | re.DOTALL
         )
 
+        # Group BEFORE INSERT triggers by table
+        table_triggers: dict[str, list[tuple[str, str]]] = {}
         for trigger in triggers:
             relation_name = trigger[0].strip() if trigger[0] else None
             source = trigger[1]
             trigger_type = trigger[2] if len(trigger) > 2 else 1
             if not relation_name or not source or trigger_type != 1:
                 continue
+            if relation_name.upper() in tables_by_name:
+                clean = re.sub(r"--[^\r\n]*", "", source)
+                clean = re.sub(r"/\*.*?\*/", "", clean, flags=re.DOTALL).strip()
+                table_triggers.setdefault(relation_name.upper(), []).append((source, clean))
 
-            table = tables_by_name.get(relation_name.upper())
-            if not table:
-                continue
+        for rel_name_upper, trg_list in table_triggers.items():
+            table = tables_by_name[rel_name_upper]
 
-            # Strip comments (-- and /* ... */)
-            clean = re.sub(r"--[^\r\n]*", "", source)
-            clean = re.sub(r"/\*.*?\*/", "", clean, flags=re.DOTALL)
+            for idx, (source, clean) in enumerate(trg_list):
+                # Split clean source into meaningful statements
+                raw_stmts = [s.strip() for s in clean.split(";") if s.strip()]
+                stmts = []
+                for s in raw_stmts:
+                    # Ignore pure block boundary keywords
+                    s_no_kw = re.sub(r"\b(BEGIN|END)\b", "", s, flags=re.IGNORECASE).strip()
+                    if s_no_kw:
+                        stmts.append(s)
 
-            stmts = [s.strip() for s in clean.split(";") if s.strip()]
-            for stmt in stmts:
-                col_name = None
-                seq_name = None
+                if not stmts:
+                    continue
 
-                m_if = if_re.match(stmt)
-                if m_if:
-                    cond = (m_if.group(1) or m_if.group(2)).strip()
-                    c = m_if.group(3).strip()
-                    s = (m_if.group(4) or m_if.group(5)).strip().lower()
-                    cond_cols = re.findall(r"NEW\.(?:\"|\s)*([A-Za-z0-9_]+)(?:\"|\s)*", cond, re.IGNORECASE)
-                    # Verify condition strictly guards absence of value on this same column (e.g. NEW.ID IS NULL or NEW.ID <= 0)
-                    if cond_cols and all(col.upper() == c.upper() for col in cond_cols):
-                        if not re.search(r"\bNOT\b", cond, re.IGNORECASE) and not re.search(r"!=|<>|>\s*0\b", cond):
-                            if re.search(r"\bIS\s+NULL\b", cond, re.IGNORECASE) or re.search(r"(?:<=?|=)\s*0\b", cond):
-                                col_name = c
-                                seq_name = s
+                # If the trigger contains any statement other than an auto-increment assignment,
+                # it is not a pure auto-increment trigger (commands/logic present)
+                candidates = []
+                is_pure = True
+                for stmt in stmts:
+                    m_if = if_re.match(stmt)
+                    if m_if:
+                        cond = (m_if.group(1) or m_if.group(2)).strip()
+                        c = m_if.group(3).strip()
+                        s = (m_if.group(4) or m_if.group(5)).strip().lower()
+                        if cls._is_equivalent_absent_condition(cond, c):
+                            candidates.append((c, s))
+                        else:
+                            is_pure = False
+                            break
+                    else:
+                        is_pure = False
+                        break
 
-                if col_name and seq_name:
-                    column = next((c for c in table.columns if c.name.upper() == col_name.upper()), None)
+                if not is_pure or not candidates:
+                    continue
+
+                # For each candidate column, verify no other BEFORE INSERT trigger on this table
+                # references or modifies NEW.<col>
+                other_triggers = [c_src for i, (_, c_src) in enumerate(trg_list) if i != idx]
+                for col_name, seq_name in candidates:
+                    col_pat = re.compile(rf'\bNEW\s*\.\s*"?{re.escape(col_name)}"?\b', re.IGNORECASE)
+                    if any(col_pat.search(other_clean) for other_clean in other_triggers):
+                        # Another trigger references this column; do not promote to default
+                        continue
+
+                    column = next((col for col in table.columns if col.name.upper() == col_name.upper()), None)
                     if column:
                         column.sequence_name = seq_name
 

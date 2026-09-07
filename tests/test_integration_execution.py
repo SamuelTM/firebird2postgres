@@ -458,7 +458,196 @@ class TestIntegrationExecution(unittest.TestCase):
         self.assertEqual(rows[1][4], decimal.Decimal('32.00'))  # 22 + 10
         self.assertEqual(rows[1][5], '10A')
 
-        self.pg_cur.execute("DROP TABLE IF EXISTS reg_computed_test CASCADE;")
+    @unittest.skipUnless(HAS_REAL_PG, "Live PostgreSQL instance required for real execution test")
+    def test_real_pg_item_g_trigger_conditional_and_sequence_advancement(self):
+        """
+        Validates Item G regression criteria on live PostgreSQL:
+        - ID omitted, NULL, zero, and explicit value.
+        - Condition CURRENT_USER = 'ADMIN' prevents sequence advancement for regular users.
+        - Condition on another column prevents sequence advancement when condition is not met.
+        - Unconditional trigger does not cause double-generation.
+        - Multiple triggers preserve trigger execution order and do not waste sequence numbers.
+        """
+        # Cleanup any previous runs
+        self.pg_cur.execute("""
+            DROP TABLE IF EXISTS reg_t_pure CASCADE;
+            DROP TABLE IF EXISTS reg_t_admin CASCADE;
+            DROP TABLE IF EXISTS reg_t_cond_col CASCADE;
+            DROP TABLE IF EXISTS reg_t_uncond CASCADE;
+            DROP TABLE IF EXISTS reg_t_multi CASCADE;
+            DROP SEQUENCE IF EXISTS seq_pure CASCADE;
+            DROP SEQUENCE IF EXISTS seq_admin CASCADE;
+            DROP SEQUENCE IF EXISTS seq_cond_col CASCADE;
+            DROP SEQUENCE IF EXISTS seq_uncond CASCADE;
+            DROP SEQUENCE IF EXISTS seq_multi CASCADE;
+        """)
+
+        # 1. Pure auto-increment trigger (promoted to DEFAULT nextval)
+        self.pg_cur.execute("""
+            CREATE SEQUENCE seq_pure START WITH 1;
+            CREATE TABLE reg_t_pure (id INT DEFAULT nextval('seq_pure'), val TEXT);
+            CREATE OR REPLACE FUNCTION trg_bi_pure() RETURNS TRIGGER AS $$
+            BEGIN
+                IF (NEW.id IS NULL) THEN
+                    NEW.id = nextval('seq_pure');
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+            CREATE TRIGGER trg_bi_pure BEFORE INSERT ON reg_t_pure FOR EACH ROW EXECUTE FUNCTION trg_bi_pure();
+        """)
+
+        # 1a. ID omitted -> gets 1, sequence at 1 (no double generation)
+        self.pg_cur.execute("INSERT INTO reg_t_pure (val) VALUES ('omitted');")
+        self.pg_cur.execute("SELECT id FROM reg_t_pure WHERE val = 'omitted';")
+        self.assertEqual(self.pg_cur.fetchone()[0], 1)
+        self.pg_cur.execute("SELECT last_value FROM seq_pure;")
+        self.assertEqual(self.pg_cur.fetchone()[0], 1)
+
+        # 1b. ID = NULL -> trigger catches it, gets 2, sequence at 2
+        self.pg_cur.execute("INSERT INTO reg_t_pure (id, val) VALUES (NULL, 'null_val');")
+        self.pg_cur.execute("SELECT id FROM reg_t_pure WHERE val = 'null_val';")
+        self.assertEqual(self.pg_cur.fetchone()[0], 2)
+        self.pg_cur.execute("SELECT last_value FROM seq_pure;")
+        self.assertEqual(self.pg_cur.fetchone()[0], 2)
+
+        # 1c. ID = 0 -> not null, stays 0, sequence does not advance
+        self.pg_cur.execute("INSERT INTO reg_t_pure (id, val) VALUES (0, 'zero_val');")
+        self.pg_cur.execute("SELECT id FROM reg_t_pure WHERE val = 'zero_val';")
+        self.assertEqual(self.pg_cur.fetchone()[0], 0)
+        self.pg_cur.execute("SELECT last_value FROM seq_pure;")
+        self.assertEqual(self.pg_cur.fetchone()[0], 2)
+
+        # 1d. ID = 42 (explicit value) -> preserved, sequence does not advance
+        self.pg_cur.execute("INSERT INTO reg_t_pure (id, val) VALUES (42, 'explicit');")
+        self.pg_cur.execute("SELECT id FROM reg_t_pure WHERE val = 'explicit';")
+        self.assertEqual(self.pg_cur.fetchone()[0], 42)
+        self.pg_cur.execute("SELECT last_value FROM seq_pure;")
+        self.assertEqual(self.pg_cur.fetchone()[0], 2)
+
+        # 2. Condition CURRENT_USER = 'ADMIN' (NOT promoted to default)
+        self.pg_cur.execute("""
+            CREATE SEQUENCE seq_admin START WITH 1;
+            CREATE TABLE reg_t_admin (id INT, val TEXT);
+            CREATE OR REPLACE FUNCTION trg_bi_admin() RETURNS TRIGGER AS $$
+            BEGIN
+                IF (NEW.id IS NULL AND CURRENT_USER = 'ADMIN') THEN
+                    NEW.id = nextval('seq_admin');
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+            CREATE TRIGGER trg_bi_admin BEFORE INSERT ON reg_t_admin FOR EACH ROW EXECUTE FUNCTION trg_bi_admin();
+        """)
+
+        # Non-admin insertion: ID omitted -> remains NULL, sequence is NOT called
+        self.pg_cur.execute("INSERT INTO reg_t_admin (val) VALUES ('regular_user');")
+        self.pg_cur.execute("SELECT id FROM reg_t_admin WHERE val = 'regular_user';")
+        self.assertIsNone(self.pg_cur.fetchone()[0])
+        self.pg_cur.execute("SELECT is_called FROM seq_admin;")
+        self.assertFalse(self.pg_cur.fetchone()[0])
+
+        # 3. Condition on another column (NOT promoted to default)
+        self.pg_cur.execute("""
+            CREATE SEQUENCE seq_cond_col START WITH 1;
+            CREATE TABLE reg_t_cond_col (id INT, status INT);
+            CREATE OR REPLACE FUNCTION trg_bi_cond_col() RETURNS TRIGGER AS $$
+            BEGIN
+                IF (NEW.id IS NULL AND NEW.status = 1) THEN
+                    NEW.id = nextval('seq_cond_col');
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+            CREATE TRIGGER trg_bi_cond_col BEFORE INSERT ON reg_t_cond_col FOR EACH ROW EXECUTE FUNCTION trg_bi_cond_col();
+        """)
+
+        # 3a. status = 0 -> ID remains NULL, sequence not called
+        self.pg_cur.execute("INSERT INTO reg_t_cond_col (status) VALUES (0);")
+        self.pg_cur.execute("SELECT id FROM reg_t_cond_col WHERE status = 0;")
+        self.assertIsNone(self.pg_cur.fetchone()[0])
+        self.pg_cur.execute("SELECT is_called FROM seq_cond_col;")
+        self.assertFalse(self.pg_cur.fetchone()[0])
+
+        # 3b. status = 1 -> ID gets 1, sequence called
+        self.pg_cur.execute("INSERT INTO reg_t_cond_col (status) VALUES (1);")
+        self.pg_cur.execute("SELECT id FROM reg_t_cond_col WHERE status = 1;")
+        self.assertEqual(self.pg_cur.fetchone()[0], 1)
+        self.pg_cur.execute("SELECT last_value FROM seq_cond_col;")
+        self.assertEqual(self.pg_cur.fetchone()[0], 1)
+
+        # 4. Unconditional trigger (NOT promoted to default)
+        self.pg_cur.execute("""
+            CREATE SEQUENCE seq_uncond START WITH 1;
+            CREATE TABLE reg_t_uncond (id INT, val TEXT);
+            CREATE OR REPLACE FUNCTION trg_bi_uncond() RETURNS TRIGGER AS $$
+            BEGIN
+                NEW.id = nextval('seq_uncond');
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+            CREATE TRIGGER trg_bi_uncond BEFORE INSERT ON reg_t_uncond FOR EACH ROW EXECUTE FUNCTION trg_bi_uncond();
+        """)
+
+        # Insert -> ID gets 1, sequence at 1 (no double generation)
+        self.pg_cur.execute("INSERT INTO reg_t_uncond (val) VALUES ('test');")
+        self.pg_cur.execute("SELECT id FROM reg_t_uncond WHERE val = 'test';")
+        self.assertEqual(self.pg_cur.fetchone()[0], 1)
+        self.pg_cur.execute("SELECT last_value FROM seq_uncond;")
+        self.assertEqual(self.pg_cur.fetchone()[0], 1)
+
+        # 5. Multiple triggers (order preserved, no sequence advance when overridden)
+        self.pg_cur.execute("""
+            CREATE SEQUENCE seq_multi START WITH 1;
+            CREATE TABLE reg_t_multi (id INT, flag INT, val TEXT);
+            CREATE OR REPLACE FUNCTION trg_01_override() RETURNS TRIGGER AS $$
+            BEGIN
+                IF (NEW.flag = 99) THEN
+                    NEW.id = 999;
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+            CREATE TRIGGER trg_01_override BEFORE INSERT ON reg_t_multi FOR EACH ROW EXECUTE FUNCTION trg_01_override();
+
+            CREATE OR REPLACE FUNCTION trg_02_seq() RETURNS TRIGGER AS $$
+            BEGIN
+                IF (NEW.id IS NULL) THEN
+                    NEW.id = nextval('seq_multi');
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+            CREATE TRIGGER trg_02_seq BEFORE INSERT ON reg_t_multi FOR EACH ROW EXECUTE FUNCTION trg_02_seq();
+        """)
+
+        # 5a. flag = 99: Trigger 1 overrides ID to 999; Trigger 2 does NOT advance seq_multi
+        self.pg_cur.execute("INSERT INTO reg_t_multi (flag, val) VALUES (99, 'special');")
+        self.pg_cur.execute("SELECT id FROM reg_t_multi WHERE flag = 99;")
+        self.assertEqual(self.pg_cur.fetchone()[0], 999)
+        self.pg_cur.execute("SELECT is_called FROM seq_multi;")
+        self.assertFalse(self.pg_cur.fetchone()[0])
+
+        # 5b. flag = 1: Trigger 1 doesn't touch ID; Trigger 2 assigns nextval -> id = 1
+        self.pg_cur.execute("INSERT INTO reg_t_multi (flag, val) VALUES (1, 'regular');")
+        self.pg_cur.execute("SELECT id FROM reg_t_multi WHERE flag = 1;")
+        self.assertEqual(self.pg_cur.fetchone()[0], 1)
+        self.pg_cur.execute("SELECT last_value FROM seq_multi;")
+        self.assertEqual(self.pg_cur.fetchone()[0], 1)
+
+        # Cleanup
+        self.pg_cur.execute("""
+            DROP TABLE IF EXISTS reg_t_pure CASCADE;
+            DROP TABLE IF EXISTS reg_t_admin CASCADE;
+            DROP TABLE IF EXISTS reg_t_cond_col CASCADE;
+            DROP TABLE IF EXISTS reg_t_uncond CASCADE;
+            DROP TABLE IF EXISTS reg_t_multi CASCADE;
+            DROP SEQUENCE IF EXISTS seq_pure CASCADE;
+            DROP SEQUENCE IF EXISTS seq_admin CASCADE;
+            DROP SEQUENCE IF EXISTS seq_cond_col CASCADE;
+            DROP SEQUENCE IF EXISTS seq_uncond CASCADE;
+            DROP SEQUENCE IF EXISTS seq_multi CASCADE;
+        """)
 
 
 if __name__ == '__main__':
