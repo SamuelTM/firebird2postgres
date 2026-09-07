@@ -10,14 +10,20 @@ from models import Table, pg_quote_ident
 logger = logging.getLogger(__name__)
 
 
-def _import_single_table(table: Table, fb_cur, pg_cur, pg_con) -> int:
+def _import_single_table(table: Table, fb_cur, pg_cur, pg_con) -> tuple[int, dict[str, int]]:
     """
     Imports data for a single table:
     1. Truncates table in PostgreSQL (no CASCADE)
     2. Queries Firebird and fetches rows in adaptive batches
     3. Streams rows into PostgreSQL using native COPY protocol (copy_expert)
     4. Commits table transaction in PostgreSQL
-    Returns total rows imported.
+
+    Data transformation policy:
+    PostgreSQL text/varchar rejects 0x00 (NUL) bytes. Strings containing NUL bytes
+    have them stripped during serialization; all occurrences are counted per table/column
+    and returned in nul_stats for auditing and diagnostics.
+
+    Returns (total_rows, nul_stats).
     """
     logger.info(f"Importing data for '{table.name}'...")
 
@@ -36,6 +42,7 @@ def _import_single_table(table: Table, fb_cur, pg_cur, pg_con) -> int:
     # Firebird-side keeps the original casing (quoted identifiers are case-sensitive there);
     # PostgreSQL-side uses the lowercase identifier.
     cols_to_import = [col for col in table.columns if not col.computed_source]
+    col_names = [col.name for col in cols_to_import]
     fb_column_names = [pg_quote_ident(col.name) for col in cols_to_import]
     fb_columns_str = ", ".join(fb_column_names)
 
@@ -46,6 +53,7 @@ def _import_single_table(table: Table, fb_cur, pg_cur, pg_con) -> int:
     copy_sql = f'COPY {pg_quote_ident(table.pg_name)} ({pg_columns_str}) FROM STDIN WITH (FORMAT text, NULL \'\\N\')'
 
     total_rows = 0
+    nul_stats: dict[str, int] = {}
     while True:
         rows = fb_cur.fetchmany(batch_size)
         if not rows:
@@ -54,13 +62,17 @@ def _import_single_table(table: Table, fb_cur, pg_cur, pg_con) -> int:
         buf = io.StringIO()
         for row in rows:
             line = []
-            for val in row:
+            for col_idx, val in enumerate(row):
                 if val is None:
                     line.append(r'\N')
                 elif isinstance(val, bytes):
                     line.append(r'\\x' + val.hex())
                 elif isinstance(val, str):
-                    line.append(val.replace('\x00', '').replace('\\', '\\\\')
+                    if '\x00' in val:
+                        col_name = col_names[col_idx]
+                        nul_stats[col_name] = nul_stats.get(col_name, 0) + val.count('\x00')
+                        val = val.replace('\x00', '')
+                    line.append(val.replace('\\', '\\\\')
                                    .replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t'))
                 elif isinstance(val, bool):
                     line.append('t' if val else 'f')
@@ -73,14 +85,17 @@ def _import_single_table(table: Table, fb_cur, pg_cur, pg_con) -> int:
         total_rows += len(rows)
 
     pg_con.commit()
+    if nul_stats:
+        logger.warning(f"  -> Table '{table.name}': stripped NUL (0x00) bytes from columns: {nul_stats}")
     logger.info(f"  -> Successfully imported {total_rows} rows for '{table.name}'.")
-    return total_rows
+    return total_rows, nul_stats
 
 
-def _migrate_table_worker(table: Table) -> tuple[str, int, str | None]:
+def _migrate_table_worker(table: Table) -> tuple[str, int, str | None, dict[str, int]]:
     """
     Top-level worker function for ProcessPoolExecutor: establishes isolated database
     connections in the worker process, sets session performance tuning, and imports the table.
+    Returns (table_name, rows_imported, error_message, nul_stats).
     """
     fb_con = get_firebird_connection()
     pg_con = get_postgres_connection()
@@ -89,15 +104,15 @@ def _migrate_table_worker(table: Table) -> tuple[str, int, str | None]:
         pg_cur.execute("SET synchronous_commit = OFF;")
         fb_cur = fb_con.cursor()
 
-        rows_imported = _import_single_table(table, fb_cur, pg_cur, pg_con)
-        return table.name, rows_imported, None
+        rows_imported, nul_stats = _import_single_table(table, fb_cur, pg_cur, pg_con)
+        return table.name, rows_imported, None, nul_stats
     except (psycopg2.Error, firebirdsql.Error, OSError, ValueError, TypeError) as e:
         try:
             pg_con.rollback()
         except (psycopg2.Error, OSError):
             pass
         logger.error(f"Failed to import table '{table.name}': {e}", exc_info=True)
-        return table.name, 0, str(e)
+        return table.name, 0, str(e), {}
     finally:
         try:
             fb_con.close()
@@ -119,6 +134,7 @@ class DataMigrator:
     def __init__(self, fb_con, pg_con):
         self.fb_con = fb_con
         self.pg_con = pg_con
+        self.last_nul_stats: dict[str, dict[str, int]] = {}
 
     def _re_enable_triggers(self, table_objs: list[Table]):
         """
@@ -185,6 +201,7 @@ class DataMigrator:
         Returns True if all tables were imported successfully, False if any table failed.
         """
         self.check_source_consistency()
+        self.last_nul_stats = {}
         logger.info(f"Starting data migration for {len(table_objs)} tables (workers={max_workers})...")
         pg_cur = self.pg_con.cursor()
 
@@ -204,7 +221,7 @@ class DataMigrator:
                 reverse=True
             )
 
-            results: list[tuple[str, int, str | None]] = []
+            results: list[tuple[str, int, str | None, dict[str, int]]] = []
 
             if max_workers <= 1 or len(sorted_tables) <= 1:
                 # Sequential execution using caller connections
@@ -214,12 +231,12 @@ class DataMigrator:
                 try:
                     for table in sorted_tables:
                         try:
-                            rows_imported = _import_single_table(table, fb_cur, pg_cur, self.pg_con)
-                            results.append((table.name, rows_imported, None))
+                            rows_imported, nul_stats = _import_single_table(table, fb_cur, pg_cur, self.pg_con)
+                            results.append((table.name, rows_imported, None, nul_stats))
                         except (psycopg2.Error, firebirdsql.Error, OSError, ValueError, TypeError) as e:
                             self.pg_con.rollback()
                             logger.error(f"Failed to import table '{table.name}': {e}", exc_info=True)
-                            results.append((table.name, 0, str(e)))
+                            results.append((table.name, 0, str(e), {}))
                 finally:
                     try:
                         pg_cur.execute("RESET synchronous_commit;")
@@ -236,8 +253,8 @@ class DataMigrator:
                 try:
                     futures = {executor.submit(_migrate_table_worker, table): table for table in sorted_tables}
                     for future in as_completed(futures):
-                        tbl_name, rows_imported, err = future.result()
-                        results.append((tbl_name, rows_imported, err))
+                        tbl_name, rows_imported, err, nul_stats = future.result()
+                        results.append((tbl_name, rows_imported, err, nul_stats))
                 finally:
                     if owns_executor:
                         executor.shutdown()
@@ -285,9 +302,20 @@ class DataMigrator:
         finally:
             self._re_enable_triggers(table_objs)
 
-        failed_tables = [(tbl, err) for tbl, _, err in results if err is not None]
-        successful_tables = sum(1 for _, _, err in results if err is None)
-        total_rows_imported = sum(rows for _, rows, err in results if err is None)
+        failed_tables = [(tbl, err) for tbl, _, err, _ in results if err is not None]
+        successful_tables = sum(1 for _, _, err, _ in results if err is None)
+        total_rows_imported = sum(rows for _, rows, err, _ in results if err is None)
+
+        all_nul_stats = {tbl: nuls for tbl, _, err, nuls in results if err is None and nuls}
+        self.last_nul_stats = all_nul_stats
+        if all_nul_stats:
+            logger.warning("=" * 80)
+            logger.warning("DATA TRANSFORMATION NOTICE: NUL (0x00) bytes were stripped from text columns:")
+            for tbl, col_map in sorted(all_nul_stats.items()):
+                details = ", ".join(f"'{col}': {cnt} NUL byte(s)" for col, cnt in sorted(col_map.items()))
+                logger.warning(f"  Table '{tbl}': {details}")
+            logger.warning("PostgreSQL text/varchar rejects 0x00 bytes. Verify downstream applications if exact binary values were required.")
+            logger.warning("=" * 80)
 
         if failed_tables:
             logger.error("=" * 80)

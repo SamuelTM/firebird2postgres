@@ -32,7 +32,7 @@ An ANTLR-based transpiler converts triggers, stored procedures and views to PL/p
 
 - Disables triggers during the load (`DISABLE TRIGGER ALL`). No foreign-key sort is necessary.
 
-- Removes NUL bytes (`\x00`) from text values.
+- Removes NUL bytes (`\x00`) from text values (required because PostgreSQL `TEXT`/`VARCHAR` rejects `0x00`) and logs an audit diagnostic summary with affected tables, columns, and occurrence counts.
  
 - Checks source database consistency before data import. Because Firebird parallel workers cannot share a transactional snapshot across separate connections, migrating from a frozen database (`gfix -mode read_only`) or a cold backup is recommended to avoid relational inconsistencies caused by concurrent writes.
 

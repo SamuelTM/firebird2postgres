@@ -47,6 +47,8 @@ class TestDataMigrator(unittest.TestCase):
         buf_val = buf.getvalue()
         self.assertIn('JOAO SILVA', buf_val)
         self.assertNotIn('\x00', buf_val)
+        # NUL stats must record table, column, and exact count of occurrences
+        self.assertEqual(self.migrator.last_nul_stats, {'CLIENTES': {'NOME': 1}})
 
     def test_data_migration_zero_copy_for_numeric_tables(self):
         table = Table('ESTATISTICAS')
@@ -63,6 +65,22 @@ class TestDataMigrator(unittest.TestCase):
 
         success = self.migrator.import_data([table])
         self.assertTrue(success)
+        self.assertEqual(self.migrator.last_nul_stats, {})
+
+    def test_data_migration_nul_stats_warns_on_stripped_bytes(self):
+        table = Table('TAB_NUL')
+        table.columns.append(Column('ID', 'INTEGER', nullable=False))
+        table.columns.append(Column('DESCRICAO', 'VARCHAR(50)', nullable=False))
+
+        raw_rows = [(1, 'A\x00B\x00C'), (2, 'XYZ')]
+        self.mock_fb_cur.fetchmany.side_effect = [raw_rows, []]
+
+        with self.assertLogs('engine.data_migrator', level='WARNING') as cm:
+            success = self.migrator.import_data([table], max_workers=1)
+            self.assertTrue(success)
+            self.assertEqual(self.migrator.last_nul_stats, {'TAB_NUL': {'DESCRICAO': 2}})
+            self.assertTrue(any('DATA TRANSFORMATION NOTICE' in msg for msg in cm.output))
+            self.assertTrue(any("'DESCRICAO': 2 NUL byte(s)" in msg for msg in cm.output))
 
     def test_data_migration_handles_failure_and_rollback(self):
         table = Table('FALHA')
