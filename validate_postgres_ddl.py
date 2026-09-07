@@ -103,65 +103,171 @@ def identify_object(sql_text: str) -> Tuple[str, str]:
     return 'OTHER', 'UNKNOWN'
 
 
+# Status constants for PL/pgSQL runtime verification
+CHECK_PASSED = "PASSED"                    # "verificado sem erros"
+CHECK_ISSUES_FOUND = "ISSUES_FOUND"        # "problemas encontrados"
+CHECK_NOT_PERFORMED = "NOT_PERFORMED"      # "não foi possível verificar / verificação não realizada"
+
+
 def check_plpgsql_runtime_validity(
     cursor,
-    function_names: Optional[List[str]] = None
-) -> tuple[List[ValidationResult], List[tuple[str, str]]]:
+    function_names: Optional[List[str]] = None,
+    require_checker: bool = False
+) -> tuple[List[ValidationResult], List[tuple[str, str]], str]:
     """
     Checks PL/pgSQL functions and triggers for runtime syntax and column/type errors
     using plpgsql_check_function_tb with proper OIDs and trigger relation IDs.
-    Wraps each check in a SAVEPOINT to preserve transaction state on check failure.
-    Returns (validation_results, runtime_issues).
+    Wraps each check and catalog query in a SAVEPOINT to preserve transaction state.
+    Distinguishes:
+      - 'PASSED' (verificado sem erros)
+      - 'ISSUES_FOUND' (problemas encontrados)
+      - 'NOT_PERFORMED' (não foi possível verificar / verificação não realizada)
+
+    Returns (validation_results, runtime_issues, checker_status).
     """
     validation_results: List[ValidationResult] = []
     runtime_issues: List[tuple[str, str]] = []
 
+    # 1. Extension presence check wrapped in SAVEPOINT
+    has_ext = False
     try:
+        cursor.execute("SAVEPOINT sp_check_ext;")
         cursor.execute("SELECT 1 FROM pg_extension WHERE extname = 'plpgsql_check';")
-        if not cursor.fetchone():
-            return validation_results, runtime_issues
+        row = cursor.fetchone()
+        has_ext = bool(row and row[0] == 1)
+        cursor.execute("RELEASE SAVEPOINT sp_check_ext;")
     except Exception:
-        return validation_results, runtime_issues
+        try:
+            cursor.execute("ROLLBACK TO SAVEPOINT sp_check_ext;")
+        except Exception:
+            pass
+        has_ext = False
 
-    filter_names = set(n.lower() for n in function_names) if function_names else None
+    if not has_ext:
+        if require_checker:
+            validation_results.append(
+                ValidationResult(
+                    statement=SQLStatement(
+                        file_name="extension",
+                        object_type="EXTENSION",
+                        object_name="plpgsql_check",
+                        sql="CREATE EXTENSION plpgsql_check;",
+                        start_line=0
+                    ),
+                    success=False,
+                    error_message=(
+                        "Runtime checking is required (require_checker=True), "
+                        "but the 'plpgsql_check' extension is not installed or available."
+                    ),
+                    pg_code="CHECKER_REQUIRED"
+                )
+            )
+            runtime_issues.append((
+                "plpgsql_check",
+                "[verificação não realizada] Extensão 'plpgsql_check' ausente, mas verificação runtime é obrigatória."
+            ))
+        else:
+            runtime_issues.append((
+                "plpgsql_check",
+                "[verificação não realizada] Extensão 'plpgsql_check' ausente no banco de dados."
+            ))
+        return validation_results, runtime_issues, CHECK_NOT_PERFORMED
 
-    # 1. Inspect regular functions & procedures
+    filter_names = set(n.lower() for n in function_names) if function_names is not None else None
+    discovery_failed = False
+
+    # 2. Inspect regular functions & procedures with overload signatures and OIDs
+    regular_funcs = []
     try:
+        cursor.execute("SAVEPOINT sp_discover_funcs;")
         cursor.execute("""
-            SELECT p.oid, p.proname, n.nspname
+            SELECT p.oid, p.proname, n.nspname,
+                   pg_get_function_identity_arguments(p.oid) AS identity_args
             FROM pg_proc p
             JOIN pg_namespace n ON n.oid = p.pronamespace
-            WHERE n.nspname = 'public'
+            WHERE (n.nspname = ANY(current_schemas(false)) OR n.nspname = 'public')
               AND p.prolang = (SELECT oid FROM pg_language WHERE lanname = 'plpgsql')
-              AND p.prorettype <> (SELECT oid FROM pg_type WHERE typname = 'trigger');
+              AND p.prorettype <> (SELECT oid FROM pg_type WHERE typname = 'trigger')
+            ORDER BY p.oid;
         """)
         regular_funcs = cursor.fetchall()
-    except Exception:
-        regular_funcs = []
+        cursor.execute("RELEASE SAVEPOINT sp_discover_funcs;")
+    except Exception as e:
+        try:
+            cursor.execute("ROLLBACK TO SAVEPOINT sp_discover_funcs;")
+        except Exception:
+            pass
+        err_msg = str(e).strip()
+        validation_results.append(
+            ValidationResult(
+                statement=SQLStatement(
+                    file_name="catalog",
+                    object_type="CATALOG",
+                    object_name="pg_proc",
+                    sql="SELECT p.oid, p.proname FROM pg_proc ...",
+                    start_line=0
+                ),
+                success=False,
+                error_message=f"Falha na descoberta de funções/procedimentos PL/pgSQL no catálogo: {err_msg}",
+                pg_code=getattr(e, 'pgcode', 'CATALOG_DISCOVERY_FAILED')
+            )
+        )
+        runtime_issues.append(("catalog", f"[falha de descoberta de funções] {err_msg}"))
+        discovery_failed = True
 
-    # 2. Inspect trigger functions with their target relation IDs
+    # 3. Inspect trigger functions with their target relation IDs
+    triggers = []
     try:
+        cursor.execute("SAVEPOINT sp_discover_triggers;")
         cursor.execute("""
-            SELECT t.tgfoid, p.proname, t.tgrelid, c.relname, t.tgname
+            SELECT t.tgfoid, p.proname, t.tgrelid, c.relname, t.tgname, n.nspname
             FROM pg_trigger t
             JOIN pg_proc p ON p.oid = t.tgfoid
             JOIN pg_class c ON c.oid = t.tgrelid
             JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE n.nspname = 'public' AND NOT t.tgisinternal;
+            WHERE (n.nspname = ANY(current_schemas(false)) OR n.nspname = 'public')
+              AND NOT t.tgisinternal
+            ORDER BY t.tgfoid, t.tgrelid;
         """)
         triggers = cursor.fetchall()
-    except Exception:
-        triggers = []
+        cursor.execute("RELEASE SAVEPOINT sp_discover_triggers;")
+    except Exception as e:
+        try:
+            cursor.execute("ROLLBACK TO SAVEPOINT sp_discover_triggers;")
+        except Exception:
+            pass
+        err_msg = str(e).strip()
+        validation_results.append(
+            ValidationResult(
+                statement=SQLStatement(
+                    file_name="catalog",
+                    object_type="CATALOG",
+                    object_name="pg_trigger",
+                    sql="SELECT t.tgfoid ... FROM pg_trigger ...",
+                    start_line=0
+                ),
+                success=False,
+                error_message=f"Falha na descoberta de triggers PL/pgSQL no catálogo: {err_msg}",
+                pg_code=getattr(e, 'pgcode', 'CATALOG_DISCOVERY_FAILED')
+            )
+        )
+        runtime_issues.append(("catalog", f"[falha de descoberta de triggers] {err_msg}"))
+        discovery_failed = True
+
+    if discovery_failed:
+        return validation_results, runtime_issues, CHECK_NOT_PERFORMED
 
     check_targets = []
-    for fn_oid, fn_name, nsp in regular_funcs:
-        if filter_names is None or fn_name.lower() in filter_names:
-            check_targets.append((fn_oid, 0, fn_name, 'FUNCTION'))
+    for fn_oid, fn_name, nsp, identity_args in regular_funcs:
+        full_sig = f"{fn_name}({identity_args})" if identity_args else fn_name
+        if filter_names is None or fn_name.lower() in filter_names or full_sig.lower() in filter_names:
+            check_targets.append((fn_oid, 0, full_sig, 'FUNCTION'))
 
-    for tg_foid, fn_name, tg_relid, rel_name, tg_name in triggers:
-        if filter_names is None or fn_name.lower() in filter_names or tg_name.lower() in filter_names:
+    for tg_foid, fn_name, tg_relid, rel_name, tg_name, nsp in triggers:
+        if filter_names is None or fn_name.lower() in filter_names or tg_name.lower() in filter_names or rel_name.lower() in filter_names:
             check_targets.append((tg_foid, tg_relid, f"{tg_name} on {rel_name}", 'TRIGGER'))
 
+    has_errors = False
     for idx, (f_oid, r_oid, obj_name, obj_type) in enumerate(check_targets, 1):
         sp_name = f"sp_plpgsql_check_{idx}"
         try:
@@ -174,9 +280,11 @@ def check_plpgsql_runtime_validity(
             cursor.execute(f"RELEASE SAVEPOINT {sp_name};")
 
             for msg, level, sqlstate, lineno, stmt_text in rows:
+                lvl_str = str(level).lower()
                 desc = f"[{level}] {msg} (line {lineno})" if lineno else f"[{level}] {msg}"
                 runtime_issues.append((obj_name, desc))
-                if str(level).lower() == 'error':
+                if lvl_str in ('error', 'fatal'):
+                    has_errors = True
                     validation_results.append(
                         ValidationResult(
                             statement=SQLStatement(
@@ -187,7 +295,7 @@ def check_plpgsql_runtime_validity(
                                 object_name=obj_name
                             ),
                             success=False,
-                            error_message=f"[plpgsql_check error] {msg} (line {lineno})",
+                            error_message=f"[plpgsql_check {lvl_str}] {msg}" + (f" (line {lineno})" if lineno else ""),
                             pg_code=sqlstate
                         )
                     )
@@ -197,9 +305,31 @@ def check_plpgsql_runtime_validity(
             except Exception:
                 pass
             err_msg = str(e).strip()
-            runtime_issues.append((obj_name, f"[check failure] {err_msg}"))
+            has_errors = True
+            runtime_issues.append((obj_name, f"[check exception] {err_msg}"))
+            validation_results.append(
+                ValidationResult(
+                    statement=SQLStatement(
+                        sql=f"-- plpgsql_check exception on {obj_name}",
+                        file_name="plpgsql_check",
+                        start_line=0,
+                        object_type=obj_type,
+                        object_name=obj_name
+                    ),
+                    success=False,
+                    error_message=f"[plpgsql_check exception] {err_msg}",
+                    pg_code=getattr(e, 'pgcode', 'CHECKER_EXCEPTION')
+                )
+            )
 
-    return validation_results, runtime_issues
+    if has_errors:
+        status = CHECK_ISSUES_FOUND
+    elif runtime_issues:
+        status = CHECK_ISSUES_FOUND
+    else:
+        status = CHECK_PASSED
+
+    return validation_results, runtime_issues, status
 
 
 def run_ddl_validation(
@@ -207,12 +337,13 @@ def run_ddl_validation(
     target_files: List[str],
     apply_changes: bool = False,
     allow_missing_files: bool = False,
-    allow_empty_files: bool = False
-) -> tuple[List[ValidationResult], List[tuple[str, str]]]:
+    allow_empty_files: bool = False,
+    require_checker: bool = False
+) -> tuple[List[ValidationResult], List[tuple[str, str]], str]:
     """
     Executes each statement in sequence inside a PostgreSQL transaction using SAVEPOINTS.
     In dry-run mode (default), the entire transaction is rolled back at the end.
-    Returns (results, runtime_issues).
+    Returns (results, runtime_issues, checker_status).
     """
     if getattr(conn, 'autocommit', False):
         conn.autocommit = False
@@ -288,12 +419,17 @@ def run_ddl_validation(
                     )
                 )
 
-        # Perform late-binding runtime verification with plpgsql_check if available
+        # Determine target objects for PL/pgSQL runtime verification
         created_objects = [
             r.statement.object_name for r in results
             if r.success and r.statement.object_type in ('FUNCTION', 'PROCEDURE', 'TRIGGER') and r.statement.object_name != 'UNKNOWN'
         ]
-        check_results, runtime_issues = check_plpgsql_runtime_validity(cursor, created_objects)
+
+        check_results, runtime_issues, checker_status = check_plpgsql_runtime_validity(
+            cursor,
+            function_names=created_objects,
+            require_checker=require_checker
+        )
         results.extend(check_results)
 
         if apply_changes:
@@ -308,7 +444,7 @@ def run_ddl_validation(
             conn.rollback()
             print("[INFO] Test completed. Rollback executed (no changes persisted to database).")
 
-        return results, runtime_issues
+        return results, runtime_issues, checker_status
     except Exception:
         try:
             conn.rollback()
@@ -324,7 +460,8 @@ def run_ddl_validation(
 
 def print_diagnostic_report(
     results: List[ValidationResult],
-    runtime_issues: Optional[List[Tuple[str, str]]] = None
+    runtime_issues: Optional[List[Tuple[str, str]]] = None,
+    checker_status: Optional[str] = None
 ) -> bool:
     """
     Formats and prints a comprehensive diagnostic report.
@@ -363,14 +500,28 @@ def print_diagnostic_report(
     total_rate = (len(passed) / total) * 100
     print(f"{'OVERALL TOTAL':<18} | {total:<8} | {len(passed):<10} | {len(failed):<8} | {total_rate:>6.1f}%")
 
-    if runtime_issues:
+    # Section for PL/pgSQL Runtime Checker status
+    if checker_status or runtime_issues:
         print("\n" + "=" * 80)
-        print(f"  PL/PGSQL RUNTIME CHECKER ISSUES ({len(runtime_issues)} DETECTED)")
+        print("  PL/PGSQL RUNTIME VERIFICATION (plpgsql_check)")
         print("=" * 80)
-        for idx, (obj_name, issue_msg) in enumerate(runtime_issues, 1):
-            print(f"\n[{idx}/{len(runtime_issues)}] ⚠️  Object: {obj_name}")
-            for line in issue_msg.splitlines():
-                print(f"    ▶ {line}")
+        if checker_status == CHECK_PASSED:
+            print("  Status: VERIFICADO SEM ERROS")
+            print("  All PL/pgSQL functions and triggers verified without query plan or semantic issues.")
+        elif checker_status == CHECK_ISSUES_FOUND:
+            print("  Status: PROBLEMAS ENCONTRADOS")
+            print(f"  {len(runtime_issues or [])} issue(s) detected during PL/pgSQL runtime checks.")
+        elif checker_status == CHECK_NOT_PERFORMED:
+            print("  Status: NÃO FOI POSSÍVEL VERIFICAR (VERIFICAÇÃO NÃO REALIZADA)")
+            print("  plpgsql_check extension is not available or catalog discovery failed.")
+        elif runtime_issues:
+            print(f"  Status: PROBLEMAS ENCONTRADOS ({len(runtime_issues)} issues)")
+
+        if runtime_issues:
+            for idx, (obj_name, issue_msg) in enumerate(runtime_issues, 1):
+                print(f"\n[{idx}/{len(runtime_issues)}] ⚠️  Object: {obj_name}")
+                for line in issue_msg.splitlines():
+                    print(f"    ▶ {line}")
 
     if failed:
         print("\n" + "=" * 80)
@@ -417,7 +568,8 @@ def validate_postgres_ddl(
     target_files: Optional[List[str]] = None,
     apply_changes: bool = False,
     allow_missing_files: bool = False,
-    allow_empty_files: bool = False
+    allow_empty_files: bool = False,
+    require_checker: bool = False
 ) -> bool:
     """
     Validates the generated PostgreSQL DDL files against a PostgreSQL instance.
@@ -442,13 +594,15 @@ def validate_postgres_ddl(
     committed = False
     results = []
     runtime_issues = []
+    checker_status = CHECK_NOT_PERFORMED
     try:
-        results, runtime_issues = run_ddl_validation(
+        results, runtime_issues, checker_status = run_ddl_validation(
             conn=pg_connection,
             target_files=target_files,
             apply_changes=apply_changes,
             allow_missing_files=allow_missing_files,
-            allow_empty_files=allow_empty_files
+            allow_empty_files=allow_empty_files,
+            require_checker=require_checker
         )
         committed = apply_changes and all(r.success for r in results)
     except Exception as e:
@@ -462,7 +616,7 @@ def validate_postgres_ddl(
                 pass
 
     try:
-        return print_diagnostic_report(results, runtime_issues=runtime_issues)
+        return print_diagnostic_report(results, runtime_issues=runtime_issues, checker_status=checker_status)
     except Exception as e:
         if committed:
             print(f"[ERROR] Failed to display diagnostic report: {e}. Note: changes WERE committed to the database.")
@@ -478,13 +632,15 @@ if __name__ == '__main__':
     parser.add_argument('--files', nargs='*', help="Target SQL files to validate.")
     parser.add_argument('--allow-missing', action='store_true', help="Allow missing target files without failing validation.")
     parser.add_argument('--allow-empty', action='store_true', help="Allow empty target files without failing validation.")
+    parser.add_argument('--require-checker', action='store_true', help="Require plpgsql_check validation to pass. Fails if extension is missing.")
     cli_args = parser.parse_args()
 
     success = validate_postgres_ddl(
         target_files=cli_args.files if cli_args.files else None,
         apply_changes=cli_args.apply,
         allow_missing_files=cli_args.allow_missing,
-        allow_empty_files=cli_args.allow_empty
+        allow_empty_files=cli_args.allow_empty,
+        require_checker=cli_args.require_checker
     )
     if not success:
         sys.exit(1)

@@ -203,18 +203,19 @@ class TestIntegrationExecution(unittest.TestCase):
         mock_cursor.fetchone.return_value = (1,)
         # 2. pg_proc query, 3. pg_trigger query, 4. plpgsql_check_function_tb query
         mock_cursor.fetchall.side_effect = [
-            [(12345, 'sp_broken_func', 'public')],  # pg_proc
-            [],                                     # pg_trigger
+            [(12345, 'sp_broken_func', 'public', '')],  # pg_proc (oid, proname, nspname, identity_args)
+            [],                                          # pg_trigger
             [("column 'bad_col' does not exist", 'error', '42703', 10, 'SELECT bad_col;')]  # check tb
         ]
 
-        val_results, issues = check_plpgsql_runtime_validity(mock_cursor, ['sp_broken_func'])
+        val_results, issues, status = check_plpgsql_runtime_validity(mock_cursor, ['sp_broken_func'])
         self.assertEqual(len(val_results), 1)
         self.assertFalse(val_results[0].success)
         self.assertEqual(val_results[0].statement.object_name, 'sp_broken_func')
         self.assertIn("column 'bad_col' does not exist", val_results[0].error_message)
         self.assertEqual(len(issues), 1)
         self.assertIn("column 'bad_col' does not exist", issues[0][1])
+        self.assertEqual(status, "ISSUES_FOUND")
 
     def test_check_plpgsql_runtime_validity_graceful_when_extension_absent(self):
         """
@@ -223,9 +224,11 @@ class TestIntegrationExecution(unittest.TestCase):
         mock_cursor = MagicMock()
         mock_cursor.fetchone.return_value = None  # Extension not found
 
-        val_results, issues = check_plpgsql_runtime_validity(mock_cursor, ['sp_any_func'])
+        val_results, issues, status = check_plpgsql_runtime_validity(mock_cursor, ['sp_any_func'])
         self.assertEqual(val_results, [])
-        self.assertEqual(issues, [])
+        self.assertEqual(len(issues), 1)
+        self.assertIn("verificação não realizada", issues[0][1])
+        self.assertEqual(status, "NOT_PERFORMED")
 
 
 if __name__ == '__main__':

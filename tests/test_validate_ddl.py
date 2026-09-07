@@ -72,7 +72,7 @@ class TestRunDdlValidation(unittest.TestCase):
 
             mock_cursor.execute.side_effect = execute_side_effect
 
-            results, _ = run_ddl_validation(mock_conn, [fpath], apply_changes=True)
+            results, *_ = run_ddl_validation(mock_conn, [fpath], apply_changes=True)
             self.assertEqual(len(results), 2)
             self.assertTrue(results[0].success)
             self.assertFalse(results[1].success)
@@ -97,7 +97,7 @@ class TestRunDdlValidation(unittest.TestCase):
             mock_cursor = MagicMock()
             mock_conn.cursor.return_value = mock_cursor
 
-            results, _ = run_ddl_validation(mock_conn, [fpath], apply_changes=True)
+            results, *_ = run_ddl_validation(mock_conn, [fpath], apply_changes=True)
             self.assertEqual(len(results), 2)
             self.assertTrue(all(r.success for r in results))
 
@@ -142,7 +142,7 @@ class TestRunDdlValidation(unittest.TestCase):
             mock_cursor = MagicMock()
             strict_conn = StrictConnection(mock_cursor)
 
-            results, runtime_issues = run_ddl_validation(strict_conn, [fpath], apply_changes=False)
+            results, runtime_issues, *_ = run_ddl_validation(strict_conn, [fpath], apply_changes=False)
             self.assertEqual(len(results), 1)
             self.assertTrue(results[0].success)
             self.assertTrue(strict_conn.rolled_back)
@@ -159,7 +159,7 @@ class TestRunDdlValidation(unittest.TestCase):
         from unittest.mock import MagicMock
         from validate_postgres_ddl import run_ddl_validation, print_diagnostic_report
         mock_conn = MagicMock()
-        results, _ = run_ddl_validation(mock_conn, ["/nonexistent/missing_dump.sql"])
+        results, *_ = run_ddl_validation(mock_conn, ["/nonexistent/missing_dump.sql"])
         self.assertEqual(len(results), 1)
         self.assertFalse(results[0].success)
         self.assertEqual(results[0].pg_code, "FILE_NOT_FOUND")
@@ -175,11 +175,107 @@ class TestRunDdlValidation(unittest.TestCase):
         self.addCleanup(os.remove, temp_path)
 
         mock_conn = MagicMock()
-        results, _ = run_ddl_validation(mock_conn, [temp_path], allow_empty_files=False)
+        results, *_ = run_ddl_validation(mock_conn, [temp_path], allow_empty_files=False)
         self.assertEqual(len(results), 1)
         self.assertFalse(results[0].success)
         self.assertEqual(results[0].pg_code, "FILE_EMPTY")
         self.assertFalse(print_diagnostic_report(results))
+
+
+class TestPlpgsqlCheckValidationUnit(unittest.TestCase):
+    def test_checker_exception_generates_failure_result_and_savepoint_rollback(self):
+        from unittest.mock import MagicMock
+        from validate_postgres_ddl import check_plpgsql_runtime_validity, CHECK_ISSUES_FOUND
+
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = (1,)
+        mock_cursor.fetchall.side_effect = [
+            [(101, 'sp_fn_crash', 'public', '')],
+            [],
+        ]
+
+        def execute_side_effect(sql, *args):
+            if 'plpgsql_check_function_tb' in str(sql):
+                raise RuntimeError("plpgsql_check internal error / cache lookup failed")
+
+        mock_cursor.execute.side_effect = execute_side_effect
+
+        val_results, issues, status = check_plpgsql_runtime_validity(mock_cursor, ['sp_fn_crash'])
+        self.assertEqual(len(val_results), 1)
+        self.assertFalse(val_results[0].success)
+        self.assertEqual(val_results[0].pg_code, 'CHECKER_EXCEPTION')
+        self.assertIn("plpgsql_check internal error", val_results[0].error_message)
+        self.assertEqual(status, CHECK_ISSUES_FOUND)
+        mock_cursor.execute.assert_any_call("ROLLBACK TO SAVEPOINT sp_plpgsql_check_1;")
+
+    def test_catalog_discovery_failure_does_not_equal_empty_list(self):
+        from unittest.mock import MagicMock
+        from validate_postgres_ddl import check_plpgsql_runtime_validity, CHECK_NOT_PERFORMED
+
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = (1,)
+
+        def execute_side_effect(sql, *args):
+            if 'FROM pg_proc p' in str(sql):
+                raise RuntimeError("permission denied for table pg_proc")
+
+        mock_cursor.execute.side_effect = execute_side_effect
+
+        val_results, issues, status = check_plpgsql_runtime_validity(mock_cursor)
+        self.assertEqual(len(val_results), 1)
+        self.assertFalse(val_results[0].success)
+        self.assertEqual(val_results[0].pg_code, 'CATALOG_DISCOVERY_FAILED')
+        self.assertIn("permission denied for table pg_proc", val_results[0].error_message)
+        self.assertEqual(status, CHECK_NOT_PERFORMED)
+        mock_cursor.execute.assert_any_call("ROLLBACK TO SAVEPOINT sp_discover_funcs;")
+
+    def test_missing_extension_reports_not_performed_and_blocks_if_required(self):
+        from unittest.mock import MagicMock
+        from validate_postgres_ddl import check_plpgsql_runtime_validity, CHECK_NOT_PERFORMED
+
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = None  # Extension missing
+
+        # Case 1: require_checker = False
+        val_results, issues, status = check_plpgsql_runtime_validity(mock_cursor, require_checker=False)
+        self.assertEqual(val_results, [])
+        self.assertEqual(status, CHECK_NOT_PERFORMED)
+        self.assertEqual(len(issues), 1)
+        self.assertIn("verificação não realizada", issues[0][1])
+
+        # Case 2: require_checker = True
+        val_results, issues, status = check_plpgsql_runtime_validity(mock_cursor, require_checker=True)
+        self.assertEqual(len(val_results), 1)
+        self.assertFalse(val_results[0].success)
+        self.assertEqual(val_results[0].pg_code, "CHECKER_REQUIRED")
+        self.assertEqual(status, CHECK_NOT_PERFORMED)
+
+    def test_two_objects_first_failing_preserves_transaction_and_checks_second(self):
+        from unittest.mock import MagicMock
+        from validate_postgres_ddl import check_plpgsql_runtime_validity, CHECK_ISSUES_FOUND
+
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = (1,)
+        mock_cursor.fetchall.side_effect = [
+            [(101, 'fn_bad', 'public', ''), (102, 'fn_good', 'public', '')],
+            [],  # triggers
+            [],  # fn_good check returns []
+        ]
+
+        def execute_side_effect(sql, *args):
+            if 'plpgsql_check_function_tb' in str(sql):
+                if args and len(args[0]) >= 1 and args[0][0] == 101:
+                    raise RuntimeError("Error checking fn_bad")
+
+        mock_cursor.execute.side_effect = execute_side_effect
+
+        val_results, issues, status = check_plpgsql_runtime_validity(mock_cursor)
+        self.assertEqual(len(val_results), 1)
+        self.assertFalse(val_results[0].success)
+        self.assertEqual(val_results[0].statement.object_name, 'fn_bad')
+        self.assertEqual(status, CHECK_ISSUES_FOUND)
+        mock_cursor.execute.assert_any_call("ROLLBACK TO SAVEPOINT sp_plpgsql_check_1;")
+        mock_cursor.execute.assert_any_call("SAVEPOINT sp_plpgsql_check_2;")
 
 
 def check_live_postgres_available() -> bool:
@@ -199,6 +295,60 @@ def check_live_postgres_available() -> bool:
 HAS_REAL_PG = check_live_postgres_available()
 
 
+class DbCursorProxy:
+    def __init__(self, real_cur, execute_hook=None, fetchone_hook=None):
+        self._cur = real_cur
+        self._execute_hook = execute_hook
+        self._fetchone_hook = fetchone_hook
+
+    def execute(self, sql, params=None):
+        if self._execute_hook:
+            return self._execute_hook(self._cur, sql, params)
+        return self._cur.execute(sql, params) if params is not None else self._cur.execute(sql)
+
+    def fetchone(self):
+        if self._fetchone_hook:
+            return self._fetchone_hook(self._cur)
+        return self._cur.fetchone()
+
+    def fetchall(self):
+        return self._cur.fetchall()
+
+    def close(self):
+        return self._cur.close()
+
+
+class DbConnProxy:
+    def __init__(self, real_conn, cursor_factory):
+        self._conn = real_conn
+        self._cursor_factory = cursor_factory
+
+    def cursor(self, *args, **kwargs):
+        real_cur = self._conn.cursor(*args, **kwargs)
+        return self._cursor_factory(real_cur)
+
+    def commit(self):
+        return self._conn.commit()
+
+    def rollback(self):
+        return self._conn.rollback()
+
+    def close(self):
+        return self._conn.close()
+
+    @property
+    def closed(self):
+        return self._conn.closed
+
+    @property
+    def autocommit(self):
+        return self._conn.autocommit
+
+    @autocommit.setter
+    def autocommit(self, val):
+        self._conn.autocommit = val
+
+
 @unittest.skipUnless(HAS_REAL_PG, "Live PostgreSQL instance required for full regression tests")
 class TestValidatePostgresDdlRegression(unittest.TestCase):
     """
@@ -215,6 +365,7 @@ class TestValidatePostgresDdlRegression(unittest.TestCase):
         cur = self.conn.cursor()
         cur.execute(f"DROP SCHEMA IF EXISTS {self.schema_name} CASCADE;")
         cur.execute(f"CREATE SCHEMA {self.schema_name};")
+        cur.execute("CREATE EXTENSION IF NOT EXISTS plpgsql_check;")
         cur.execute(f"SET search_path TO {self.schema_name}, public;")
         self.conn.commit()
 
@@ -348,6 +499,209 @@ class TestValidatePostgresDdlRegression(unittest.TestCase):
             # Must accurately indicate changes WERE committed, not that a rollback occurred
             self.assertIn("changes WERE committed", output_str)
             self.assertNotIn("rolled back all changes", output_str)
+
+    def test_function_with_nonexistent_column_fails_validation_and_blocks_commit(self):
+        import tempfile, os
+        from validate_postgres_ddl import validate_postgres_ddl
+
+        with tempfile.NamedTemporaryFile("w+", suffix=".sql", delete=False) as f:
+            f.write(
+                "CREATE TABLE reg_tbl_bad (id INT PRIMARY KEY, name VARCHAR(50));\n"
+                "CREATE FUNCTION reg_fn_broken() RETURNS void AS $$\n"
+                "BEGIN\n"
+                "    SELECT non_existent_col FROM reg_tbl_bad;\n"
+                "END;\n"
+                "$$ LANGUAGE plpgsql;\n"
+            )
+            fpath = f.name
+        self.addCleanup(os.remove, fpath)
+
+        success = validate_postgres_ddl(
+            pg_connection=self.conn,
+            target_files=[fpath],
+            apply_changes=True
+        )
+        self.assertFalse(success)
+        self.assertFalse(self.conn.closed)
+
+        # Confirm rollback: neither table nor function were persisted
+        cur = self.conn.cursor()
+        cur.execute(
+            f"SELECT 1 FROM information_schema.tables "
+            f"WHERE table_schema = '{self.schema_name}' AND table_name = 'reg_tbl_bad';"
+        )
+        self.assertIsNone(cur.fetchone())
+
+    def test_two_objects_first_failing_preserves_transaction_for_second_diagnostic(self):
+        import tempfile, os
+        from validate_postgres_ddl import run_ddl_validation, CHECK_ISSUES_FOUND
+
+        with tempfile.NamedTemporaryFile("w+", suffix=".sql", delete=False) as f:
+            f.write(
+                "CREATE TABLE reg_two_tbl (id INT PRIMARY KEY);\n"
+                "CREATE FUNCTION reg_two_bad1() RETURNS void AS $$\n"
+                "BEGIN\n"
+                "    SELECT bad_c1 FROM reg_two_tbl;\n"
+                "END;\n"
+                "$$ LANGUAGE plpgsql;\n"
+                "CREATE FUNCTION reg_two_bad2() RETURNS void AS $$\n"
+                "BEGIN\n"
+                "    SELECT bad_c2 FROM reg_two_tbl;\n"
+                "END;\n"
+                "$$ LANGUAGE plpgsql;\n"
+            )
+            fpath = f.name
+        self.addCleanup(os.remove, fpath)
+
+        results, runtime_issues, status = run_ddl_validation(
+            conn=self.conn,
+            target_files=[fpath],
+            apply_changes=False
+        )
+        self.assertEqual(status, CHECK_ISSUES_FOUND)
+        failed_names = [r.statement.object_name for r in results if not r.success]
+        self.assertIn("reg_two_bad1", failed_names)
+        self.assertIn("reg_two_bad2", failed_names)
+        self.assertTrue(len(runtime_issues) >= 2)
+
+    def test_overloaded_functions_checked_by_distinct_oids(self):
+        import tempfile, os
+        from validate_postgres_ddl import run_ddl_validation, CHECK_ISSUES_FOUND
+
+        with tempfile.NamedTemporaryFile("w+", suffix=".sql", delete=False) as f:
+            f.write(
+                "CREATE TABLE reg_ovl_tbl (id INT PRIMARY KEY);\n"
+                "CREATE FUNCTION reg_ovl(a int) RETURNS int AS $$\n"
+                "BEGIN\n"
+                "    RETURN a + 1;\n"
+                "END;\n"
+                "$$ LANGUAGE plpgsql;\n"
+                "CREATE FUNCTION reg_ovl(a text) RETURNS text AS $$\n"
+                "BEGIN\n"
+                "    SELECT bad_col_in_ovl FROM reg_ovl_tbl;\n"
+                "    RETURN a;\n"
+                "END;\n"
+                "$$ LANGUAGE plpgsql;\n"
+            )
+            fpath = f.name
+        self.addCleanup(os.remove, fpath)
+
+        results, runtime_issues, status = run_ddl_validation(
+            conn=self.conn,
+            target_files=[fpath],
+            apply_changes=False
+        )
+        self.assertEqual(status, CHECK_ISSUES_FOUND)
+        failed_msgs = " ".join(r.error_message for r in results if not r.success)
+        self.assertIn("bad_col_in_ovl", failed_msgs)
+
+    def test_trigger_dependent_on_new_validates_against_table_columns(self):
+        import tempfile, os
+        from validate_postgres_ddl import validate_postgres_ddl
+
+        with tempfile.NamedTemporaryFile("w+", suffix=".sql", delete=False) as f:
+            f.write(
+                "CREATE TABLE reg_trg_tbl (id INT PRIMARY KEY, val VARCHAR(50));\n"
+                "CREATE OR REPLACE FUNCTION reg_trg_fn() RETURNS trigger AS $$\n"
+                "BEGIN\n"
+                "    NEW.invalid_column_on_table = 'bad';\n"
+                "    RETURN NEW;\n"
+                "END;\n"
+                "$$ LANGUAGE plpgsql;\n"
+                "CREATE TRIGGER reg_trg_obj BEFORE INSERT ON reg_trg_tbl FOR EACH ROW EXECUTE FUNCTION reg_trg_fn();\n"
+            )
+            fpath = f.name
+        self.addCleanup(os.remove, fpath)
+
+        success = validate_postgres_ddl(
+            pg_connection=self.conn,
+            target_files=[fpath],
+            apply_changes=True
+        )
+        self.assertFalse(success)
+        # Commit must be blocked, table must not exist
+        cur = self.conn.cursor()
+        cur.execute(
+            f"SELECT 1 FROM information_schema.tables "
+            f"WHERE table_schema = '{self.schema_name}' AND table_name = 'reg_trg_tbl';"
+        )
+        self.assertIsNone(cur.fetchone())
+
+    def test_checker_exception_blocks_commit_in_apply_mode(self):
+        import tempfile, os
+        from unittest.mock import patch
+        from validate_postgres_ddl import validate_postgres_ddl
+
+        with tempfile.NamedTemporaryFile("w+", suffix=".sql", delete=False) as f:
+            f.write(
+                "CREATE TABLE reg_tbl_exc (id INT PRIMARY KEY);\n"
+                "CREATE FUNCTION reg_fn_exc() RETURNS void AS $$\n"
+                "BEGIN\n"
+                "    NULL;\n"
+                "END;\n"
+                "$$ LANGUAGE plpgsql;\n"
+            )
+            fpath = f.name
+        self.addCleanup(os.remove, fpath)
+
+        def execute_hook(real_cur, sql, params):
+            if 'plpgsql_check_function_tb' in str(sql):
+                raise RuntimeError("Simulated checker runtime exception")
+            return real_cur.execute(sql, params) if params is not None else real_cur.execute(sql)
+
+        proxy_conn = DbConnProxy(self.conn, lambda cur: DbCursorProxy(cur, execute_hook=execute_hook))
+        success = validate_postgres_ddl(
+            pg_connection=proxy_conn,
+            target_files=[fpath],
+            apply_changes=True
+        )
+        self.assertFalse(success)
+
+        # Must not have been persisted
+        cur = self.conn.cursor()
+        cur.execute(
+            f"SELECT 1 FROM information_schema.tables "
+            f"WHERE table_schema = '{self.schema_name}' AND table_name = 'reg_tbl_exc';"
+        )
+        self.assertIsNone(cur.fetchone())
+
+    def test_missing_extension_reports_not_performed_and_blocks_if_required(self):
+        import tempfile, os
+        from validate_postgres_ddl import validate_postgres_ddl
+
+        with tempfile.NamedTemporaryFile("w+", suffix=".sql", delete=False) as f:
+            f.write("CREATE TABLE reg_tbl_req (id INT PRIMARY KEY);\n")
+            fpath = f.name
+        self.addCleanup(os.remove, fpath)
+
+        def make_cur(real_cur):
+            last_sql = {"val": ""}
+            def exec_hook(c, sql, params):
+                last_sql["val"] = str(sql)
+                return c.execute(sql, params) if params is not None else c.execute(sql)
+            def fetchone_hook(c):
+                if 'pg_extension' in last_sql["val"]:
+                    return None
+                return c.fetchone()
+            return DbCursorProxy(real_cur, execute_hook=exec_hook, fetchone_hook=fetchone_hook)
+
+        proxy_conn = DbConnProxy(self.conn, make_cur)
+
+        # When require_checker is True, missing extension MUST block commit
+        success_req = validate_postgres_ddl(
+            pg_connection=proxy_conn,
+            target_files=[fpath],
+            apply_changes=True,
+            require_checker=True
+        )
+        self.assertFalse(success_req)
+
+        cur = self.conn.cursor()
+        cur.execute(
+            f"SELECT 1 FROM information_schema.tables "
+            f"WHERE table_schema = '{self.schema_name}' AND table_name = 'reg_tbl_req';"
+        )
+        self.assertIsNone(cur.fetchone())
 
 
 if __name__ == '__main__':
