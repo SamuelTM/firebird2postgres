@@ -299,32 +299,61 @@ class SchemaExtractor:
         Extracts user-defined secondary indexes for a given table (excluding PK/UQ indexes),
         supporting both standard column-segment indexes and expression-based indexes (COMPUTED BY).
         """
-        cursor.execute("""
-            SELECT 
-                i.RDB$INDEX_NAME AS index_name,
-                i.RDB$UNIQUE_FLAG AS is_unique,
-                i.RDB$INDEX_INACTIVE AS is_inactive,
-                seg.RDB$FIELD_NAME AS column_name,
-                seg.RDB$FIELD_POSITION AS column_position,
-                i.RDB$EXPRESSION_SOURCE AS expression_source
-            FROM RDB$INDICES i
-            LEFT JOIN RDB$INDEX_SEGMENTS seg ON i.RDB$INDEX_NAME = seg.RDB$INDEX_NAME
-            WHERE i.RDB$RELATION_NAME = ?
-              AND i.RDB$INDEX_NAME NOT IN (
-                  SELECT RDB$INDEX_NAME 
-                  FROM RDB$RELATION_CONSTRAINTS 
-                  WHERE RDB$CONSTRAINT_TYPE IN ('PRIMARY KEY', 'UNIQUE') 
-                    AND RDB$INDEX_NAME IS NOT NULL
-              )
-            ORDER BY i.RDB$INDEX_NAME, seg.RDB$FIELD_POSITION;
-        """, (table_name,))
+        try:
+            cursor.execute("""
+                SELECT 
+                    i.RDB$INDEX_NAME AS index_name,
+                    i.RDB$UNIQUE_FLAG AS is_unique,
+                    i.RDB$INDEX_INACTIVE AS is_inactive,
+                    seg.RDB$FIELD_NAME AS column_name,
+                    seg.RDB$FIELD_POSITION AS column_position,
+                    i.RDB$EXPRESSION_SOURCE AS expression_source,
+                    i.RDB$CONDITION_SOURCE AS condition_source
+                FROM RDB$INDICES i
+                LEFT JOIN RDB$INDEX_SEGMENTS seg ON i.RDB$INDEX_NAME = seg.RDB$INDEX_NAME
+                WHERE i.RDB$RELATION_NAME = ?
+                  AND i.RDB$INDEX_NAME NOT IN (
+                      SELECT RDB$INDEX_NAME 
+                      FROM RDB$RELATION_CONSTRAINTS 
+                      WHERE RDB$CONSTRAINT_TYPE IN ('PRIMARY KEY', 'UNIQUE') 
+                        AND RDB$INDEX_NAME IS NOT NULL
+                  )
+                ORDER BY i.RDB$INDEX_NAME, seg.RDB$FIELD_POSITION;
+            """, (table_name,))
+            rows = cursor.fetchall()
+        except Exception:
+            cursor.execute("""
+                SELECT 
+                    i.RDB$INDEX_NAME AS index_name,
+                    i.RDB$UNIQUE_FLAG AS is_unique,
+                    i.RDB$INDEX_INACTIVE AS is_inactive,
+                    seg.RDB$FIELD_NAME AS column_name,
+                    seg.RDB$FIELD_POSITION AS column_position,
+                    i.RDB$EXPRESSION_SOURCE AS expression_source
+                FROM RDB$INDICES i
+                LEFT JOIN RDB$INDEX_SEGMENTS seg ON i.RDB$INDEX_NAME = seg.RDB$INDEX_NAME
+                WHERE i.RDB$RELATION_NAME = ?
+                  AND i.RDB$INDEX_NAME NOT IN (
+                      SELECT RDB$INDEX_NAME 
+                      FROM RDB$RELATION_CONSTRAINTS 
+                      WHERE RDB$CONSTRAINT_TYPE IN ('PRIMARY KEY', 'UNIQUE') 
+                        AND RDB$INDEX_NAME IS NOT NULL
+                  )
+                ORDER BY i.RDB$INDEX_NAME, seg.RDB$FIELD_POSITION;
+            """, (table_name,))
+            rows = cursor.fetchall()
+
         indexes = []
-        for row in cursor.fetchall():
+        for row in rows:
             raw_expr = row[5]
             expr_str = raw_expr.strip() if raw_expr else None
             if expr_str:
                 expr_str = FirebirdToPostgresVisitor.transpile_expression(expr_str, symbols=symbols)
                 validate_immutable_expression(expr_str, f"expression index '{row[0].strip()}' in table '{table_name}'")
+            raw_cond = row[6] if len(row) > 6 else None
+            cond_str = raw_cond.strip() if raw_cond else None
+            if cond_str:
+                cond_str = FirebirdToPostgresVisitor.transpile_expression(cond_str, symbols=symbols)
             col_name = row[3].strip() if row[3] else None
             indexes.append(
                 Index(
@@ -334,6 +363,7 @@ class SchemaExtractor:
                     column_name=col_name,
                     column_index=row[4] if row[4] is not None else 0,
                     expression=expr_str,
+                    condition=cond_str,
                 )
             )
         return indexes

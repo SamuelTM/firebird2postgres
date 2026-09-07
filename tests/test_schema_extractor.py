@@ -437,6 +437,17 @@ class TestSchemaExtractorSequenceBinding(unittest.TestCase):
         self.assertEqual(seqs[0].current_value, 100)
         self.assertEqual(seqs[0].increment, 5)
 
+    def test_extract_partial_index(self):
+        mock_cursor = MagicMock()
+        # Row format: index_name, is_unique, is_inactive, column_name, column_position, expression_source, condition_source
+        mock_cursor.fetchall.return_value = [
+            ("IDX_PARTIAL", 1, 0, "EMAIL", 0, None, "ACTIVE = 1")
+        ]
+        indexes = SchemaExtractor._extract_indexes(mock_cursor, "USERS")
+        self.assertEqual(len(indexes), 1)
+        self.assertEqual(indexes[0].condition, "ACTIVE = 1")
+        self.assertTrue(indexes[0].unique)
+
 
 if __name__ == '__main__':
     unittest.main()

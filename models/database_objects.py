@@ -47,7 +47,8 @@ class UniqueKey:
 
 class Index:
     def __init__(self, index_name: str, unique: bool, inactive: bool,
-                 column_name: str = None, column_index: int = 0, expression: str = None):
+                 column_name: str = None, column_index: int = 0, expression: str = None,
+                 condition: str = None):
         # PostgreSQL-side only identifiers, normalized to lowercase
         self.column_index = column_index
         self.column_name = column_name.lower() if column_name else None
@@ -55,6 +56,7 @@ class Index:
         self.unique = unique
         self.index_name = index_name.lower()
         self.expression = expression.strip() if expression else None
+        self.condition = condition.strip() if condition else None
 
 
 class CheckConstraint:
@@ -279,10 +281,15 @@ class Table:
 
             if first_idx.expression:
                 expr = first_idx.expression.strip()
-                query += f'(({expr}));'
+                query += f'(({expr}))'
             else:
                 column_names = ', '.join([pg_quote_ident(idx.column_name) for idx in indexes_grouped_by_name[index_name] if idx.column_name])
-                query += f'({column_names});'
+                query += f'({column_names})'
+
+            if first_idx.condition:
+                query += f' WHERE {first_idx.condition}'
+
+            query += ';'
 
             queries.append(query)
 

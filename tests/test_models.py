@@ -377,6 +377,21 @@ class TestTableDdlGenerators(unittest.TestCase):
         self.assertIn('CREATE UNIQUE INDEX "uk_clientes_doc_clean" ON "clientes" ((TRIM(CNPJ)));', idx_queries)
         self.assertIn('CREATE INDEX "idx_str_concat" ON "clientes" (((\'(\') || (\')\')));', idx_queries)
 
+    def test_partial_index_generation(self):
+        table = Table('USERS')
+        table.indexes.append(
+            Index(
+                index_name='IDX_USERS_ACTIVE_EMAIL',
+                unique=True,
+                inactive=False,
+                column_name='EMAIL',
+                condition='active = 1'
+            )
+        )
+        queries = table.get_index_queries()
+        self.assertEqual(len(queries), 1)
+        self.assertIn('CREATE UNIQUE INDEX "idx_users_active_email" ON "users" ("email") WHERE active = 1;', queries)
+
 
 class TestSequenceModel(unittest.TestCase):
     def test_sequence_creation_queries(self):
