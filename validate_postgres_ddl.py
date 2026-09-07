@@ -101,30 +101,103 @@ def identify_object(sql_text: str) -> Tuple[str, str]:
     return 'OTHER', 'UNKNOWN'
 
 
-def check_plpgsql_runtime_validity(cursor, function_names: List[str]) -> List[tuple[str, str]]:
+def check_plpgsql_runtime_validity(
+    cursor,
+    function_names: Optional[List[str]] = None
+) -> tuple[List[ValidationResult], List[tuple[str, str]]]:
     """
-    Checks PL/pgSQL functions for runtime query planning and column/type errors using plpgsql_check if installed.
-    Because PostgreSQL defers inner query validation until runtime execution (late binding), CREATE FUNCTION
-    succeeds even if internal statements reference non-existent columns or incompatible types.
+    Checks PL/pgSQL functions and triggers for runtime syntax and column/type errors
+    using plpgsql_check_function_tb with proper OIDs and trigger relation IDs.
+    Wraps each check in a SAVEPOINT to preserve transaction state on check failure.
+    Returns (validation_results, runtime_issues).
     """
-    issues = []
-    if not function_names:
-        return issues
+    validation_results: List[ValidationResult] = []
+    runtime_issues: List[tuple[str, str]] = []
+
     try:
         cursor.execute("SELECT 1 FROM pg_extension WHERE extname = 'plpgsql_check';")
         if not cursor.fetchone():
-            return issues
-        for fn in function_names:
+            return validation_results, runtime_issues
+    except Exception:
+        return validation_results, runtime_issues
+
+    filter_names = set(n.lower() for n in function_names) if function_names else None
+
+    # 1. Inspect regular functions & procedures
+    try:
+        cursor.execute("""
+            SELECT p.oid, p.proname, n.nspname
+            FROM pg_proc p
+            JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname = 'public'
+              AND p.prolang = (SELECT oid FROM pg_language WHERE lanname = 'plpgsql')
+              AND p.prorettype <> (SELECT oid FROM pg_type WHERE typname = 'trigger');
+        """)
+        regular_funcs = cursor.fetchall()
+    except Exception:
+        regular_funcs = []
+
+    # 2. Inspect trigger functions with their target relation IDs
+    try:
+        cursor.execute("""
+            SELECT t.tgfoid, p.proname, t.tgrelid, c.relname, t.tgname
+            FROM pg_trigger t
+            JOIN pg_proc p ON p.oid = t.tgfoid
+            JOIN pg_class c ON c.oid = t.tgrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = 'public' AND NOT t.tgisinternal;
+        """)
+        triggers = cursor.fetchall()
+    except Exception:
+        triggers = []
+
+    check_targets = []
+    for fn_oid, fn_name, nsp in regular_funcs:
+        if filter_names is None or fn_name.lower() in filter_names:
+            check_targets.append((fn_oid, 0, fn_name, 'FUNCTION'))
+
+    for tg_foid, fn_name, tg_relid, rel_name, tg_name in triggers:
+        if filter_names is None or fn_name.lower() in filter_names or tg_name.lower() in filter_names:
+            check_targets.append((tg_foid, tg_relid, f"{tg_name} on {rel_name}", 'TRIGGER'))
+
+    for idx, (f_oid, r_oid, obj_name, obj_type) in enumerate(check_targets, 1):
+        sp_name = f"sp_plpgsql_check_{idx}"
+        try:
+            cursor.execute(f"SAVEPOINT {sp_name};")
+            cursor.execute(
+                "SELECT message, level, sqlstate, lineno, statement FROM plpgsql_check_function_tb(%s, %s);",
+                (f_oid, r_oid)
+            )
+            rows = cursor.fetchall()
+            cursor.execute(f"RELEASE SAVEPOINT {sp_name};")
+
+            for msg, level, sqlstate, lineno, stmt_text in rows:
+                desc = f"[{level}] {msg} (line {lineno})" if lineno else f"[{level}] {msg}"
+                runtime_issues.append((obj_name, desc))
+                if str(level).lower() == 'error':
+                    validation_results.append(
+                        ValidationResult(
+                            statement=SQLStatement(
+                                sql=stmt_text or f"-- plpgsql_check {obj_name}",
+                                file_name="plpgsql_check",
+                                start_line=lineno or 0,
+                                object_type=obj_type,
+                                object_name=obj_name
+                            ),
+                            success=False,
+                            error_message=f"[plpgsql_check error] {msg} (line {lineno})",
+                            pg_code=sqlstate
+                        )
+                    )
+        except Exception as e:
             try:
-                cursor.execute(f"SELECT message FROM plpgsql_check_function('{fn}()');")
-                for row in cursor.fetchall():
-                    if row and row[0]:
-                        issues.append((fn, row[0]))
+                cursor.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
             except Exception:
                 pass
-    except Exception:
-        pass
-    return issues
+            err_msg = str(e).strip()
+            runtime_issues.append((obj_name, f"[check failure] {err_msg}"))
+
+    return validation_results, runtime_issues
 
 
 def run_ddl_validation(
@@ -173,11 +246,12 @@ def run_ddl_validation(
                 )
 
         # Perform late-binding runtime verification with plpgsql_check if available
-        created_functions = [
+        created_objects = [
             r.statement.object_name for r in results
-            if r.success and r.statement.object_type in ('FUNCTION', 'PROCEDURE') and r.statement.object_name != 'UNKNOWN'
+            if r.success and r.statement.object_type in ('FUNCTION', 'PROCEDURE', 'TRIGGER') and r.statement.object_name != 'UNKNOWN'
         ]
-        runtime_issues = check_plpgsql_runtime_validity(cursor, created_functions)
+        check_results, runtime_issues = check_plpgsql_runtime_validity(cursor, created_objects)
+        results.extend(check_results)
 
         if apply_changes:
             failed_count = sum(1 for r in results if not r.success)

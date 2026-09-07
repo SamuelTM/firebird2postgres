@@ -74,27 +74,35 @@ class TestIntegrationExecution(unittest.TestCase):
 
     def test_check_plpgsql_runtime_validity_finds_warnings(self):
         """
-        Tests that check_plpgsql_runtime_validity inspects functions when plpgsql_check is present.
+        Tests that check_plpgsql_runtime_validity inspects functions with OIDs and generates ValidationResult failures when plpgsql_check reports errors.
         """
         mock_cursor = MagicMock()
-        # 1. plpgsql_check extension exists
-        # 2. check_function returns a warning
+        # 1. plpgsql_check extension check
         mock_cursor.fetchone.return_value = (1,)
-        mock_cursor.fetchall.return_value = [("error:42703:column 'bad_col' does not exist",)]
+        # 2. pg_proc query, 3. pg_trigger query, 4. plpgsql_check_function_tb query
+        mock_cursor.fetchall.side_effect = [
+            [(12345, 'sp_broken_func', 'public')],  # pg_proc
+            [],                                     # pg_trigger
+            [("column 'bad_col' does not exist", 'error', '42703', 10, 'SELECT bad_col;')]  # check tb
+        ]
 
-        issues = check_plpgsql_runtime_validity(mock_cursor, ['sp_broken_func'])
+        val_results, issues = check_plpgsql_runtime_validity(mock_cursor, ['sp_broken_func'])
+        self.assertEqual(len(val_results), 1)
+        self.assertFalse(val_results[0].success)
+        self.assertEqual(val_results[0].statement.object_name, 'sp_broken_func')
+        self.assertIn("column 'bad_col' does not exist", val_results[0].error_message)
         self.assertEqual(len(issues), 1)
-        self.assertEqual(issues[0][0], 'sp_broken_func')
         self.assertIn("column 'bad_col' does not exist", issues[0][1])
 
     def test_check_plpgsql_runtime_validity_graceful_when_extension_absent(self):
         """
-        Tests that check_plpgsql_runtime_validity returns empty list when plpgsql_check is not installed.
+        Tests that check_plpgsql_runtime_validity returns empty lists when plpgsql_check is not installed.
         """
         mock_cursor = MagicMock()
         mock_cursor.fetchone.return_value = None  # Extension not found
 
-        issues = check_plpgsql_runtime_validity(mock_cursor, ['sp_any_func'])
+        val_results, issues = check_plpgsql_runtime_validity(mock_cursor, ['sp_any_func'])
+        self.assertEqual(val_results, [])
         self.assertEqual(issues, [])
 
 
