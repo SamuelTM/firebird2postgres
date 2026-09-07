@@ -233,6 +233,27 @@ class TestDdlExporterViews(unittest.TestCase):
         self.assertIn("END $body$;", pg_ddl)
         self.assertNotIn("DO $$", pg_ddl)
 
+    def test_inventory_unsupported_objects(self):
+        mock_con = MagicMock()
+        mock_cur = MagicMock()
+        mock_con.cursor.return_value = mock_cur
+
+        # Side effects for the 5 queries: functions, packages, exceptions, db triggers, roles
+        mock_cur.fetchall.side_effect = [
+            [("FN_CUSTOM",)],
+            [("PKG_SALES",)],
+            [("EXC_INVALID_DOC",)],
+            [("TRG_ON_CONNECT",)],
+            [("ROLE_ADMIN",)],
+        ]
+        exporter = DdlExporter(mock_con)
+        inventory = exporter.inventory_unsupported_objects()
+        self.assertEqual(inventory['FUNCTIONS'], ['FN_CUSTOM'])
+        self.assertEqual(inventory['PACKAGES'], ['PKG_SALES'])
+        self.assertEqual(inventory['EXCEPTIONS'], ['EXC_INVALID_DOC'])
+        self.assertEqual(inventory['DATABASE_TRIGGERS'], ['TRG_ON_CONNECT'])
+        self.assertEqual(inventory['ROLES'], ['ROLE_ADMIN'])
+
 
 if __name__ == '__main__':
     unittest.main()

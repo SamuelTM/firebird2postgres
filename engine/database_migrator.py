@@ -118,6 +118,12 @@ class DatabaseMigrator:
         """
         self.ddl_exporter.export_all_firebird_ddl(output_dir=output_dir)
 
+    def inventory_unsupported_objects(self) -> dict[str, list[str]]:
+        """
+        Returns an inventory of Firebird objects requiring manual migration.
+        """
+        return self.ddl_exporter.inventory_unsupported_objects()
+
     def apply_sql_file(self, file_path: str, continue_on_error: bool = False) -> int:
         """
         Executes a PostgreSQL SQL file against the connected database.

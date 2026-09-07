@@ -413,13 +413,115 @@ class DdlExporter:
         col_list = f" ({', '.join(col_names)})" if col_names else ""
         return f'CREATE OR ALTER VIEW "{view_name}"{col_list} AS\n{source}\n\n'
 
+    def inventory_unsupported_objects(self) -> dict[str, list[str]]:
+        """
+        Scans the Firebird database for objects that are not automatically transpiled
+        (functions/UDFs, packages, exceptions, database triggers, roles) and returns
+        a dictionary mapping object categories to lists of object names.
+        """
+        cursor = self.fb_con.cursor()
+        unsupported: dict[str, list[str]] = {}
+
+        # 1. Functions / UDFs
+        try:
+            cursor.execute("""
+                SELECT RDB$FUNCTION_NAME
+                FROM RDB$FUNCTIONS
+                WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
+                ORDER BY RDB$FUNCTION_NAME;
+            """)
+            funcs = [r[0].strip() for r in cursor.fetchall() if r[0]]
+            if funcs:
+                unsupported['FUNCTIONS'] = funcs
+        except Exception:
+            pass
+
+        # 2. Packages (FB 3.0+)
+        try:
+            cursor.execute("""
+                SELECT RDB$PACKAGE_NAME
+                FROM RDB$PACKAGES
+                WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
+                ORDER BY RDB$PACKAGE_NAME;
+            """)
+            pkgs = [r[0].strip() for r in cursor.fetchall() if r[0]]
+            if pkgs:
+                unsupported['PACKAGES'] = pkgs
+        except Exception:
+            pass
+
+        # 3. Exceptions
+        try:
+            cursor.execute("""
+                SELECT RDB$EXCEPTION_NAME
+                FROM RDB$EXCEPTIONS
+                WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
+                ORDER BY RDB$EXCEPTION_NAME;
+            """)
+            exc = [r[0].strip() for r in cursor.fetchall() if r[0]]
+            if exc:
+                unsupported['EXCEPTIONS'] = exc
+        except Exception:
+            pass
+
+        # 4. Database-level triggers (non-table triggers)
+        try:
+            cursor.execute("""
+                SELECT RDB$TRIGGER_NAME
+                FROM RDB$TRIGGERS
+                WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
+                  AND (RDB$RELATION_NAME IS NULL OR RDB$TRIGGER_TYPE > 8192)
+                ORDER BY RDB$TRIGGER_NAME;
+            """)
+            db_trgs = [r[0].strip() for r in cursor.fetchall() if r[0]]
+            if db_trgs:
+                unsupported['DATABASE_TRIGGERS'] = db_trgs
+        except Exception:
+            pass
+
+        # 5. Roles
+        try:
+            cursor.execute("""
+                SELECT RDB$ROLE_NAME
+                FROM RDB$ROLES
+                WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
+                  AND RDB$ROLE_NAME NOT STARTING WITH 'RDB$'
+                ORDER BY RDB$ROLE_NAME;
+            """)
+            roles = [r[0].strip() for r in cursor.fetchall() if r[0]]
+            if roles:
+                unsupported['ROLES'] = roles
+        except Exception:
+            pass
+
+        if unsupported:
+            for cat, items in unsupported.items():
+                logger.warning(
+                    f"Found {len(items)} {cat.lower()} in Firebird requiring manual review/migration: "
+                    f"{', '.join(items[:10])}{'...' if len(items) > 10 else ''}"
+                )
+        return unsupported
+
     def export_all_firebird_ddl(self, output_dir: str = None):
         """
         Exports all Firebird domains, triggers, procedures, and views using a single shared
         ProcessPoolExecutor, saving all dump files to the specified output directory.
+        Also scans and logs an inventory of database objects that require manual migration.
         """
         target_dir = output_dir or DUMP_DIR
         os.makedirs(target_dir, exist_ok=True)
+
+        # Inventory untranspiled/manual objects
+        unsupported = self.inventory_unsupported_objects()
+        if unsupported:
+            report_path = os.path.join(target_dir, "manual_migration_inventory.txt")
+            with open(report_path, 'w', encoding='utf-8') as f:
+                f.write(self._dump_header("FIREBIRD OBJECTS REQUIRING MANUAL MIGRATION"))
+                for category, items in sorted(unsupported.items()):
+                    f.write(f"[{category}] ({len(items)} items):\n")
+                    for item in items:
+                        f.write(f"  - {item}\n")
+                    f.write("\n")
 
         def _path(filename: str) -> str:
             return get_dump_path(filename, target_dir)
@@ -458,6 +560,7 @@ class DdlExporter:
         out_file = output_file or get_dump_path(DumpFiles.GENERATORS_FB)
         conv_file = converted_file or get_dump_path(DumpFiles.SEQUENCES_PG)
 
+        cursor = self.fb_con.cursor()
         try:
             cursor.execute("""
                 SELECT RDB$GENERATOR_NAME, COALESCE(RDB$GENERATOR_INCREMENT, 1)
