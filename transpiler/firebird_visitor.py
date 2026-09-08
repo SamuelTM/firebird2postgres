@@ -766,6 +766,15 @@ def _normalize_type_of(sql: str, domain_types: dict[str, str] = None) -> str:
 def convert_firebird_type_declaration(raw_type: str, domain_map: dict[str, str] = None) -> str:
     if not raw_type:
         return ""
+    # Check domain_map FIRST, before type substitutions, so delimited domains
+    # whose names collide with native types (e.g. "INT128") resolve correctly.
+    if domain_map:
+        u = raw_type.strip().upper()
+        if u in domain_map:
+            return domain_map[u]
+        u_clean = u.strip('"')
+        if u_clean in domain_map:
+            return domain_map[u_clean]
     cleaned = re.sub(r'(?i)\bBLOB\s+SUBTYPE\s+(?:1|TEXT)\b', 'TEXT', raw_type)
     cleaned = re.sub(r'(?i)\bBLOB\s+SUBTYPE\s+(?:0|BINARY)\b', 'BYTEA', cleaned)
     cleaned = re.sub(r'(?i)\bBLOB\b', 'BYTEA', cleaned)
@@ -774,13 +783,6 @@ def convert_firebird_type_declaration(raw_type: str, domain_map: dict[str, str] 
     cleaned = re.sub(r'(?i)\bINT128\b', 'NUMERIC(39)', cleaned)
     cleaned = re.sub(r'(?i)\bTIME\s+WITH\s+TIME\s+ZONE\b', 'TIMETZ', cleaned)
     cleaned = re.sub(r'(?i)\bTIMESTAMP\s+WITH\s+TIME\s+ZONE\b', 'TIMESTAMPTZ', cleaned)
-    if domain_map:
-        u = cleaned.strip().upper()
-        if u in domain_map:
-            return domain_map[u]
-        u_clean = u.strip('"')
-        if u_clean in domain_map:
-            return domain_map[u_clean]
     return cleaned
 
 

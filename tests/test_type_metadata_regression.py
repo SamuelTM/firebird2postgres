@@ -110,6 +110,61 @@ class TestTypeMetadataRegression(unittest.TestCase):
         self.assertIn('V_BIG NUMERIC(39);', transpiled)
         self.assertIn('V_RAW BYTEA;', transpiled)
 
+    def test_delimited_domain_with_type_name_not_corrupted(self):
+        """
+        A domain called "INT128" (delimited identifier, NOT the native type)
+        must resolve to its domain_map entry, not be converted to NUMERIC(39).
+        Same for "BLOB", "DECFLOAT", etc.
+        """
+        from transpiler.firebird_visitor import convert_firebird_type_declaration
+
+        # Domain "INT128" mapped to int128_dom
+        dm = {'INT128': 'int128_dom'}
+
+        # Delimited domain reference: "INT128" -> should resolve to int128_dom
+        self.assertEqual(convert_firebird_type_declaration('"INT128"', domain_map=dm), 'int128_dom')
+
+        # Unquoted domain reference: INT128 -> should also resolve to int128_dom
+        self.assertEqual(convert_firebird_type_declaration('INT128', domain_map=dm), 'int128_dom')
+
+        # Without domain_map, INT128 is a native type -> NUMERIC(39)
+        self.assertEqual(convert_firebird_type_declaration('INT128'), 'NUMERIC(39)')
+
+        # Domain "BLOB" mapped to blob_dom
+        dm2 = {'BLOB': 'blob_dom'}
+        self.assertEqual(convert_firebird_type_declaration('"BLOB"', domain_map=dm2), 'blob_dom')
+        self.assertEqual(convert_firebird_type_declaration('BLOB', domain_map=dm2), 'blob_dom')
+
+        # Without domain_map, BLOB is a native type -> BYTEA
+        self.assertEqual(convert_firebird_type_declaration('BLOB'), 'BYTEA')
+
+    def test_delimited_domain_in_procedure_transpile(self):
+        """
+        End-to-end: procedure with parameter, variable, and return using
+        a domain "INT128" must use the domain, not NUMERIC(39).
+        """
+        fb_proc = """
+        CREATE OR ALTER PROCEDURE SP_TEST (
+            X "INT128"
+        ) RETURNS (
+            Y "INT128"
+        ) AS
+        DECLARE VARIABLE Z "INT128";
+        BEGIN
+            Z = X;
+            Y = Z;
+            SUSPEND;
+        END;
+        """
+        dm = {'INT128': 'int128_dom'}
+        transpiled = FirebirdToPostgresVisitor.transpile(fb_proc, domain_map=dm)
+        # All three usages must resolve to domain, not NUMERIC(39)
+        self.assertIn('X int128_dom', transpiled)
+        self.assertIn('OUT Y int128_dom', transpiled)
+        self.assertIn('Z int128_dom;', transpiled)
+        self.assertNotIn('NUMERIC(39)', transpiled)
+
+
     def test_octets_domain_and_column_metadata(self):
         """
         Verify export_firebird_domains, _fetch_domain_info, and schema_extractor
