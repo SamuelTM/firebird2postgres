@@ -16,7 +16,7 @@ from antlr4.error.Errors import ParseCancellationException, RecognitionException
 from antlr4.TokenStreamRewriter import TokenStreamRewriter
 
 from .firebird_grammar import FirebirdParserVisitor, FirebirdParser, FirebirdLexer
-from models import pg_quote_ident
+from models import pg_quote_ident, get_postgres_type
 from utils import choose_dollar_tag
 
 logger = logging.getLogger(__name__)
@@ -671,22 +671,45 @@ def _normalize_first_skip(sql: str, expr_map: dict[str, str]) -> str:
     return "".join(result)
 
 
-def _normalize_type_of(sql: str) -> str:
+def _normalize_type_of(sql: str, domain_types: dict[str, str] = None) -> str:
     pat = re.compile(
         r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|(\bTYPE\s+OF\s+(?:COLUMN\s+)?(([a-zA-Z0-9_$]+|\"[^\"]+\")(?:\s*\.\s*([a-zA-Z0-9_$]+|\"[^\"]+\"))?))",
         flags=re.IGNORECASE
     )
+    norm_domain_types = {k.strip(' "').upper(): v.strip() for k, v in (domain_types or {}).items()}
+
     def repl(m):
         if m.group(1):
             return m.group(1)
         full_kw = m.group(2)
-        m_col = re.match(r'^\bTYPE\s+OF\s+COLUMN\s+(([a-zA-Z0-9_$]+|\"[^\"]+\")\s*\.\s*([a-zA-Z0-9_$]+|\"[^\"]+\"))', full_kw, re.IGNORECASE)
+        m_col = re.match(
+            r'^\bTYPE\s+OF\s+COLUMN\s+(([a-zA-Z0-9_$]+|\"[^\"]+\")\s*\.\s*([a-zA-Z0-9_$]+|\"[^\"]+\"))',
+            full_kw,
+            re.IGNORECASE
+        )
         if m_col:
             return f"{m_col.group(2)}.{m_col.group(3)}%TYPE"
+        m_col_nodot = re.match(
+            r'^\bTYPE\s+OF\s+(([a-zA-Z0-9_$]+|\"[^\"]+\")\s*\.\s*([a-zA-Z0-9_$]+|\"[^\"]+\"))',
+            full_kw,
+            re.IGNORECASE
+        )
+        if m_col_nodot:
+            return f"{m_col_nodot.group(2)}.{m_col_nodot.group(3)}%TYPE"
         m_dom = re.match(r'^\bTYPE\s+OF\s+([a-zA-Z0-9_$]+|\"[^\"]+\")', full_kw, re.IGNORECASE)
         if m_dom:
-            return m_dom.group(1)
+            raw_dom = m_dom.group(1)
+            clean_dom = raw_dom.strip(' "').upper()
+            if clean_dom in norm_domain_types:
+                base_type = norm_domain_types[clean_dom]
+                try:
+                    base_type = get_postgres_type(base_type)
+                except Exception:
+                    pass
+                return base_type
+            raise ValueError(f"Unknown domain '{raw_dom}' in TYPE OF expression.")
         return full_kw
+
     return pat.sub(repl, sql)
 
 
@@ -1766,7 +1789,8 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         self.not_null_params = not_null_params or {}
 
     @classmethod
-    def _normalize_sql(cls, sql: str, expr_map: dict[str, str] = None, not_null_params: dict[str, list[str]] = None) -> str:
+    def _normalize_sql(cls, sql: str, expr_map: dict[str, str] = None, not_null_params: dict[str, list[str]] = None,
+                       domain_types: dict[str, str] = None) -> str:
         """
         Pre-parse normalization:
         1. Firebird allows custom exception messages: `EXCEPTION <name> '<msg>';`.
@@ -1821,7 +1845,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         sql = _normalize_data_types(sql)
 
         # Step 5: Normalize TYPE OF COLUMN and TYPE OF domain
-        sql = _normalize_type_of(sql)
+        sql = _normalize_type_of(sql, domain_types=domain_types)
 
         # Step 6: Normalize variable declarations (= initializers, DEFAULT ... NOT NULL, etc.)
         sql = _normalize_variable_declarations(sql)
@@ -1839,14 +1863,45 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         return _normalize_first_skip(sql, expr_map)
 
     @classmethod
-    def transpile(cls, firebird_sql_string: str, symbols: dict[str, str] = None, domain_map: dict[str, str] = None, sequence_increments: dict[str, int] = None) -> str:
+    def transpile(cls, firebird_sql_string: str, symbols: dict[str, str] = None, domain_map: dict[str, str] = None,
+                  sequence_increments: dict[str, int] = None, domain_types: dict[str, str] = None) -> str:
         """
         Parses Firebird SQL using Two-Stage Parsing (SLL -> LL), traverses the AST with the visitor,
         and applies dialect token rewriting to produce clean PostgreSQL SQL.
         """
+        norm_domain_map = {}
+        extracted_domain_types = {}
+        if domain_map:
+            for k, v in domain_map.items():
+                k_norm = k.strip().upper()
+                if isinstance(v, (tuple, list)) and len(v) == 2:
+                    norm_domain_map[k_norm] = str(v[0]).strip()
+                    extracted_domain_types[k_norm] = str(v[1]).strip()
+                elif isinstance(v, dict):
+                    norm_domain_map[k_norm] = str(v.get('pg_name', k)).strip()
+                    if 'base_type' in v:
+                        extracted_domain_types[k_norm] = str(v['base_type']).strip()
+                elif hasattr(v, 'pg_name') and hasattr(v, 'base_type'):
+                    norm_domain_map[k_norm] = str(v.pg_name).strip()
+                    extracted_domain_types[k_norm] = str(v.base_type).strip()
+                else:
+                    norm_domain_map[k_norm] = str(v).strip()
+
+        combined_domain_types = {}
+        if extracted_domain_types:
+            combined_domain_types.update(extracted_domain_types)
+        if domain_types:
+            for k, v in domain_types.items():
+                combined_domain_types[k.strip().upper()] = str(v).strip()
+
         expr_map = {}
         not_null_params = {}
-        normalized_sql = cls._normalize_sql(firebird_sql_string, expr_map=expr_map, not_null_params=not_null_params)
+        normalized_sql = cls._normalize_sql(
+            firebird_sql_string,
+            expr_map=expr_map,
+            not_null_params=not_null_params,
+            domain_types=combined_domain_types
+        )
 
         error_listener = _CollectingErrorListener()
 
@@ -1893,7 +1948,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         dialect_rewriter.visit(tree)
 
         # Pass 2: High-level PL/pgSQL structure visitor
-        visitor = cls(rewriter=rewriter, domain_map=domain_map, not_null_params=not_null_params)
+        visitor = cls(rewriter=rewriter, domain_map=norm_domain_map, not_null_params=not_null_params)
         pg_sql = visitor.visit(tree)
 
         if pg_sql:

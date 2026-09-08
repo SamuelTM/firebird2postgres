@@ -818,21 +818,26 @@ class TestTranspilerProcedures(unittest.TestCase):
         fb_sql = """
         CREATE PROCEDURE SP_TEST_TYPE_OF (
             P_NAME TYPE OF COLUMN CLIENTES.NOME,
-            P_STATUS TYPE OF DOM_STATUS
+            P_STATUS TYPE OF DOM_STATUS,
+            P_DIRECT DOM_STATUS
         )
         AS
         DECLARE VARIABLE V_ID TYPE OF COLUMN CLIENTES.ID;
         DECLARE VARIABLE V_DOM TYPE OF DOM_CUSTOM;
+        DECLARE VARIABLE V_DIRECT DOM_CUSTOM;
         BEGIN
             V_ID = 1;
         END;
         """
         domain_map = {"DOM_STATUS": "dom_status", "DOM_CUSTOM": "dom_custom_type"}
-        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql, domain_map=domain_map)
+        domain_types = {"DOM_STATUS": "VARCHAR(20)", "DOM_CUSTOM": "INTEGER"}
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql, domain_map=domain_map, domain_types=domain_types)
         self.assertIn("P_NAME CLIENTES.NOME%TYPE", pg_sql)
-        self.assertIn("P_STATUS dom_status", pg_sql)
+        self.assertIn("P_STATUS VARCHAR(20)", pg_sql)
+        self.assertIn("P_DIRECT dom_status", pg_sql)
         self.assertIn("V_ID CLIENTES.ID%TYPE;", pg_sql)
-        self.assertIn("V_DOM dom_custom_type;", pg_sql)
+        self.assertIn("V_DOM INTEGER;", pg_sql)
+        self.assertIn("V_DIRECT dom_custom_type;", pg_sql)
         self.assertNotIn("TYPE OF", pg_sql)
 
     def test_procedure_when_any_exception_handler(self):

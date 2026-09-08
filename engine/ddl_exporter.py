@@ -39,12 +39,14 @@ def _transpile_worker(item: tuple) -> tuple[str | None, str | None]:
     domain_map = item[3] if len(item) > 3 else None
     symbols = item[4] if len(item) > 4 else None
     sequence_increments = item[5] if len(item) > 5 else None
+    domain_types = item[6] if len(item) > 6 else None
     try:
         pg_sql = FirebirdToPostgresVisitor.transpile(
             sql_to_transpile,
             domain_map=domain_map,
             symbols=symbols,
-            sequence_increments=sequence_increments
+            sequence_increments=sequence_increments,
+            domain_types=domain_types,
         )
         return pg_sql, None
     except Exception as e:
@@ -152,7 +154,7 @@ class DdlExporter:
         triggers = fb_cursor.fetchall()
 
         symbols = self._fetch_all_column_symbols(fb_cursor)
-        domain_map = self._fetch_domain_map(fb_cursor)
+        domain_map, domain_types = self._fetch_domain_info(fb_cursor)
         seq_increments = fetch_all_sequence_increments(fb_cursor)
 
         items = []
@@ -166,7 +168,7 @@ class DdlExporter:
             fb_sql = self._format_trigger_firebird_ddl(trigger_name, relation_name, trigger_type, source)
             pg_trg_name = f"trg_{trigger_sequence:05d}_{trigger_name.lower()}"
             transpile_sql = self._format_trigger_firebird_ddl(pg_trg_name, relation_name, trigger_type, source)
-            items.append((trigger_name, fb_sql, transpile_sql, domain_map, symbols, seq_increments))
+            items.append((trigger_name, fb_sql, transpile_sql, domain_map, symbols, seq_increments, domain_types))
 
         self._export_transpiled_ddl(
             items,
@@ -208,7 +210,7 @@ class DdlExporter:
         procedures = fb_cursor.fetchall()
 
         symbols = self._fetch_all_column_symbols(fb_cursor)
-        domain_map = self._fetch_domain_map(fb_cursor)
+        domain_map, domain_types = self._fetch_domain_info(fb_cursor)
         seq_increments = fetch_all_sequence_increments(fb_cursor)
 
         items = []
@@ -218,7 +220,7 @@ class DdlExporter:
 
             input_params, output_params = self._fetch_procedure_parameters(fb_cursor, proc_name, domain_map=domain_map)
             fb_sql = self._format_procedure_firebird_ddl(proc_name, input_params, output_params, source)
-            items.append((proc_name, fb_sql, fb_sql, domain_map, symbols, seq_increments))
+            items.append((proc_name, fb_sql, fb_sql, domain_map, symbols, seq_increments, domain_types))
 
         self._export_transpiled_ddl(
             items,
@@ -232,15 +234,54 @@ class DdlExporter:
         )
 
     @staticmethod
-    def _fetch_domain_map(cursor) -> dict[str, str]:
+    def _fetch_domain_info(cursor) -> tuple[dict[str, str], dict[str, str]]:
         cursor.execute('SELECT RDB$RELATION_NAME FROM RDB$RELATIONS WHERE RDB$SYSTEM_FLAG = 0;')
         relation_names = {r[0].strip() for r in cursor.fetchall() if r[0]}
         cursor.execute("""
-            SELECT DISTINCT RDB$FIELD_NAME FROM RDB$FIELDS
+            SELECT 
+                RDB$FIELD_NAME, 
+                RDB$FIELD_TYPE, 
+                RDB$FIELD_SUB_TYPE, 
+                COALESCE(RDB$CHARACTER_LENGTH, RDB$FIELD_LENGTH), 
+                RDB$FIELD_PRECISION, 
+                RDB$FIELD_SCALE
+            FROM RDB$FIELDS
             WHERE RDB$SYSTEM_FLAG = 0 AND RDB$FIELD_NAME NOT STARTING WITH 'RDB$';
         """)
-        domain_names = [r[0].strip() for r in cursor.fetchall() if r[0]]
-        return build_domain_mapping(domain_names, relation_names)
+        rows = cursor.fetchall()
+        domain_names = [r[0].strip() for r in rows if r[0]]
+        domain_map = build_domain_mapping(domain_names, relation_names)
+        domain_types = {}
+        for r in rows:
+            if not r[0]:
+                continue
+            d_name = r[0].strip().upper()
+            if len(r) > 1:
+                field_type = r[1]
+                field_subtype = r[2] if len(r) > 2 else None
+                field_length = r[3] if len(r) > 3 else None
+                field_precision = r[4] if len(r) > 4 else None
+                field_scale = r[5] if len(r) > 5 else None
+                fb_type = resolve_firebird_type(
+                    field_type=field_type,
+                    field_subtype=field_subtype,
+                    field_length=field_length,
+                    field_precision=field_precision,
+                    field_scale=field_scale,
+                )
+                if fb_type:
+                    domain_types[d_name] = get_postgres_type(fb_type)
+        return domain_map, domain_types
+
+    @staticmethod
+    def _fetch_domain_map(cursor) -> dict[str, str]:
+        domain_map, _ = DdlExporter._fetch_domain_info(cursor)
+        return domain_map
+
+    @staticmethod
+    def _fetch_domain_types(cursor) -> dict[str, str]:
+        _, domain_types = DdlExporter._fetch_domain_info(cursor)
+        return domain_types
 
     @staticmethod
     def _fetch_procedure_parameters(cursor, proc_name: str, domain_map: dict[str, str] = None) -> tuple[list[str], list[str]]:
@@ -322,7 +363,13 @@ class DdlExporter:
             # Preserve user-defined domain if not a system domain (RDB$...) and not TYPE OF domain (mechanism = 1)
             if field_source and not field_source.startswith('RDB$') and param_mechanism != 1:
                 if domain_map and field_source.upper() in domain_map:
-                    type_name = domain_map[field_source.upper()]
+                    val = domain_map[field_source.upper()]
+                    if isinstance(val, (tuple, list)):
+                        type_name = val[0]
+                    elif isinstance(val, dict):
+                        type_name = val.get('pg_name', field_source)
+                    else:
+                        type_name = val
                 else:
                     type_name = field_source
             else:
@@ -402,7 +449,7 @@ class DdlExporter:
         views = fb_cursor.fetchall()
 
         symbols = self._fetch_all_column_symbols(fb_cursor)
-        domain_map = self._fetch_domain_map(fb_cursor)
+        domain_map, domain_types = self._fetch_domain_info(fb_cursor)
         seq_increments = fetch_all_sequence_increments(fb_cursor)
 
         view_map = {}
@@ -411,7 +458,7 @@ class DdlExporter:
             source = view[1]
             col_names = self._fetch_view_columns(fb_cursor, view_name)
             fb_sql = self._format_view_firebird_ddl(view_name, col_names, source)
-            view_map[view_name] = (view_name, fb_sql, None, domain_map, symbols, seq_increments)
+            view_map[view_name] = (view_name, fb_sql, None, domain_map, symbols, seq_increments, domain_types)
 
         ordered_names = self._resolve_view_dependency_order(fb_cursor, set(view_map.keys()))
         items = [view_map[name] for name in ordered_names if name in view_map]
