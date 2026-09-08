@@ -688,29 +688,43 @@ class DataMigrator:
             try:
                 cur.execute("SELECT MON$READ_ONLY, MON$SHUTDOWN_MODE FROM MON$DATABASE;")
                 row = cur.fetchone()
-                if row:
-                    read_only = row[0]
-                    # Handle unconfigured MagicMock in generic unit tests
-                    if read_only is not None and read_only.__class__.__name__ == 'MagicMock':
-                        info['is_read_only'] = True
-                        info['shutdown_mode'] = 0
-                        info['is_shutdown'] = False
-                        info['verified'] = True
-                    else:
+                if row is None:
+                    info['error'] = "MON$DATABASE returned no row; cannot prove frozen state."
+                elif not isinstance(row, (tuple, list)) or len(row) < 2:
+                    info['error'] = f"Unexpected MON$DATABASE result shape: {row!r}."
+                else:
+                    read_only, shutdown_mode = row[0], row[1]
+                    # Strict catalog typing: mocks, strings or other fakes are
+                    # NOT valid proof of a frozen source and must be rejected.
+                    if isinstance(read_only, bool):
+                        info['is_read_only'] = read_only
+                    elif isinstance(read_only, int) and read_only in (0, 1):
                         info['is_read_only'] = bool(read_only)
-                        shutdown_mode = row[1]
-                        info['shutdown_mode'] = shutdown_mode
-                        # Firebird MON$SHUTDOWN_MODE:
-                        # 0 = Online
-                        # 1 = Multi-user maintenance ('multi') - SYSDBA and owner can connect and write!
-                        # 2 = Single-user maintenance ('single')
-                        # 3 = Full shutdown ('full')
-                        info['is_shutdown'] = (
-                            shutdown_mode is not None
-                            and isinstance(shutdown_mode, int)
-                            and shutdown_mode > 1
+                    else:
+                        info['error'] = (
+                            f"Unexpected MON$READ_ONLY value: {read_only!r}; "
+                            f"expected 0/1."
                         )
-                        info['verified'] = True
+                    if info['error'] is None:
+                        if isinstance(shutdown_mode, bool):
+                            info['error'] = (
+                                f"Unexpected MON$SHUTDOWN_MODE value: {shutdown_mode!r}; "
+                                f"expected 0-3."
+                            )
+                        elif isinstance(shutdown_mode, int) and 0 <= shutdown_mode <= 3:
+                            info['shutdown_mode'] = shutdown_mode
+                            # Firebird MON$SHUTDOWN_MODE:
+                            # 0 = Online
+                            # 1 = Multi-user maintenance ('multi') - SYSDBA and owner can connect and write!
+                            # 2 = Single-user maintenance ('single')
+                            # 3 = Full shutdown ('full')
+                            info['is_shutdown'] = shutdown_mode > 1
+                            info['verified'] = True
+                        else:
+                            info['error'] = (
+                                f"Unexpected MON$SHUTDOWN_MODE value: {shutdown_mode!r}; "
+                                f"expected 0-3."
+                            )
             except Exception as e:
                 info['error'] = f"Failed to check MON$DATABASE: {e}"
                 logger.warning(f"Could not check source database frozen state: {e}")
@@ -718,11 +732,23 @@ class DataMigrator:
             try:
                 cur.execute("SELECT COUNT(*) FROM MON$ATTACHMENTS WHERE MON$ATTACHMENT_ID <> CURRENT_CONNECTION AND (MON$SYSTEM_FLAG = 0 OR MON$SYSTEM_FLAG IS NULL);")
                 row = cur.fetchone()
-                if row and row[0] is not None:
-                    if row[0].__class__.__name__ == 'MagicMock':
-                        info['active_attachments'] = 0
-                    else:
-                        info['active_attachments'] = int(row[0])
+                if row is None:
+                    info['error'] = (
+                        f"{info['error']}; MON$ATTACHMENTS returned no row."
+                        if info['error'] else "MON$ATTACHMENTS returned no row."
+                    )
+                elif not isinstance(row, (tuple, list)) or len(row) < 1:
+                    info['error'] = (
+                        f"{info['error']}; Unexpected MON$ATTACHMENTS result shape: {row!r}."
+                        if info['error'] else f"Unexpected MON$ATTACHMENTS result shape: {row!r}."
+                    )
+                elif isinstance(row[0], bool) or not isinstance(row[0], int) or row[0] < 0:
+                    info['error'] = (
+                        f"{info['error']}; Unexpected attachment count: {row[0]!r}."
+                        if info['error'] else f"Unexpected attachment count: {row[0]!r}."
+                    )
+                else:
+                    info['active_attachments'] = int(row[0])
             except Exception as e:
                 err_msg = f"Failed to check MON$ATTACHMENTS: {e}"
                 info['error'] = f"{info['error']}; {err_msg}" if info['error'] else err_msg

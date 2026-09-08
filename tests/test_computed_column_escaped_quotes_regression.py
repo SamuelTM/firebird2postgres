@@ -2,45 +2,18 @@ import unittest
 import psycopg2
 import firebirdsql
 
-from config import (
-    get_postgres_connection,
-    get_firebird_connection,
-    PostgresConfig,
-    FirebirdConfig,
+from tests.db_isolation import (
+    get_test_firebird_connection,
+    get_test_postgres_connection,
+    require_live_databases,
+    require_live_firebird,
+    require_live_postgres,
+    requires_live_databases_class,
+    requires_postgres_class,
 )
 from engine.schema_extractor import SchemaExtractor
 from models import Column, Table
 from transpiler import FirebirdToPostgresVisitor
-
-
-def check_live_postgres_available() -> bool:
-    try:
-        cfg = PostgresConfig()
-        conn = get_postgres_connection(cfg)
-        cur = conn.cursor()
-        cur.execute("SELECT 1;")
-        res = cur.fetchone()
-        conn.close()
-        return bool(res and res[0] == 1)
-    except psycopg2.Error:
-        return False
-
-
-def check_live_firebird_available() -> bool:
-    try:
-        cfg = FirebirdConfig()
-        conn = get_firebird_connection(cfg)
-        cur = conn.cursor()
-        cur.execute("SELECT 1 FROM RDB$DATABASE;")
-        res = cur.fetchone()
-        conn.close()
-        return bool(res and res[0] == 1)
-    except Exception:
-        return False
-
-
-HAS_REAL_PG = check_live_postgres_available()
-HAS_REAL_FB = check_live_firebird_available()
 
 
 class TestComputedColumnEscapedQuotesUnitRegression(unittest.TestCase):
@@ -107,7 +80,7 @@ class TestComputedColumnEscapedQuotesUnitRegression(unittest.TestCase):
         self.assertEqual(col_c.computed_source, "id || '\"A\"\"B\"'")
 
 
-@unittest.skipUnless(HAS_REAL_PG, "PostgreSQL not available")
+@requires_postgres_class
 class TestComputedColumnEscapedQuotesLivePostgres(unittest.TestCase):
     """
     Live PostgreSQL regression verifying that table DDL with chain of computed columns
@@ -115,7 +88,8 @@ class TestComputedColumnEscapedQuotesLivePostgres(unittest.TestCase):
     """
 
     def setUp(self):
-        self.conn = get_postgres_connection(PostgresConfig())
+        require_live_postgres(self)
+        self.conn = get_test_postgres_connection()
         self.conn.autocommit = True
         self.cur = self.conn.cursor()
         self.cur.execute("DROP TABLE IF EXISTS t_comp_pg_test CASCADE;")
@@ -150,7 +124,7 @@ class TestComputedColumnEscapedQuotesLivePostgres(unittest.TestCase):
         self.assertEqual(row, (5, 6, 7, 20))
 
 
-@unittest.skipUnless(HAS_REAL_FB and HAS_REAL_PG, "Both Firebird and PostgreSQL required")
+@requires_live_databases_class
 class TestComputedColumnEscapedQuotesE2EComparison(unittest.TestCase):
     """
     End-to-end regression: create table in Firebird with chain of computed columns
@@ -159,9 +133,10 @@ class TestComputedColumnEscapedQuotesE2EComparison(unittest.TestCase):
     """
 
     def setUp(self):
-        self.fb_conn = get_firebird_connection(FirebirdConfig())
+        require_live_databases(self)
+        self.fb_conn = get_test_firebird_connection()
         self.fb_cur = self.fb_conn.cursor()
-        self.pg_conn = get_postgres_connection(PostgresConfig())
+        self.pg_conn = get_test_postgres_connection()
         self.pg_conn.autocommit = True
         self.pg_cur = self.pg_conn.cursor()
         self._cleanup()

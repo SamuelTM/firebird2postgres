@@ -3,26 +3,18 @@ from unittest.mock import MagicMock
 
 import psycopg2
 
-from config import get_postgres_connection, PostgresConfig
 from engine.data_migrator import DataMigrator
 from engine.schema_extractor import SchemaExtractor
 from models import Column, Table
 
 
-def check_live_postgres_available() -> bool:
-    try:
-        cfg = PostgresConfig()
-        conn = get_postgres_connection(cfg)
-        cur = conn.cursor()
-        cur.execute("SELECT 1;")
-        res = cur.fetchone()
-        conn.close()
-        return bool(res and res[0] == 1)
-    except psycopg2.Error:
-        return False
-
-
-HAS_REAL_PG = check_live_postgres_available()
+from tests.db_isolation import (
+    get_test_postgres_connection,
+    is_postgres_available,
+    require_live_postgres,
+    requires_postgres,
+    requires_postgres_class,
+)
 
 
 class TestIdentityUnitRegression(unittest.TestCase):
@@ -133,6 +125,8 @@ class TestIdentityUnitRegression(unittest.TestCase):
 
         mock_fb_con.cursor.return_value = mock_fb_cur
         mock_pg_con.cursor.return_value = mock_pg_cur
+        # Explicit frozen-source proof (production rejects bare mocks).
+        mock_fb_cur.fetchone.side_effect = [(1, 0), (0,)]
         migrator = DataMigrator(mock_fb_con, mock_pg_con)
 
         t = Table("tbl'special")
@@ -156,7 +150,7 @@ class TestIdentityUnitRegression(unittest.TestCase):
         self.assertIn('s.seqmin', query)
 
 
-@unittest.skipUnless(HAS_REAL_PG, "Live PostgreSQL instance required for live identity regression tests")
+@requires_postgres_class
 class TestIdentityLivePostgresRegression(unittest.TestCase):
     """
     Live execution tests against PostgreSQL validating:
@@ -171,7 +165,8 @@ class TestIdentityLivePostgresRegression(unittest.TestCase):
     """
 
     def setUp(self):
-        self.pg_con = get_postgres_connection()
+        require_live_postgres(self)
+        self.pg_con = get_test_postgres_connection()
         self.pg_con.autocommit = False
         self.pg_cur = self.pg_con.cursor()
 
@@ -190,6 +185,8 @@ class TestIdentityLivePostgresRegression(unittest.TestCase):
         mock_fb_con = MagicMock()
         mock_fb_cur = MagicMock()
         mock_fb_con.cursor.return_value = mock_fb_cur
+        # Explicit frozen-source proof (production rejects bare mocks).
+        mock_fb_cur.fetchone.side_effect = [(1, 0), (0,)]
         if fb_rows:
             mock_fb_cur.fetchmany.side_effect = [fb_rows, []]
         else:

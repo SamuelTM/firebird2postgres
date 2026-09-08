@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    name: Unit tests (no live databases)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Collect-only smoke test (must not open connections)
+        run: python -m pytest tests/ --collect-only -q
+      - name: Run tests (live tests skip without databases)
+        run: python -m pytest tests/ -q
+
+  integration:
+    name: Integration tests (disposable live databases, mandatory)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: firebird2postgres_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      firebird:
+        image: firebirdsql/firebird:4.0
+        env:
+          FIREBIRD_ROOT_PASSWORD: masterkey
+          FIREBIRD_DATABASE: firebird2postgres_test.fdb
+          FIREBIRD_USER: sysdba
+          FIREBIRD_PASSWORD: masterkey
+        ports:
+          - 3050:3050
+    env:
+      # Explicit disposable test databases — never the production ones.
+      TEST_PG_HOST: localhost
+      TEST_PG_PORT: 5432
+      TEST_PG_DB: firebird2postgres_test
+      TEST_PG_USER: postgres
+      TEST_PG_PASSWORD: postgres
+      TEST_FB_HOST: localhost
+      TEST_FB_PORT: 3050
+      TEST_FB_DATABASE: /firebird/data/firebird2postgres_test.fdb
+      TEST_FB_USER: sysdba
+      TEST_FB_PASSWORD: masterkey
+      # Mandatory stage: unavailable databases must FAIL, never skip.
+      REQUIRE_INTEGRATION: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run full suite against live disposable databases
+        run: python -m pytest tests/ -q

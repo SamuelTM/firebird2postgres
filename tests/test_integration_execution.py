@@ -3,25 +3,14 @@ import unittest
 from unittest.mock import MagicMock
 
 import psycopg2
-from config import get_postgres_connection, PostgresConfig
+from tests.db_isolation import (
+    get_test_postgres_connection,
+    is_postgres_available,
+    require_live_postgres,
+    requires_postgres,
+)
 from transpiler import FirebirdToPostgresVisitor
 from validate_postgres_ddl import check_plpgsql_runtime_validity
-
-
-def check_live_postgres_available() -> bool:
-    try:
-        cfg = PostgresConfig()
-        conn = get_postgres_connection(cfg)
-        cur = conn.cursor()
-        cur.execute("SELECT 1;")
-        res = cur.fetchone()
-        conn.close()
-        return bool(res and res[0] == 1)
-    except psycopg2.Error:
-        return False
-
-
-HAS_REAL_PG = check_live_postgres_available()
 
 
 class TestIntegrationExecution(unittest.TestCase):
@@ -33,8 +22,9 @@ class TestIntegrationExecution(unittest.TestCase):
     """
 
     def setUp(self):
-        if HAS_REAL_PG:
-            self.pg_con = get_postgres_connection()
+        # Lazy connection: no database is touched at collection time.
+        if is_postgres_available():
+            self.pg_con = get_test_postgres_connection()
             self.pg_con.autocommit = False
             self.pg_cur = self.pg_con.cursor()
         else:
@@ -52,7 +42,7 @@ class TestIntegrationExecution(unittest.TestCase):
             except psycopg2.Error:
                 pass
 
-    @unittest.skipUnless(HAS_REAL_PG, "Live PostgreSQL instance required for real execution test")
+    @requires_postgres
     def test_real_pg_late_binding_demonstrates_ddl_pass_vs_runtime_failure(self):
         """
         Validates real PostgreSQL late-binding: compiles a PL/pgSQL function referencing
@@ -80,7 +70,7 @@ class TestIntegrationExecution(unittest.TestCase):
         self.assertEqual(ctx.exception.pgcode, '42P01')
         self.assertIn("nonexistent_table", str(ctx.exception))
 
-    @unittest.skipUnless(HAS_REAL_PG, "Live PostgreSQL instance required for real execution test")
+    @requires_postgres
     def test_real_pg_transpiled_selectable_procedure_execution_and_values(self):
         """
         Transpiles a Firebird selectable procedure, executes the DDL against PostgreSQL,
@@ -118,7 +108,7 @@ class TestIntegrationExecution(unittest.TestCase):
         self.assertIsInstance(row_reg[0], decimal.Decimal)
         self.assertEqual(row_reg[0], decimal.Decimal('95.00'))
 
-    @unittest.skipUnless(HAS_REAL_PG, "Live PostgreSQL instance required for real execution test")
+    @requires_postgres
     def test_real_pg_transpiled_trigger_fires_and_mutates_data(self):
         """
         Creates a table in PostgreSQL, transpiles and creates a BEFORE INSERT trigger,
@@ -159,7 +149,7 @@ class TestIntegrationExecution(unittest.TestCase):
         self.assertEqual(row2[0], decimal.Decimal('0.00'))
         self.assertEqual(row2[1], 'PROCESSADO')
 
-    @unittest.skipUnless(HAS_REAL_PG, "Live PostgreSQL instance required for real execution test")
+    @requires_postgres
     def test_real_pg_explain_analyze_buffers_benchmark(self):
         """
         Validates performance by executing EXPLAIN (ANALYZE, BUFFERS) on representative
@@ -239,8 +229,9 @@ class TestIntegrationExecution(unittest.TestCase):
         - WHERE ID=:ID.
         - Global precedence directive does not alter results.
         """
-        if not HAS_REAL_PG or not self.pg_cur:
-            self.skipTest("Real PostgreSQL database connection not available")
+        require_live_postgres(self)
+        if not self.pg_cur:
+            self.skipTest("Disposable PostgreSQL test database not connected")
 
         # 1. Setup disposable table
         self.pg_cur.execute("""
@@ -301,7 +292,7 @@ class TestIntegrationExecution(unittest.TestCase):
         rows_where = self.pg_cur.fetchall()
         self.assertEqual(rows_where, [(1, 999), (2, 100)])
 
-    @unittest.skipUnless(HAS_REAL_PG, "Live PostgreSQL instance required for real execution test")
+    @requires_postgres
     def test_real_pg_volatility_classification_and_execution_semantics(self):
         """
         Validates Item D:
@@ -310,8 +301,9 @@ class TestIntegrationExecution(unittest.TestCase):
         - Mutating procedures called by other procedures execute and persist changes under VOLATILE.
         - Verifies PostgreSQL catalog attributes (pg_proc.provolatile).
         """
-        if not HAS_REAL_PG or not self.pg_cur:
-            self.skipTest("Real PostgreSQL database connection not available")
+        require_live_postgres(self)
+        if not self.pg_cur:
+            self.skipTest("Disposable PostgreSQL test database not connected")
 
         # 1. Disposable fixtures
         self.pg_cur.execute("""
@@ -402,7 +394,7 @@ class TestIntegrationExecution(unittest.TestCase):
         self.pg_cur.execute("SELECT val FROM reg_volatility_data WHERE id = 1;")
         self.assertEqual(self.pg_cur.fetchone()[0], 'modified_via_caller')
 
-    @unittest.skipUnless(HAS_REAL_PG, "Live PostgreSQL instance required for real execution test")
+    @requires_postgres
     def test_real_pg_computed_columns_expansion_and_execution(self):
         """
         Validates Item F on a live PostgreSQL database:
@@ -458,7 +450,7 @@ class TestIntegrationExecution(unittest.TestCase):
         self.assertEqual(rows[1][4], decimal.Decimal('32.00'))  # 22 + 10
         self.assertEqual(rows[1][5], '10A')
 
-    @unittest.skipUnless(HAS_REAL_PG, "Live PostgreSQL instance required for real execution test")
+    @requires_postgres
     def test_real_pg_item_g_trigger_conditional_and_sequence_advancement(self):
         """
         Validates Item G regression criteria on live PostgreSQL:

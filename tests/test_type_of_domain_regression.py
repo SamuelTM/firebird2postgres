@@ -2,9 +2,13 @@ import unittest
 import psycopg2
 
 from transpiler import FirebirdToPostgresVisitor
-from tests.test_integration_execution import check_live_postgres_available, get_postgres_connection
+from tests.db_isolation import (
+    get_test_postgres_connection,
+    is_postgres_available,
+    requires_postgres,
+)
 
-HAS_REAL_PG = check_live_postgres_available()
+
 
 
 class TestTypeOfDomainRegression(unittest.TestCase):
@@ -142,8 +146,8 @@ class TestTypeOfDomainRealPostgresExecution(unittest.TestCase):
     """
 
     def setUp(self):
-        if HAS_REAL_PG:
-            self.pg_con = get_postgres_connection()
+        if is_postgres_available():
+            self.pg_con = get_test_postgres_connection()
             self.pg_con.autocommit = False
             self.pg_cur = self.pg_con.cursor()
             # Set up domain and helper table
@@ -168,7 +172,7 @@ class TestTypeOfDomainRealPostgresExecution(unittest.TestCase):
             except psycopg2.Error:
                 pass
 
-    @unittest.skipUnless(HAS_REAL_PG, "Live PostgreSQL instance required for real execution test")
+    @requires_postgres
     def test_real_pg_procedure_initialization_and_constraints(self):
         # 1. Transpile procedure comparing initialization
         fb_sql = """
@@ -279,7 +283,7 @@ class TestTypeOfDomainRealPostgresExecution(unittest.TestCase):
             """)
         self.assertTrue(cm_chk.exception.pgcode == '23514' or "check" in str(cm_chk.exception).lower())
 
-    @unittest.skipUnless(HAS_REAL_PG, "Live PostgreSQL instance required for real execution test")
+    @requires_postgres
     def test_real_pg_trigger_initialization_and_constraints(self):
         # Create target table and logging table
         self.pg_cur.execute("CREATE TABLE orders (id INT, total INT);")

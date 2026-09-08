@@ -1,43 +1,12 @@
 import unittest
-import psycopg2
-import firebirdsql
-from config import (
-    get_postgres_connection,
-    get_firebird_connection,
-    PostgresConfig,
-    FirebirdConfig,
+from tests.db_isolation import (
+    get_test_firebird_connection,
+    get_test_postgres_connection,
+    is_firebird_available,
+    is_postgres_available,
+    requires_live_databases,
 )
 from transpiler import FirebirdToPostgresVisitor
-
-
-def check_live_postgres_available() -> bool:
-    try:
-        cfg = PostgresConfig()
-        conn = get_postgres_connection(cfg)
-        cur = conn.cursor()
-        cur.execute("SELECT 1;")
-        res = cur.fetchone()
-        conn.close()
-        return bool(res and res[0] == 1)
-    except psycopg2.Error:
-        return False
-
-
-def check_live_firebird_available() -> bool:
-    try:
-        cfg = FirebirdConfig()
-        conn = get_firebird_connection(cfg)
-        cur = conn.cursor()
-        cur.execute("SELECT 1 FROM RDB$DATABASE;")
-        res = cur.fetchone()
-        conn.close()
-        return bool(res and res[0] == 1)
-    except Exception:
-        return False
-
-
-HAS_REAL_PG = check_live_postgres_available()
-HAS_REAL_FB = check_live_firebird_available()
 
 
 class TestJoinUsingTranspiler(unittest.TestCase):
@@ -155,9 +124,10 @@ class TestJoinUsingExecution(unittest.TestCase):
     """
 
     def setUp(self):
-        if HAS_REAL_PG and HAS_REAL_FB:
-            self.pg_conn = get_postgres_connection(PostgresConfig())
-            self.fb_conn = get_firebird_connection(FirebirdConfig())
+        # Lazy connection against disposable test databases (no I/O at collection).
+        if is_postgres_available() and is_firebird_available():
+            self.pg_conn = get_test_postgres_connection()
+            self.fb_conn = get_test_firebird_connection()
             self.pg_cur = self.pg_conn.cursor()
             self.fb_cur = self.fb_conn.cursor()
 
@@ -208,7 +178,7 @@ class TestJoinUsingExecution(unittest.TestCase):
                 cleaned.append(val)
         return tuple(cleaned)
 
-    @unittest.skipUnless(HAS_REAL_PG and HAS_REAL_FB, "Live Firebird and PostgreSQL instances required")
+    @requires_live_databases
     def test_inner_left_full_join_using_results_and_columns_match(self):
         """
         Compares results and column names between Firebird and PostgreSQL for:
@@ -251,7 +221,7 @@ class TestJoinUsingExecution(unittest.TestCase):
                         # row 3: (3, None, 'b3')
                         self.assertEqual(pg_rows[2], (3, None, "b3"))
 
-    @unittest.skipUnless(HAS_REAL_PG and HAS_REAL_FB, "Live Firebird and PostgreSQL instances required")
+    @requires_live_databases
     def test_transpiled_view_execution_matches_firebird(self):
         """
         Creates a view in Firebird using FULL JOIN ... USING, transpiles it,

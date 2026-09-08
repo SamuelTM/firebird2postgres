@@ -19,7 +19,15 @@ class TestDataMigrator(unittest.TestCase):
         self.mock_fb_con.cursor.return_value = self.mock_fb_cur
         self.mock_pg_con.cursor.return_value = self.mock_pg_cur
 
+        # Explicit frozen-source proof for unit tests: production no longer
+        # accepts unconfigured mocks as evidence of a frozen database.
+        self._prove_frozen_source()
+
         self.migrator = DataMigrator(self.mock_fb_con, self.mock_pg_con)
+
+    def _prove_frozen_source(self):
+        """Configures an explicit read-only source: MON$READ_ONLY=1, 0 attachments."""
+        self.mock_fb_cur.fetchone.side_effect = [(1, 0), (0,)]
 
     def test_data_migration_sanitizes_nul_bytes_only_when_present(self):
         table = Table('CLIENTES')

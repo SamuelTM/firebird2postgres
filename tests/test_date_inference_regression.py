@@ -2,44 +2,17 @@ import unittest
 import psycopg2
 import firebirdsql
 
-from config import (
-    get_postgres_connection,
-    get_firebird_connection,
-    PostgresConfig,
-    FirebirdConfig,
+from tests.db_isolation import (
+    get_test_firebird_connection,
+    get_test_postgres_connection,
+    require_live_databases,
+    require_live_firebird,
+    require_live_postgres,
+    requires_firebird_class,
+    requires_postgres_class,
 )
 from transpiler import FirebirdToPostgresVisitor
 from utils import split_sql_statements
-
-
-def check_live_postgres_available() -> bool:
-    try:
-        cfg = PostgresConfig()
-        conn = get_postgres_connection(cfg)
-        cur = conn.cursor()
-        cur.execute("SELECT 1;")
-        res = cur.fetchone()
-        conn.close()
-        return bool(res and res[0] == 1)
-    except psycopg2.Error:
-        return False
-
-
-def check_live_firebird_available() -> bool:
-    try:
-        cfg = FirebirdConfig()
-        conn = get_firebird_connection(cfg)
-        cur = conn.cursor()
-        cur.execute("SELECT 1 FROM RDB$DATABASE;")
-        res = cur.fetchone()
-        conn.close()
-        return bool(res and res[0] == 1)
-    except Exception:
-        return False
-
-
-HAS_REAL_PG = check_live_postgres_available()
-HAS_REAL_FB = check_live_firebird_available()
 
 
 class TestDateInferenceUnitRegression(unittest.TestCase):
@@ -98,7 +71,7 @@ class TestDateInferenceUnitRegression(unittest.TestCase):
         self.assertIn("((Y.D + (1) * INTERVAL '1 day')::date) - Y.D", out)
 
 
-@unittest.skipUnless(HAS_REAL_PG, "PostgreSQL not available")
+@requires_postgres_class
 class TestDateInferenceLivePostgresRegression(unittest.TestCase):
     """
     Live PostgreSQL regression verifying that the date subtraction transpilation
@@ -106,7 +79,8 @@ class TestDateInferenceLivePostgresRegression(unittest.TestCase):
     """
 
     def setUp(self):
-        self.conn = get_postgres_connection(PostgresConfig())
+        require_live_postgres(self)
+        self.conn = get_test_postgres_connection()
         self.conn.autocommit = True
         self.cur = self.conn.cursor()
         self.cur.execute("DROP TABLE IF EXISTS t CASCADE;")
@@ -161,14 +135,15 @@ class TestDateInferenceLivePostgresRegression(unittest.TestCase):
         self.assertEqual(row[1], "integer")
 
 
-@unittest.skipUnless(HAS_REAL_FB, "Firebird not available")
+@requires_firebird_class
 class TestDateInferenceLiveFirebirdRegression(unittest.TestCase):
     """
     Live Firebird regression verifying native behavior of trigger and derived table view.
     """
 
     def setUp(self):
-        self.conn = get_firebird_connection(FirebirdConfig())
+        require_live_firebird(self)
+        self.conn = get_test_firebird_connection()
         self.cur = self.conn.cursor()
         self._cleanup()
         self.cur.execute("CREATE TABLE T_DATE (D DATE, N INTEGER);")

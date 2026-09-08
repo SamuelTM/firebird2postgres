@@ -1,43 +1,14 @@
 import unittest
 import psycopg2
 
-from config import (
-    get_postgres_connection,
-    PostgresConfig,
-    get_firebird_connection,
-    FirebirdConfig,
+from tests.db_isolation import (
+    get_test_firebird_connection,
+    get_test_postgres_connection,
+    is_firebird_available,
+    is_postgres_available,
+    requires_live_databases,
 )
 from transpiler import FirebirdToPostgresVisitor
-
-
-def check_live_postgres_available() -> bool:
-    try:
-        cfg = PostgresConfig()
-        conn = get_postgres_connection(cfg)
-        cur = conn.cursor()
-        cur.execute("SELECT 1;")
-        res = cur.fetchone()
-        conn.close()
-        return bool(res and res[0] == 1)
-    except Exception:
-        return False
-
-
-def check_live_firebird_available() -> bool:
-    try:
-        cfg = FirebirdConfig()
-        conn = get_firebird_connection(cfg)
-        cur = conn.cursor()
-        cur.execute("SELECT 1 FROM RDB$DATABASE;")
-        res = cur.fetchone()
-        conn.close()
-        return bool(res and res[0] == 1)
-    except Exception:
-        return False
-
-
-HAS_REAL_PG = check_live_postgres_available()
-HAS_REAL_FB = check_live_firebird_available()
 
 
 class TestOutputNotNullRegression(unittest.TestCase):
@@ -57,16 +28,16 @@ class TestOutputNotNullRegression(unittest.TestCase):
     """
 
     def setUp(self):
-        if HAS_REAL_PG:
-            self.pg_con = get_postgres_connection()
+        if is_postgres_available():
+            self.pg_con = get_test_postgres_connection()
             self.pg_con.autocommit = False
             self.pg_cur = self.pg_con.cursor()
         else:
             self.pg_con = None
             self.pg_cur = None
 
-        if HAS_REAL_FB:
-            self.fb_con = get_firebird_connection()
+        if is_firebird_available():
+            self.fb_con = get_test_firebird_connection()
             self.fb_cur = self.fb_con.cursor()
         else:
             self.fb_con = None
@@ -94,7 +65,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
                 pass
 
     def _cleanup_fb_proc(self, name: str):
-        if not HAS_REAL_FB:
+        if not is_firebird_available():
             return
         try:
             self.fb_cur.execute(f"DROP PROCEDURE {name}")
@@ -141,7 +112,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
         END
         """
         # 1. Firebird verification
-        if HAS_REAL_FB:
+        if is_firebird_available():
             self._cleanup_fb_proc("P_TEST_VALID_SEL")
             self.fb_cur.execute(fb_sql)
             self.fb_con.commit()
@@ -151,7 +122,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
             self._cleanup_fb_proc("P_TEST_VALID_SEL")
 
         # 2. PostgreSQL verification
-        if HAS_REAL_PG:
+        if is_postgres_available():
             pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
             self.pg_cur.execute(pg_sql)
             self.pg_cur.execute('SELECT * FROM "p_test_valid_sel"();')
@@ -171,7 +142,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
         END
         """
         # 1. Firebird verification
-        if HAS_REAL_FB:
+        if is_firebird_available():
             self._cleanup_fb_proc("P_TEST_VALID_EXEC")
             self.fb_cur.execute(fb_sql)
             self.fb_con.commit()
@@ -181,7 +152,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
             self._cleanup_fb_proc("P_TEST_VALID_EXEC")
 
         # 2. PostgreSQL verification
-        if HAS_REAL_PG:
+        if is_postgres_available():
             pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
             self.pg_cur.execute(pg_sql)
             self.pg_cur.execute('SELECT "p_test_valid_exec"();')
@@ -201,7 +172,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
         END
         """
         # 1. Firebird verification: error occurs at SUSPEND
-        if HAS_REAL_FB:
+        if is_firebird_available():
             self._cleanup_fb_proc("P_TEST_UNINIT_SEL")
             self.fb_cur.execute(fb_sql)
             self.fb_con.commit()
@@ -212,7 +183,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
             self._cleanup_fb_proc("P_TEST_UNINIT_SEL")
 
         # 2. PostgreSQL verification
-        if HAS_REAL_PG:
+        if is_postgres_available():
             pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
             self.pg_cur.execute(pg_sql)
             with self.assertRaises(psycopg2.Error) as pg_cm:
@@ -232,7 +203,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
         END
         """
         # 1. Firebird verification: error occurs at routine end
-        if HAS_REAL_FB:
+        if is_firebird_available():
             self._cleanup_fb_proc("P_TEST_UNINIT_EXEC")
             self.fb_cur.execute(fb_sql)
             self.fb_con.commit()
@@ -243,7 +214,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
             self._cleanup_fb_proc("P_TEST_UNINIT_EXEC")
 
         # 2. PostgreSQL verification
-        if HAS_REAL_PG:
+        if is_postgres_available():
             pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
             self.pg_cur.execute(pg_sql)
             with self.assertRaises(psycopg2.Error) as pg_cm:
@@ -265,7 +236,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
         END
         """
         # 1. Firebird verification
-        if HAS_REAL_FB:
+        if is_firebird_available():
             self._cleanup_fb_proc("P_TEST_ASSIGN_NULL")
             self.fb_cur.execute(fb_sql)
             self.fb_con.commit()
@@ -276,7 +247,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
             self._cleanup_fb_proc("P_TEST_ASSIGN_NULL")
 
         # 2. PostgreSQL verification
-        if HAS_REAL_PG:
+        if is_postgres_available():
             pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
             self.pg_cur.execute(pg_sql)
             with self.assertRaises(psycopg2.Error) as pg_cm:
@@ -301,7 +272,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
         END
         """
         # 1. Firebird verification: row 1 emitted, row 2 fails on assignment of NULL
-        if HAS_REAL_FB:
+        if is_firebird_available():
             self._cleanup_fb_proc("P_TEST_MULTI_SUSPEND")
             self.fb_cur.execute(fb_sql)
             self.fb_con.commit()
@@ -312,12 +283,12 @@ class TestOutputNotNullRegression(unittest.TestCase):
                 self.fb_con.close()
             except Exception:
                 pass
-            self.fb_con = get_firebird_connection()
+            self.fb_con = get_test_firebird_connection()
             self.fb_cur = self.fb_con.cursor()
             self._cleanup_fb_proc("P_TEST_MULTI_SUSPEND")
 
         # 2. PostgreSQL verification
-        if HAS_REAL_PG:
+        if is_postgres_available():
             pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
             self.pg_cur.execute(pg_sql)
             with self.assertRaises(psycopg2.Error) as pg_cm:
@@ -340,7 +311,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
         END
         """
         # 1. Firebird verification
-        if HAS_REAL_FB:
+        if is_firebird_available():
             self._cleanup_fb_proc("P_TEST_SEL_NULL")
             self.fb_cur.execute(fb_sql)
             self.fb_con.commit()
@@ -351,7 +322,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
             self._cleanup_fb_proc("P_TEST_SEL_NULL")
 
         # 2. PostgreSQL verification
-        if HAS_REAL_PG:
+        if is_postgres_available():
             pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
             self.pg_cur.execute(pg_sql)
             with self.assertRaises(psycopg2.Error) as pg_cm:
@@ -375,7 +346,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
         END
         """
         # 1. Firebird verification
-        if HAS_REAL_FB:
+        if is_firebird_available():
             self._cleanup_fb_proc("P_TEST_FOR_NULL")
             self.fb_cur.execute(fb_sql)
             self.fb_con.commit()
@@ -386,7 +357,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
             self._cleanup_fb_proc("P_TEST_FOR_NULL")
 
         # 2. PostgreSQL verification
-        if HAS_REAL_PG:
+        if is_postgres_available():
             pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
             self.pg_cur.execute(pg_sql)
             with self.assertRaises(psycopg2.Error) as pg_cm:
@@ -410,7 +381,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
         END
         """
         # 1. Firebird verification
-        if HAS_REAL_FB:
+        if is_firebird_available():
             self._cleanup_fb_proc("P_TEST_EARLY_EXIT_SEL")
             self.fb_cur.execute(fb_sql)
             self.fb_con.commit()
@@ -420,7 +391,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
             self._cleanup_fb_proc("P_TEST_EARLY_EXIT_SEL")
 
         # 2. PostgreSQL verification
-        if HAS_REAL_PG:
+        if is_postgres_available():
             pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
             self.pg_cur.execute(pg_sql)
             self.pg_cur.execute('SELECT * FROM "p_test_early_exit_sel"();')
@@ -442,7 +413,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
         END
         """
         # 1. Firebird verification
-        if HAS_REAL_FB:
+        if is_firebird_available():
             self._cleanup_fb_proc("P_TEST_EARLY_EXIT_EXEC")
             self.fb_cur.execute(fb_sql)
             self.fb_con.commit()
@@ -453,7 +424,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
             self._cleanup_fb_proc("P_TEST_EARLY_EXIT_EXEC")
 
         # 2. PostgreSQL verification
-        if HAS_REAL_PG:
+        if is_postgres_available():
             pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
             self.pg_cur.execute(pg_sql)
             with self.assertRaises(psycopg2.Error) as pg_cm:
@@ -486,7 +457,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
         self.assertIn("IF P_OUT IS NULL THEN", pg_sql)
 
         # 1. Firebird verification
-        if HAS_REAL_FB:
+        if is_firebird_available():
             self._cleanup_fb_proc("P_TEST_IN_OUT_DISTINCT")
             self.fb_cur.execute(fb_sql)
             self.fb_con.commit()
@@ -502,7 +473,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
             self._cleanup_fb_proc("P_TEST_IN_OUT_DISTINCT")
 
         # 2. PostgreSQL verification
-        if HAS_REAL_PG:
+        if is_postgres_available():
             self.pg_cur.execute(pg_sql)
 
             # Valid call
@@ -534,7 +505,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
         END
         """
         # 1. Firebird verification
-        if HAS_REAL_FB:
+        if is_firebird_available():
             self._cleanup_fb_proc("P_TEST_MIXED_OUT")
             self.fb_cur.execute(fb_sql)
             self.fb_con.commit()
@@ -543,7 +514,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
             self._cleanup_fb_proc("P_TEST_MIXED_OUT")
 
         # 2. PostgreSQL verification
-        if HAS_REAL_PG:
+        if is_postgres_available():
             pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
             self.pg_cur.execute(pg_sql)
             self.pg_cur.execute('SELECT * FROM "p_test_mixed_out"();')
@@ -626,7 +597,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
                 if i + 1 < len(lines):
                     self.assertNotIn("RAISE EXCEPTION", lines[i + 1])
 
-    @unittest.skipUnless(HAS_REAL_FB and HAS_REAL_PG, "Live Firebird and PostgreSQL required")
+    @requires_live_databases
     def test_returning_into_not_null_live_equivalence(self):
         """
         Execute INSERT RETURNING INTO :R (NOT NULL output) with NULL value

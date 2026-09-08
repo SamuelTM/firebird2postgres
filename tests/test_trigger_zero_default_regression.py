@@ -3,46 +3,16 @@ from unittest.mock import MagicMock
 import psycopg2
 import firebirdsql
 
-from config import (
-    get_postgres_connection,
-    get_firebird_connection,
-    PostgresConfig,
-    FirebirdConfig,
+from tests.db_isolation import (
+    get_test_firebird_connection,
+    get_test_postgres_connection,
+    require_live_databases,
+    requires_live_databases_class,
 )
 from engine.schema_extractor import SchemaExtractor
 from models import Column, Table
 from transpiler import FirebirdToPostgresVisitor
 from utils import split_sql_statements
-
-
-def check_live_postgres_available() -> bool:
-    try:
-        cfg = PostgresConfig()
-        conn = get_postgres_connection(cfg)
-        cur = conn.cursor()
-        cur.execute("SELECT 1;")
-        res = cur.fetchone()
-        conn.close()
-        return bool(res and res[0] == 1)
-    except psycopg2.Error:
-        return False
-
-
-def check_live_firebird_available() -> bool:
-    try:
-        cfg = FirebirdConfig()
-        conn = get_firebird_connection(cfg)
-        cur = conn.cursor()
-        cur.execute("SELECT 1 FROM RDB$DATABASE;")
-        res = cur.fetchone()
-        conn.close()
-        return bool(res and res[0] == 1)
-    except Exception:
-        return False
-
-
-HAS_REAL_PG = check_live_postgres_available()
-HAS_REAL_FB = check_live_firebird_available()
 
 
 class TestTriggerZeroDefaultUnitRegression(unittest.TestCase):
@@ -106,7 +76,7 @@ class TestTriggerZeroDefaultUnitRegression(unittest.TestCase):
         self.assertEqual(col_coalesce.sequence_name, "g_coal")
 
 
-@unittest.skipUnless(HAS_REAL_PG and HAS_REAL_FB, "Both Firebird and PostgreSQL required")
+@requires_live_databases_class
 class TestTriggerZeroDefaultLiveComparisonRegression(unittest.TestCase):
     """
     Live regression comparing Firebird and PostgreSQL behavior for the trigger:
@@ -119,9 +89,11 @@ class TestTriggerZeroDefaultLiveComparisonRegression(unittest.TestCase):
     """
 
     def setUp(self):
-        self.fb_conn = get_firebird_connection(FirebirdConfig())
+        # Gated by @requires_live_databases: disposable test databases only.
+        require_live_databases(self)
+        self.fb_conn = get_test_firebird_connection()
         self.fb_cur = self.fb_conn.cursor()
-        self.pg_conn = get_postgres_connection(PostgresConfig())
+        self.pg_conn = get_test_postgres_connection()
         self.pg_conn.autocommit = True
         self.pg_cur = self.pg_conn.cursor()
         self._cleanup()

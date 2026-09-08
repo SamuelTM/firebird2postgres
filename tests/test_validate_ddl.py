@@ -2,6 +2,12 @@ import unittest
 
 import psycopg2
 
+from tests.db_isolation import (
+    get_test_postgres_connection,
+    require_live_postgres,
+    requires_postgres_class,
+    unique_name,
+)
 from validate_postgres_ddl import identify_object
 
 
@@ -352,23 +358,6 @@ class TestPlpgsqlCheckValidationUnit(unittest.TestCase):
         self.assertTrue(any("alvo não verificado" in iss[1] for iss in issues))
 
 
-def check_live_postgres_available() -> bool:
-    try:
-        from config import get_postgres_connection, PostgresConfig
-        cfg = PostgresConfig()
-        conn = get_postgres_connection(cfg)
-        cur = conn.cursor()
-        cur.execute("SELECT 1;")
-        res = cur.fetchone()
-        conn.close()
-        return bool(res and res[0] == 1)
-    except psycopg2.Error:
-        return False
-
-
-HAS_REAL_PG = check_live_postgres_available()
-
-
 class DbCursorProxy:
     def __init__(self, real_cur, execute_hook=None, fetchone_hook=None):
         self._cur = real_cur
@@ -423,7 +412,7 @@ class DbConnProxy:
         self._conn.autocommit = val
 
 
-@unittest.skipUnless(HAS_REAL_PG, "Live PostgreSQL instance required for full regression tests")
+@requires_postgres_class
 class TestValidatePostgresDdlRegression(unittest.TestCase):
     """
     Regression tests calling the complete public validate_postgres_ddl() function
@@ -433,9 +422,9 @@ class TestValidatePostgresDdlRegression(unittest.TestCase):
     """
 
     def setUp(self):
-        from config import get_postgres_connection
-        self.conn = get_postgres_connection()
-        self.schema_name = "test_disposable_val"
+        require_live_postgres(self)
+        self.conn = get_test_postgres_connection()
+        self.schema_name = unique_name("test_disposable_val")
         cur = self.conn.cursor()
         cur.execute(f"DROP SCHEMA IF EXISTS {self.schema_name} CASCADE;")
         cur.execute(f"CREATE SCHEMA {self.schema_name};")

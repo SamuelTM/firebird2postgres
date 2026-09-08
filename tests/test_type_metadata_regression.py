@@ -2,7 +2,6 @@ import unittest
 from unittest.mock import MagicMock
 
 import psycopg2
-from config import get_postgres_connection, PostgresConfig
 from engine.data_migrator import DataMigrator
 from engine.ddl_exporter import DdlExporter
 from engine.schema_extractor import SchemaExtractor
@@ -10,20 +9,13 @@ from models import Column, Table, resolve_firebird_type
 from transpiler import FirebirdToPostgresVisitor
 
 
-def check_live_postgres_available() -> bool:
-    try:
-        cfg = PostgresConfig()
-        conn = get_postgres_connection(cfg)
-        cur = conn.cursor()
-        cur.execute("SELECT 1;")
-        res = cur.fetchone()
-        conn.close()
-        return bool(res and res[0] == 1)
-    except psycopg2.Error:
-        return False
-
-
-HAS_REAL_PG = check_live_postgres_available()
+from tests.db_isolation import (
+    get_test_postgres_connection,
+    is_postgres_available,
+    require_live_postgres,
+    requires_postgres,
+    requires_postgres_class,
+)
 
 
 class TestTypeMetadataRegression(unittest.TestCase):
@@ -33,8 +25,8 @@ class TestTypeMetadataRegression(unittest.TestCase):
     """
 
     def setUp(self):
-        if HAS_REAL_PG:
-            self.pg_con = get_postgres_connection()
+        if is_postgres_available():
+            self.pg_con = get_test_postgres_connection()
             self.pg_con.autocommit = False
             self.pg_cur = self.pg_con.cursor()
         else:
@@ -264,7 +256,7 @@ class TestTypeMetadataRegression(unittest.TestCase):
             exporter._fetch_procedure_parameters(mock_cur, 'SP1')
         self.assertIn("array", str(ctx.exception).lower())
 
-    @unittest.skipUnless(HAS_REAL_PG, "Live PostgreSQL instance required for exact binary load test")
+    @requires_postgres
     def test_binary_octets_migration_exact_bytes_roundtrip(self):
         """
         Verify exact binary migration into PostgreSQL BYTEA and domain on BYTEA:
@@ -299,6 +291,8 @@ class TestTypeMetadataRegression(unittest.TestCase):
         mock_fb_con = MagicMock()
         mock_fb_cur = MagicMock()
         mock_fb_con.cursor.return_value = mock_fb_cur
+        # Explicit frozen-source proof (production rejects bare mocks).
+        mock_fb_cur.fetchone.side_effect = [(1, 0), (0,)]
         mock_fb_cur.fetchmany.side_effect = [
             [
                 (1, payload_1, payload_1),

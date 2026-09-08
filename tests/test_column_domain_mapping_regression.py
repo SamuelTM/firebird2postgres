@@ -7,9 +7,13 @@ from engine.ddl_exporter import DdlExporter
 from engine.data_migrator import DataMigrator
 from models.database_objects import Table, Column
 from models.firebird_types import build_domain_mapping
-from tests.test_integration_execution import check_live_postgres_available, get_postgres_connection
+from tests.db_isolation import (
+    get_test_postgres_connection,
+    is_postgres_available,
+    requires_postgres,
+)
 
-HAS_REAL_PG = check_live_postgres_available()
+
 
 
 class TestColumnDomainMappingRegression(unittest.TestCase):
@@ -169,7 +173,7 @@ class TestColumnDomainMappingRegression(unittest.TestCase):
         self.assertIn('"foto" public."dom_foto"', ddl)
         self.assertIn('"descricao" public."dom_texto"', ddl)
 
-    @unittest.skipUnless(HAS_REAL_PG, "Live PostgreSQL database required")
+    @requires_postgres
     def test_live_postgres_catalog_and_domain_resolution(self):
         """
         Verify live PostgreSQL catalog for domain creation and table columns referencing domains:
@@ -177,7 +181,7 @@ class TestColumnDomainMappingRegression(unittest.TestCase):
         - Creates table 'foo' referencing domains
         - Inspects pg_attribute, pg_type to ensure effective types and domain references
         """
-        con = get_postgres_connection()
+        con = get_test_postgres_connection()
         cur = con.cursor()
         try:
             # Clean up prior test objects
