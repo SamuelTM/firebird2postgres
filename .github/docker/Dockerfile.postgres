@@ -1,0 +1,12 @@
+# Disposable PostgreSQL for the CI integration stage.
+# Stock postgres images do not ship plpgsql_check, which
+# TestValidatePostgresDdlRegression requires in setUp
+# (CREATE EXTENSION IF NOT EXISTS plpgsql_check).
+# The image already configures the official PostgreSQL APT repository
+# (PGDG), so only the extension package needs installing.
+FROM postgres:16-bookworm
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends postgresql-16-plpgsql-check \
+ && rm -rf /var/lib/apt/lists/* \
+ && ls /usr/share/postgresql/16/extension/plpgsql_check.control
