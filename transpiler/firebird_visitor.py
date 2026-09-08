@@ -893,10 +893,12 @@ def _is_timestamp_expr(expr: str, symbols: dict[str, str] = None) -> bool:
     ):
         return True
 
-    m_fn = re.match(r"^(COALESCE|NULLIF|IIF)\s*\((.*)\)$", s, re.IGNORECASE | re.DOTALL)
+    m_fn = re.match(r"^(COALESCE|NULLIF|IIF|DATEADD)\s*\((.*)\)$", s, re.IGNORECASE | re.DOTALL)
     if m_fn:
         fn = m_fn.group(1).upper()
         args = _split_top_level_args(m_fn.group(2))
+        if fn == "DATEADD" and len(args) == 3:
+            return _is_timestamp_expr(args[2], symbols)
         if fn == "NULLIF" and args:
             return _is_timestamp_expr(args[0], symbols)
         if fn == "IIF" and len(args) >= 3:
@@ -914,10 +916,10 @@ def _is_timestamp_expr(expr: str, symbols: dict[str, str] = None) -> bool:
             return True
 
     if symbols:
-        clean = s.lstrip(':').strip('"').lower()
+        clean = '.'.join(p.strip('":') for p in s.split('.')).lower()
         if '.' in clean:
             # Qualified ref: prefer qualified key; bare fallback only if qualified is absent
-            col_part = clean.split('.')[-1].strip('"')
+            col_part = clean.split('.')[-1]
             key = clean if clean in symbols else col_part
             if _is_timestamp_type(symbols.get(key, '')):
                 return True
@@ -942,10 +944,12 @@ def _is_date_expr(expr: str, symbols: dict[str, str] = None) -> bool:
     ):
         return True
 
-    m_fn = re.match(r"^(COALESCE|NULLIF|IIF)\s*\((.*)\)$", s, re.IGNORECASE | re.DOTALL)
+    m_fn = re.match(r"^(COALESCE|NULLIF|IIF|DATEADD)\s*\((.*)\)$", s, re.IGNORECASE | re.DOTALL)
     if m_fn:
         fn = m_fn.group(1).upper()
         args = _split_top_level_args(m_fn.group(2))
+        if fn == "DATEADD" and len(args) == 3:
+            return _is_date_expr(args[2], symbols)
         if fn == "NULLIF" and args:
             return _is_date_expr(args[0], symbols)
         if fn == "IIF" and len(args) >= 3:
@@ -966,10 +970,10 @@ def _is_date_expr(expr: str, symbols: dict[str, str] = None) -> bool:
         return bool(b_non_null) and all(_is_date_expr(b, symbols) for b in b_non_null)
 
     if symbols:
-        clean = s.lstrip(':').strip('"').lower()
+        clean = '.'.join(p.strip('":') for p in s.split('.')).lower()
         if '.' in clean:
             # Qualified ref: prefer qualified key; bare fallback only if qualified is absent
-            col_part = clean.split('.')[-1].strip('"')
+            col_part = clean.split('.')[-1]
             key = clean if clean in symbols else col_part
             if _is_date_type(symbols.get(key, '')):
                 return True
@@ -1001,10 +1005,12 @@ def _is_time_expr(expr: str, symbols: dict[str, str] = None) -> bool:
     ):
         return True
 
-    m_fn = re.match(r"^(COALESCE|NULLIF|IIF)\s*\((.*)\)$", s, re.IGNORECASE | re.DOTALL)
+    m_fn = re.match(r"^(COALESCE|NULLIF|IIF|DATEADD)\s*\((.*)\)$", s, re.IGNORECASE | re.DOTALL)
     if m_fn:
         fn = m_fn.group(1).upper()
         args = _split_top_level_args(m_fn.group(2))
+        if fn == "DATEADD" and len(args) == 3:
+            return _is_time_expr(args[2], symbols)
         if fn == "NULLIF" and args:
             return _is_time_expr(args[0], symbols)
         if fn == "IIF" and len(args) >= 3:
@@ -1025,10 +1031,10 @@ def _is_time_expr(expr: str, symbols: dict[str, str] = None) -> bool:
         return bool(b_non_null) and all(_is_time_expr(b, symbols) for b in b_non_null)
 
     if symbols:
-        clean = s.lstrip(':').strip('"').lower()
+        clean = '.'.join(p.strip('":') for p in s.split('.')).lower()
         if '.' in clean:
             # Qualified ref: prefer qualified key; bare fallback only if qualified is absent
-            col_part = clean.split('.')[-1].strip('"')
+            col_part = clean.split('.')[-1]
             key = clean if clean in symbols else col_part
             if _is_time_type(symbols.get(key, '')):
                 return True
@@ -1049,12 +1055,13 @@ def _normalize_ident_case(raw_ident: str) -> str:
 
 
 class TableSource:
-    def __init__(self, table_name: str, alias: Optional[str] = None, qualifier: str = ""):
+    def __init__(self, table_name: str, alias: Optional[str] = None, qualifier: str = "", subquery_ctx: Optional[Any] = None):
         self.table_name = table_name
         self.table_name_clean = table_name.strip('":').lower()
         self.alias = alias
         self.alias_clean = alias.strip('":').lower() if alias else None
         self.qualifier = qualifier
+        self.subquery_ctx = subquery_ctx
 
 
 class QueryScope:
@@ -1089,23 +1096,24 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                 if k.lower().startswith("__seq_inc__"):
                     if self.sequence_increments is None:
                         self.sequence_increments = {}
-                    seq = k.lower().replace("__seq_inc__", "").strip('":')
                     try:
-                        self.sequence_increments[seq] = int(v)
+                        self.sequence_increments[k[len("__seq_inc__"):].lower()] = int(v)
                     except (ValueError, TypeError):
                         pass
-        self.is_trigger = False
-        self.trigger_return = "RETURN NEW"
-        self.current_scope: Optional[QueryScope] = None
-        self.params: set[str] = set()
         self.local_vars: set[str] = set()
-        self.table_columns: dict[str, set[str]] = defaultdict(set)
+        self.params: set[str] = set()
+        self.is_trigger: bool = False
+        self.trigger_return: str = "RETURN NEW;"
+        self.current_scope: Optional[QueryScope] = None
+        self.table_columns: dict[str, set[str]] = {}
         if symbols:
-            for k in symbols:
+            for k in symbols.keys():
                 k_clean = k.strip('":').lower()
                 if '.' in k_clean:
-                    rel, col = k_clean.split('.', 1)
-                    self.table_columns[rel.strip('":')].add(col.strip('":'))
+                    tbl, col = k_clean.split('.', 1)
+                    if tbl not in self.table_columns:
+                        self.table_columns[tbl] = set()
+                    self.table_columns[tbl].add(col)
 
     def visitCreate_procedure_body(self, ctx: FirebirdParser.Create_procedure_bodyContext):
         old_symbols = self.symbols.copy()
@@ -1122,6 +1130,28 @@ class ASTDialectRewriter(FirebirdParserVisitor):
         old_is_trigger = self.is_trigger
         old_trigger_return = self.trigger_return
         self.is_trigger = True
+
+        table_name = ctx.tableview_name().getText().strip('":').lower() if ctx.tableview_name() else ""
+        if not table_name:
+            tables_in_symbols = {k.split('.')[0] for k in old_symbols if '.' in k and not k.startswith(('new.', 'old.'))}
+            if len(tables_in_symbols) == 1:
+                table_name = next(iter(tables_in_symbols))
+
+        if table_name:
+            prefix = f"{table_name}."
+            for k, v in list(old_symbols.items()):
+                if k.startswith(prefix):
+                    col = k[len(prefix):]
+                    self.symbols[f"new.{col}"] = v
+                    self.symbols[f"old.{col}"] = v
+                elif '.' not in k:
+                    self.symbols[f"new.{k}"] = v
+                    self.symbols[f"old.{k}"] = v
+        else:
+            for k, v in list(old_symbols.items()):
+                col = k.split('.')[-1]
+                self.symbols[f"new.{col}"] = v
+                self.symbols[f"old.{col}"] = v
 
         simple_dml = ctx.simple_dml_trigger()
         timing = "BEFORE"
@@ -1659,7 +1689,12 @@ class ASTDialectRewriter(FirebirdParserVisitor):
             t_int = aux.table_ref_aux_internal()
             t_name = t_int.getText().strip() if t_int else ""
             qualifier = alias if alias else t_name
-            return TableSource(table_name=t_name, alias=alias, qualifier=qualifier)
+            subquery_ctx = None
+            if t_int and hasattr(t_int, 'dml_table_expression_clause') and t_int.dml_table_expression_clause():
+                dml = t_int.dml_table_expression_clause()
+                if hasattr(dml, 'select_statement') and dml.select_statement():
+                    subquery_ctx = dml.select_statement()
+            return TableSource(table_name=t_name, alias=alias, qualifier=qualifier, subquery_ctx=subquery_ctx)
 
         for tr in trl.table_ref():
             if hasattr(tr, 'table_ref_aux') and tr.table_ref_aux():
@@ -1673,6 +1708,97 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                         if src:
                             tables.append(src)
         return tables
+
+    def _infer_subquery_projections(self, select_stmt, symbols: dict[str, str]) -> dict[str, str]:
+        projections = {}
+        if not select_stmt:
+            return projections
+        try:
+            sub_only = select_stmt.select_only_statement()
+            if not sub_only or not sub_only.subquery():
+                return projections
+            basic = sub_only.subquery().subquery_basic_elements()
+            if not basic or not basic.query_block():
+                return projections
+            qb = basic.query_block()
+            if not qb.selected_list():
+                return projections
+
+            sub_tables = self._extract_tables_from_query_block(qb)
+            sub_symbols = symbols.copy()
+            for st in sub_tables:
+                if st.subquery_ctx:
+                    inner_proj = self._infer_subquery_projections(st.subquery_ctx, symbols)
+                    alias_use = st.alias_clean or st.table_name_clean
+                    for c_name, c_type in inner_proj.items():
+                        if c_type:
+                            sub_symbols[f"{alias_use}.{c_name}"] = c_type
+                elif st.alias_clean and st.table_name_clean:
+                    prefix = f"{st.table_name_clean}."
+                    for k, v in list(symbols.items()):
+                        if k.startswith(prefix):
+                            col = k[len(prefix):]
+                            sub_symbols[f"{st.alias_clean}.{col}"] = v
+
+            active_tables = [st for st in sub_tables if st.table_name_clean.upper() != 'RDB$DATABASE']
+            if len(active_tables) == 1:
+                st = active_tables[0]
+                prefixes = [f"{st.table_name_clean}."]
+                if st.alias_clean:
+                    prefixes.insert(0, f"{st.alias_clean}.")
+                for prefix in prefixes:
+                    for k, v in list(sub_symbols.items()):
+                        if k.startswith(prefix):
+                            sub_symbols[k[len(prefix):]] = v
+
+            sl = qb.selected_list()
+            if sl.getText() == '*':
+                for k, v in sub_symbols.items():
+                    if '.' in k:
+                        projections[k.split('.')[-1]] = v
+                    else:
+                        projections[k] = v
+                return projections
+
+            if hasattr(sl, 'select_list_elements') and sl.select_list_elements():
+                for el in sl.select_list_elements():
+                    if hasattr(el, 'ASTERISK') and el.ASTERISK() and hasattr(el, 'tableview_name') and el.tableview_name():
+                        t_name = el.tableview_name().getText().strip('":').lower()
+                        prefix = f"{t_name}."
+                        for k, v in sub_symbols.items():
+                            if k.startswith(prefix):
+                                projections[k[len(prefix):]] = v
+                    elif hasattr(el, 'expression') and el.expression():
+                        col_name = None
+                        if hasattr(el, 'column_alias') and el.column_alias():
+                            ca = el.column_alias()
+                            raw_a = ca.identifier().getText() if hasattr(ca, 'identifier') and ca.identifier() else ca.getText()
+                            col_name = re.sub(r'(?i)^\s*AS\s+', '', raw_a).strip('":').lower()
+                        if not col_name:
+                            expr_raw = el.expression().getText().strip()
+                            col_name = expr_raw.split('.')[-1].strip('":').lower()
+
+                        expr_str = self._get_tokens_text(el.expression()).strip()
+                        col_type = None
+                        if _is_date_expr(expr_str, sub_symbols):
+                            col_type = 'DATE'
+                        elif _is_timestamp_expr(expr_str, sub_symbols):
+                            col_type = 'TIMESTAMP'
+                        elif _is_time_expr(expr_str, sub_symbols):
+                            col_type = 'TIME'
+                        else:
+                            clean_expr = '.'.join(p.strip('":') for p in expr_str.split('.')).lower()
+                            if clean_expr in sub_symbols:
+                                col_type = sub_symbols[clean_expr]
+                            else:
+                                col_part = clean_expr.split('.')[-1]
+                                if col_part in sub_symbols:
+                                    col_type = sub_symbols[col_part]
+                        if col_name:
+                            projections[col_name] = col_type
+        except Exception:
+            pass
+        return projections
 
     @staticmethod
     def _extract_using_columns_from_query_block(qb: FirebirdParser.Query_blockContext) -> set[str]:
@@ -1709,7 +1835,19 @@ class ASTDialectRewriter(FirebirdParserVisitor):
         try:
             if tables:
                 for tbl in tables:
-                    if tbl.alias_clean and tbl.table_name_clean:
+                    if tbl.subquery_ctx:
+                        proj = self._infer_subquery_projections(tbl.subquery_ctx, old_symbols)
+                        alias = tbl.alias_clean or tbl.table_name_clean
+                        for col_name, col_type in proj.items():
+                            if col_type:
+                                self.symbols[f"{alias}.{col_name}"] = col_type
+                        if hasattr(self, 'table_columns'):
+                            cols = set(self.table_columns.get(tbl.table_name_clean, []))
+                            cols.update(proj.keys())
+                            self.table_columns[tbl.table_name_clean] = cols
+                            if tbl.alias_clean:
+                                self.table_columns[tbl.alias_clean] = cols
+                    elif tbl.alias_clean and tbl.table_name_clean:
                         prefix = f"{tbl.table_name_clean}."
                         for k, v in list(old_symbols.items()):
                             if k.startswith(prefix):
