@@ -62,6 +62,7 @@ class DdlExporter:
 
     def __init__(self, fb_con):
         self.fb_con = fb_con
+        self.exported_counts: dict[str, int] = {}
 
     @staticmethod
     def _dump_header(title: str) -> str:
@@ -180,6 +181,8 @@ class DdlExporter:
             executor=executor,
             chunksize=chunksize,
         )
+        self.exported_counts[DumpFiles.TRIGGERS_PG] = len(triggers)
+        return len(triggers)
 
     @staticmethod
     def _format_trigger_firebird_ddl(trigger_name: str, relation_name: str,
@@ -232,6 +235,8 @@ class DdlExporter:
             executor=executor,
             chunksize=chunksize,
         )
+        self.exported_counts[DumpFiles.PROCEDURES_PG] = len(procedures)
+        return len(procedures)
 
     @staticmethod
     def _fetch_domain_info(cursor) -> tuple[dict[str, str], dict[str, str]]:
@@ -499,6 +504,8 @@ class DdlExporter:
             chunksize=chunksize,
             per_item_separator=True,
         )
+        self.exported_counts[DumpFiles.VIEWS_PG] = len(views)
+        return len(views)
 
     @staticmethod
     def _resolve_view_dependency_order(cursor, view_names: set[str]) -> list[str]:
@@ -725,6 +732,75 @@ class DdlExporter:
                 executor=executor
             )
 
+        return dict(self.exported_counts)
+
+    def get_source_object_counts(self) -> dict[str, int]:
+        """
+        Queries Firebird catalog to count user-defined objects for each category.
+        Returns a dict mapping dump filename (e.g. DumpFiles.DOMAINS_PG) to expected count.
+        """
+        cursor = self.fb_con.cursor()
+        counts = {}
+
+        # Domains
+        try:
+            cursor.execute("""
+                SELECT COUNT(*) FROM RDB$FIELDS
+                WHERE RDB$SYSTEM_FLAG = 0
+                  AND RDB$FIELD_NAME NOT STARTING WITH 'RDB$';
+            """)
+            counts[DumpFiles.DOMAINS_PG] = cursor.fetchone()[0] or 0
+        except Exception:
+            counts[DumpFiles.DOMAINS_PG] = 0
+
+        # Procedures
+        try:
+            cursor.execute("""
+                SELECT COUNT(*) FROM RDB$PROCEDURES
+                WHERE RDB$SYSTEM_FLAG = 0
+                  AND RDB$PROCEDURE_SOURCE IS NOT NULL;
+            """)
+            counts[DumpFiles.PROCEDURES_PG] = cursor.fetchone()[0] or 0
+        except Exception:
+            counts[DumpFiles.PROCEDURES_PG] = 0
+
+        # Views
+        try:
+            cursor.execute("""
+                SELECT COUNT(*) FROM RDB$RELATIONS
+                WHERE RDB$SYSTEM_FLAG = 0
+                  AND RDB$VIEW_BLR IS NOT NULL;
+            """)
+            counts[DumpFiles.VIEWS_PG] = cursor.fetchone()[0] or 0
+        except Exception:
+            counts[DumpFiles.VIEWS_PG] = 0
+
+        # Triggers
+        try:
+            cursor.execute("""
+                SELECT COUNT(*) FROM RDB$TRIGGERS
+                WHERE RDB$SYSTEM_FLAG = 0
+                  AND RDB$TRIGGER_SOURCE IS NOT NULL
+                  AND (RDB$TRIGGER_INACTIVE = 0 OR RDB$TRIGGER_INACTIVE IS NULL);
+            """)
+            counts[DumpFiles.TRIGGERS_PG] = cursor.fetchone()[0] or 0
+        except Exception:
+            counts[DumpFiles.TRIGGERS_PG] = 0
+
+        # Generators / Sequences
+        try:
+            cursor.execute("""
+                SELECT COUNT(*) FROM RDB$GENERATORS
+                WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
+                  AND RDB$GENERATOR_NAME NOT STARTING WITH 'RDB$'
+                  AND RDB$GENERATOR_NAME NOT STARTING WITH 'MON$';
+            """)
+            counts[DumpFiles.SEQUENCES_PG] = cursor.fetchone()[0] or 0
+        except Exception:
+            counts[DumpFiles.SEQUENCES_PG] = 0
+
+        return counts
+
     def export_firebird_generators(self, output_file: str = None,
                                    converted_file: str = None):
         """
@@ -784,6 +860,9 @@ class DdlExporter:
             f.write(self._dump_header("POSTGRESQL SEQUENCES"))
             for stmt in items_pg:
                 f.write(f"{stmt}\n")
+
+        self.exported_counts[DumpFiles.SEQUENCES_PG] = len(items_pg)
+        return len(items_pg)
 
     def export_firebird_domains(self, output_file: str = None,
                                 converted_file: str = None):
@@ -888,6 +967,8 @@ class DdlExporter:
                 conv_f.write(pg_ddl)
 
         logger.info(f"Exported {len(domains)} domains to '{out_file}' and '{conv_file}'")
+        self.exported_counts[DumpFiles.DOMAINS_PG] = len(domains)
+        return len(domains)
 
     @staticmethod
     def _format_domain_firebird_ddl(domain_name: str, fb_full_type: str,

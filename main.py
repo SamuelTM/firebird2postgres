@@ -23,6 +23,13 @@ if __name__ == '__main__':
         migrator.export_all_firebird_ddl()
 
         # -------------------------------------------------------------
+        # Pre-flight Validation: Distinguish legitimately empty categories
+        # from missing or incomplete exports BEFORE destructive DROP
+        # -------------------------------------------------------------
+        logger.info("Validating exported DDL artifacts before dropping target schema...")
+        verified_empty = migrator.validate_artifacts()
+
+        # -------------------------------------------------------------
         # STEP 2: Teardown - drop existing tables, sequences and domains
         # (tables must go first: DROP DOMAIN CASCADE would otherwise drop
         # the table columns that reference the domains)
@@ -34,7 +41,10 @@ if __name__ == '__main__':
         # STEP 3: Apply Domains in PostgreSQL
         # -------------------------------------------------------------
         logger.info("[STEP 3/9] Applying Domains in PostgreSQL...")
-        migrator.apply_sql_file(get_dump_path(DumpFiles.DOMAINS_PG))
+        migrator.apply_sql_file(
+            get_dump_path(DumpFiles.DOMAINS_PG),
+            allow_empty=verified_empty.get(DumpFiles.DOMAINS_PG, False)
+        )
 
         # -------------------------------------------------------------
         # STEP 4: Create Base Tables and Sequences (without constraints/indexes)
@@ -63,14 +73,23 @@ if __name__ == '__main__':
         # STEP 7: Apply Procedures and Views in PostgreSQL
         # -------------------------------------------------------------
         logger.info("[STEP 7/9] Applying Procedures and Views in PostgreSQL...")
-        migrator.apply_sql_file(get_dump_path(DumpFiles.PROCEDURES_PG))
-        migrator.apply_sql_file(get_dump_path(DumpFiles.VIEWS_PG))
+        migrator.apply_sql_file(
+            get_dump_path(DumpFiles.PROCEDURES_PG),
+            allow_empty=verified_empty.get(DumpFiles.PROCEDURES_PG, False)
+        )
+        migrator.apply_sql_file(
+            get_dump_path(DumpFiles.VIEWS_PG),
+            allow_empty=verified_empty.get(DumpFiles.VIEWS_PG, False)
+        )
 
         # -------------------------------------------------------------
         # STEP 8: Apply Triggers in PostgreSQL
         # -------------------------------------------------------------
         logger.info("[STEP 8/9] Applying Triggers in PostgreSQL...")
-        migrator.apply_sql_file(get_dump_path(DumpFiles.TRIGGERS_PG))
+        migrator.apply_sql_file(
+            get_dump_path(DumpFiles.TRIGGERS_PG),
+            allow_empty=verified_empty.get(DumpFiles.TRIGGERS_PG, False)
+        )
 
         # -------------------------------------------------------------
         # STEP 9: Update Optimizer Statistics (ANALYZE)
