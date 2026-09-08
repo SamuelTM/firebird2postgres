@@ -116,7 +116,7 @@ def build_domain_mapping(domain_names: Iterable[str], relation_names: set[str]) 
     mapping: dict[str, str] = {}
     allocated: set[str] = set()
 
-    clean_domains = [d.strip() for d in domain_names if d and d.strip()]
+    clean_domains = sorted(dict.fromkeys(d.strip() for d in domain_names if d and d.strip()))
 
     # Pass 1: Original names that don't collide with relations
     for d in clean_domains:

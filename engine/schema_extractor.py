@@ -121,7 +121,8 @@ class SchemaExtractor:
         """
         cursor.execute("""
             SELECT DISTINCT RDB$FIELD_NAME FROM RDB$FIELDS
-            WHERE RDB$SYSTEM_FLAG = 0 AND RDB$FIELD_NAME NOT STARTING WITH 'RDB$';
+            WHERE RDB$SYSTEM_FLAG = 0 AND RDB$FIELD_NAME NOT STARTING WITH 'RDB$'
+            ORDER BY RDB$FIELD_NAME;
         """)
         domain_names = [r[0].strip() for r in cursor.fetchall() if r[0]]
         return build_domain_mapping(domain_names, relation_names)
@@ -133,7 +134,6 @@ class SchemaExtractor:
         """
         Extracts all columns for a given table, resolving types and domain mappings.
         """
-        _ = domain_map
         try:
             cursor.execute("""
                 SELECT rf.RDB$FIELD_NAME, f.RDB$FIELD_TYPE, f.RDB$FIELD_SUB_TYPE,
@@ -237,19 +237,24 @@ class SchemaExtractor:
                 dimensions=dimensions,
             )
 
+            if not column_data_type:
+                raise TypeError(
+                    f"Unsupported or unrecognized Firebird data type (field_type={field_type}, "
+                    f"field_subtype={field_subtype}) for column '{column_name}' in table '{table_name}'."
+                )
+
             # Preserve domains: if field_source is a user domain, retain its name
             domain_name = None
             if field_source and not field_source.startswith('RDB$'):
-                column_data_type = resolve_pg_domain_name(field_source, relation_names)
-                if relation_names:
+                clean_fs = field_source.upper()
+                if domain_map and clean_fs in domain_map:
+                    domain_name = domain_map[clean_fs]
+                elif relation_names:
                     domain_name = resolve_pg_domain_name(field_source, relation_names)
+                else:
+                    domain_name = field_source.lower()
                 default_value = column_default
             else:
-                if not column_data_type:
-                    raise TypeError(
-                        f"Unsupported or unrecognized Firebird data type (field_type={field_type}, "
-                        f"field_subtype={field_subtype}) for column '{column_name}' in table '{table_name}'."
-                    )
                 default_value = column_default or domain_default
 
             if default_value:

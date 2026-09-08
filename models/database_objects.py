@@ -166,7 +166,7 @@ class Table:
             if not col.computed_source:
                 if col.identity_type:
                     opts = []
-                    min_val, max_val = get_integer_bounds(type_decl)
+                    min_val, max_val = get_integer_bounds(col.column_type or type_decl)
                     if col.identity_increment is not None and col.identity_increment != 1:
                         opts.append(f"INCREMENT BY {col.identity_increment}")
                     if col.identity_increment is not None and col.identity_increment < 0:
