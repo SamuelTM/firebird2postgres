@@ -18,9 +18,20 @@ class TestDdlExporterTriggers(unittest.TestCase):
         mock_cursor = MagicMock()
         mock_fb_con.cursor.return_value = mock_cursor
 
-        mock_cursor.fetchall.return_value = [
-            ("Z_CALCULA", "PEDIDOS", 1, "AS BEGIN NEW.TOTAL = 100; END;", 0),
-            ("A_VALIDA", "PEDIDOS", 1, "AS BEGIN IF (NEW.TOTAL < 0) THEN EXCEPTION; END;", 10),
+        mock_cursor.fetchall.side_effect = [
+            # 1. triggers query
+            [
+                ("Z_CALCULA", "PEDIDOS", 1, "AS BEGIN NEW.TOTAL = 100; END;", 0),
+                ("A_VALIDA", "PEDIDOS", 1, "AS BEGIN IF (NEW.TOTAL < 0) THEN EXCEPTION; END;", 10),
+            ],
+            # 2. _fetch_all_column_symbols
+            [],
+            # 3. _fetch_domain_map relation_names
+            [],
+            # 4. _fetch_domain_map domain_names
+            [],
+            # 5. _fetch_all_sequence_increments
+            [],
         ]
 
         exporter = DdlExporter(mock_fb_con)

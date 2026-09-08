@@ -8,6 +8,38 @@ from models import (
 from transpiler import FirebirdToPostgresVisitor, validate_immutable_expression
 
 
+def is_column_not_found_error(e: Exception, column_name: str = "RDB$GENERATOR_INCREMENT") -> bool:
+    """
+    Returns True only if the error proves that the column does not exist in the Firebird catalog
+    (e.g., older Firebird versions where RDB$GENERATOR_INCREMENT was not present).
+    Any other error (permissions, connection loss, syntax, etc.) returns False.
+    """
+    if not isinstance(e, firebirdsql.Error):
+        return False
+    msg = str(e).lower()
+    sql_code = getattr(e, "sql_code", None)
+    gds_codes = getattr(e, "gds_codes", set()) or set()
+
+    # Permission errors must never be treated as column unknown
+    if sql_code == -551 or 335544352 in gds_codes or "permission" in msg or "privilege" in msg:
+        return False
+
+    # Connection errors must never be treated as column unknown
+    if "connection" in msg or "socket" in msg or "network" in msg or "broken pipe" in msg:
+        return False
+
+    # Check for Column unknown indicators
+    col_lower = column_name.lower()
+    if sql_code == -206 or 335544569 in gds_codes:
+        return True
+    if "column unknown" in msg:
+        return True
+    if "unknown column" in msg or (col_lower in msg and "unknown" in msg):
+        return True
+
+    return False
+
+
 def fetch_all_sequence_increments(cursor) -> dict[str, int]:
     """
     Fetches all user-defined sequence/generator increments from Firebird system catalog.
@@ -24,7 +56,9 @@ def fetch_all_sequence_increments(cursor) -> dict[str, int]:
     try:
         cursor.execute(query)
         rows = cursor.fetchall()
-    except firebirdsql.Error:
+    except firebirdsql.Error as e:
+        if not is_column_not_found_error(e, "RDB$GENERATOR_INCREMENT"):
+            raise RuntimeError(f"Failed to fetch sequence increments from Firebird: {e}") from e
         try:
             cursor.execute("""
                 SELECT RDB$GENERATOR_NAME, 1
@@ -34,18 +68,30 @@ def fetch_all_sequence_increments(cursor) -> dict[str, int]:
                   AND RDB$GENERATOR_NAME NOT STARTING WITH 'MON$';
             """)
             rows = cursor.fetchall()
-        except Exception as e:
-            raise RuntimeError(f"Failed to fetch sequence increments from Firebird: {e}") from e
+        except Exception as fallback_err:
+            raise RuntimeError(f"Failed to fetch sequence increments from Firebird: {fallback_err}") from fallback_err
     except Exception as e:
         raise RuntimeError(f"Failed to fetch sequence increments from Firebird: {e}") from e
 
     for row in rows:
         if row and row[0]:
-            val = row[1] if len(row) > 1 and row[1] is not None else 1
+            seq_name = str(row[0]).strip()
+            val = row[1] if len(row) > 1 else 1
+            if val is None:
+                raise ValueError(
+                    f"Invalid sequence increment None for generator '{seq_name}': sequence increment cannot be null"
+                )
             try:
-                increments[row[0].strip().lower()] = int(val)
-            except (ValueError, TypeError):
-                increments[row[0].strip().lower()] = 1
+                inc = int(val)
+            except (ValueError, TypeError) as e:
+                raise ValueError(
+                    f"Invalid sequence increment {val!r} for generator '{seq_name}': must be a valid integer"
+                ) from e
+            if inc == 0:
+                raise ValueError(
+                    f"Invalid sequence increment 0 for generator '{seq_name}': sequence increment cannot be zero"
+                )
+            increments[seq_name.lower()] = inc
     return increments
 
 
@@ -830,19 +876,40 @@ class SchemaExtractor:
                   AND RDB$GENERATOR_NAME NOT STARTING WITH 'MON$';
             """)
             seq_rows = cursor.fetchall()
-        except firebirdsql.Error:
-            cursor.execute("""
-                SELECT RDB$GENERATOR_NAME, 1
-                FROM RDB$GENERATORS
-                WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
-                  AND RDB$GENERATOR_NAME NOT STARTING WITH 'RDB$'
-                  AND RDB$GENERATOR_NAME NOT STARTING WITH 'MON$';
-            """)
-            seq_rows = cursor.fetchall()
+        except firebirdsql.Error as e:
+            if not is_column_not_found_error(e, "RDB$GENERATOR_INCREMENT"):
+                raise RuntimeError(f"Failed to query sequences from Firebird: {e}") from e
+            try:
+                cursor.execute("""
+                    SELECT RDB$GENERATOR_NAME, 1
+                    FROM RDB$GENERATORS
+                    WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
+                      AND RDB$GENERATOR_NAME NOT STARTING WITH 'RDB$'
+                      AND RDB$GENERATOR_NAME NOT STARTING WITH 'MON$';
+                """)
+                seq_rows = cursor.fetchall()
+            except Exception as fallback_err:
+                raise RuntimeError(f"Failed to query sequences from Firebird: {fallback_err}") from fallback_err
+        except Exception as e:
+            raise RuntimeError(f"Failed to query sequences from Firebird: {e}") from e
         sequences = []
         for row in seq_rows:
             name = row[0].strip()
-            increment = int(row[1]) if len(row) > 1 and row[1] is not None else 1
+            val = row[1] if len(row) > 1 else 1
+            if val is None:
+                raise ValueError(
+                    f"Invalid sequence increment None for generator '{name}': sequence increment cannot be null"
+                )
+            try:
+                increment = int(val)
+            except (ValueError, TypeError) as e:
+                raise ValueError(
+                    f"Invalid sequence increment {val!r} for generator '{name}': must be a valid integer"
+                ) from e
+            if increment == 0:
+                raise ValueError(
+                    f"Invalid sequence increment 0 for generator '{name}': sequence increment cannot be zero"
+                )
             safe_name = name.replace('"', '""')
             try:
                 cursor.execute(f'SELECT GEN_ID("{safe_name}", 0) FROM RDB$DATABASE;')

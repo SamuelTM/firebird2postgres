@@ -14,7 +14,7 @@ from models import (
 )
 from transpiler import FirebirdToPostgresVisitor
 from utils import choose_dollar_tag
-from engine.schema_extractor import fetch_all_sequence_increments
+from engine.schema_extractor import fetch_all_sequence_increments, is_column_not_found_error
 
 logger = logging.getLogger(__name__)
 
@@ -869,20 +869,41 @@ class DdlExporter:
                   AND RDB$GENERATOR_NAME NOT STARTING WITH 'MON$';
             """)
             rows = cursor.fetchall()
-        except firebirdsql.Error:
-            cursor.execute("""
-                SELECT RDB$GENERATOR_NAME, 1
-                FROM RDB$GENERATORS
-                WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
-                  AND RDB$GENERATOR_NAME NOT STARTING WITH 'RDB$'
-                  AND RDB$GENERATOR_NAME NOT STARTING WITH 'MON$';
-            """)
-            rows = cursor.fetchall()
+        except firebirdsql.Error as e:
+            if not is_column_not_found_error(e, "RDB$GENERATOR_INCREMENT"):
+                raise RuntimeError(f"Failed to export sequences from Firebird: {e}") from e
+            try:
+                cursor.execute("""
+                    SELECT RDB$GENERATOR_NAME, 1
+                    FROM RDB$GENERATORS
+                    WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
+                      AND RDB$GENERATOR_NAME NOT STARTING WITH 'RDB$'
+                      AND RDB$GENERATOR_NAME NOT STARTING WITH 'MON$';
+                """)
+                rows = cursor.fetchall()
+            except Exception as fallback_err:
+                raise RuntimeError(f"Failed to export sequences from Firebird: {fallback_err}") from fallback_err
+        except Exception as e:
+            raise RuntimeError(f"Failed to export sequences from Firebird: {e}") from e
         items_fb = []
         items_pg = []
         for row in rows:
             name = row[0].strip()
-            increment = int(row[1]) if len(row) > 1 and row[1] is not None else 1
+            val = row[1] if len(row) > 1 else 1
+            if val is None:
+                raise ValueError(
+                    f"Invalid sequence increment None for generator '{name}': sequence increment cannot be null"
+                )
+            try:
+                increment = int(val)
+            except (ValueError, TypeError) as e:
+                raise ValueError(
+                    f"Invalid sequence increment {val!r} for generator '{name}': must be a valid integer"
+                ) from e
+            if increment == 0:
+                raise ValueError(
+                    f"Invalid sequence increment 0 for generator '{name}': sequence increment cannot be zero"
+                )
             safe_name = name.replace('"', '""')
             try:
                 cursor.execute(f'SELECT GEN_ID("{safe_name}", 0) FROM RDB$DATABASE;')
