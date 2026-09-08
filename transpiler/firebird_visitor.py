@@ -7,7 +7,7 @@ import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), 'firebird_grammar'))
 
 from collections import defaultdict
-from typing import TypeVar, Optional
+from typing import Any, TypeVar, Optional
 from antlr4 import InputStream, CommonTokenStream, ParserRuleContext
 from antlr4.atn.PredictionMode import PredictionMode
 from antlr4.error.ErrorListener import ErrorListener

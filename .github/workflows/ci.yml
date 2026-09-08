@@ -6,13 +6,19 @@ on:
 
 jobs:
   unit:
-    name: Unit tests (no live databases)
+    name: Unit tests, Python ${{ matrix.python-version }} (no live databases)
     runs-on: ubuntu-latest
+    strategy:
+      # 3.12 evaluates annotations eagerly at def time while 3.14 defers
+      # them (PEP 649): a missing import like `Any` passes locally on 3.14
+      # and breaks collection on 3.12, so both must run.
+      matrix:
+        python-version: ['3.12', '3.14']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: ${{ matrix.python-version }}
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -23,8 +29,11 @@ jobs:
         run: python -m pytest tests/ -q
 
   integration:
-    name: Integration tests (disposable live databases, mandatory)
+    name: Integration tests, Python ${{ matrix.python-version }} (disposable live databases, mandatory)
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.12', '3.14']
     services:
       postgres:
         image: postgres:16
@@ -65,7 +74,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: ${{ matrix.python-version }}
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip

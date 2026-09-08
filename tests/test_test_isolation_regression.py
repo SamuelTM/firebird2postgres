@@ -291,5 +291,57 @@ class TestSourceStateRejectedWithoutShortcuts(unittest.TestCase):
         self.assertNotIn('MagicMock', source)
 
 
+class TestDefTimeAnnotationsResolve(unittest.TestCase):
+    """
+    Guards collection on Python <= 3.13, where annotations are evaluated
+    eagerly at def time (local 3.14 defers them via PEP 649 and would mask
+    a missing import such as ``Any`` until CI runs 3.12).
+    Forces resolution of every def-time annotation in first-party modules
+    (generated ANTLR grammar excluded: proven 3.12-safe by import order).
+    """
+
+    def test_all_def_time_annotations_resolve(self):
+        import importlib
+
+        roots = ['transpiler', 'engine', 'models', 'utils', 'tests']
+        files = [
+            p for r in roots for p in TESTS_DIR.parent.glob(f"{r}/**/*.py")
+            if '__pycache__' not in p.parts and 'firebird_grammar' not in p.parts
+        ] + [TESTS_DIR.parent / name for name in ('config.py', 'main.py', 'validate_postgres_ddl.py')]
+        unresolved: list[str] = []
+        for path in sorted(files):
+            modname = str(path.relative_to(TESTS_DIR.parent).with_suffix('')).replace('/', '.')
+            tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+            try:
+                mod = importlib.import_module(modname)
+            except Exception as exc:
+                unresolved.append(f"{path.name}: IMPORT FAIL {type(exc).__name__}: {exc}")
+                continue
+            for node in ast.walk(tree):
+                anns = []
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for arg in node.args.args + node.args.kwonlyargs:
+                        if arg.annotation:
+                            anns.append((node.lineno, arg.arg, arg.annotation))
+                    for arg in (node.args.vararg, node.args.kwarg):
+                        if arg and arg.annotation:
+                            anns.append((node.lineno, arg.arg, arg.annotation))
+                    if node.returns:
+                        anns.append((node.lineno, 'return', node.returns))
+                elif isinstance(node, ast.AnnAssign) and node.annotation:
+                    anns.append((node.lineno, 'assign', node.annotation))
+                for lineno, what, ann in anns:
+                    try:
+                        eval(compile(ast.unparse(ann), str(path), 'eval'), mod.__dict__)  # noqa: S307
+                    except NameError as exc:
+                        unresolved.append(f"{path.name}:{lineno} ({what}): {exc}")
+                    except Exception:
+                        pass
+        self.assertEqual(
+            unresolved, [],
+            "Annotations that NameError on eager evaluation (Python <= 3.13):\n" + "\n".join(unresolved),
+        )
+
+
 if __name__ == '__main__':
     unittest.main()
