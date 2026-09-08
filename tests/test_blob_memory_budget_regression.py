@@ -9,7 +9,6 @@ from config import MigrationConfig
 from engine.data_migrator import (
     DataMigrator,
     SerializedByteBuffer,
-    _estimate_row_bytes,
     _import_single_table,
     is_blob_column,
     is_binary_column,
@@ -439,6 +438,8 @@ class TestBlobMemoryBudgetRegression(unittest.TestCase):
 
         self.assertTrue(is_blob_column(col_dom_bin, blob_domains))
         self.assertTrue(is_binary_column(col_dom_bin, binary_domains))
+
+    def test_memory_budget_distinguishes_total_from_worker(self):
         """
         Criteria:
         - Orçamento distingue memória por worker de memória total.
@@ -548,6 +549,154 @@ class TestBlobMemoryBudgetRegression(unittest.TestCase):
             peak_delta,
             20 * 1024 * 1024,
             f"Peak memory delta ({peak_delta / (1024 * 1024):.2f}MB) exceeded budget threshold!"
+        )
+
+    def test_incompatible_total_and_per_worker_rejected(self):
+        """
+        P2: total de 128 MiB com oito workers a 32 MiB/worker (256 MiB)
+        deve ser rejeitado em vez de silenciosamente permitir estouro.
+        """
+        with self.assertRaises(ValueError) as ctx:
+            DataMigrator.calculate_memory_budget(
+                max_workers=8,
+                total_budget=128 * 1024 * 1024,
+                per_worker_budget=32 * 1024 * 1024,
+            )
+        self.assertIn("exceeds total budget", str(ctx.exception))
+
+        # Blob serializado (~2x) maior que o worker também é incompatível.
+        with self.assertRaises(ValueError) as ctx:
+            DataMigrator.calculate_memory_budget(
+                max_workers=2,
+                total_budget=64 * 1024 * 1024,
+                per_worker_budget=32 * 1024 * 1024,
+                max_blob_bytes=32 * 1024 * 1024,
+            )
+        self.assertIn("exceeds", str(ctx.exception))
+
+        # Linha máxima maior que o worker é incompatível.
+        with self.assertRaises(ValueError):
+            DataMigrator.calculate_memory_budget(
+                max_workers=4,
+                total_budget=128 * 1024 * 1024,
+                per_worker_budget=32 * 1024 * 1024,
+                max_row_bytes=64 * 1024 * 1024,
+            )
+
+    def test_eight_workers_under_smaller_budget(self):
+        """
+        Regressão: oito workers sob orçamento menor — o per-worker deriva
+        do total e configurações impossíveis são rejeitadas; import_data
+        propaga o erro antes de qualquer operação destrutiva.
+        """
+        total, worker, _ = DataMigrator.calculate_memory_budget(
+            max_workers=8, total_budget=64 * 1024 * 1024
+        )
+        self.assertEqual(total, 64 * 1024 * 1024)
+        self.assertEqual(worker, 8 * 1024 * 1024)
+        self.assertLessEqual(8 * worker, total)
+
+        # Orçamento impossivelmente pequeno para 8 workers (>=1 MiB/worker).
+        with self.assertRaises(ValueError):
+            DataMigrator.calculate_memory_budget(
+                max_workers=8, total_budget=4 * 1024 * 1024
+            )
+
+        # import_data deve propagar a incompatibilidade sem desabilitar triggers.
+        mock_fb_con = MagicMock()
+        mock_pg_con = MagicMock()
+        mock_fb_cur = MagicMock()
+        mock_pg_cur = MagicMock()
+        mock_fb_con.cursor.return_value = mock_fb_cur
+        mock_pg_con.cursor.return_value = mock_pg_cur
+        mock_fb_cur.fetchone.side_effect = [(1, 0), (0,)]
+        migrator = DataMigrator(mock_fb_con, mock_pg_con)
+        with self.assertRaises(ValueError):
+            migrator.import_data(
+                [Table('T1')],
+                max_workers=8,
+                total_memory_budget=128 * 1024 * 1024,
+                per_worker_budget=32 * 1024 * 1024,
+            )
+        executed = [c[0][0] for c in mock_pg_cur.execute.call_args_list] if mock_pg_cur.execute.call_args_list else []
+        self.assertNotIn('DISABLE TRIGGER ALL', str(executed))
+
+    def test_multiple_blobs_in_same_row_enforce_row_cap(self):
+        """
+        Regressão: vários BLOBs individualmente válidos na mesma linha não
+        podem acumular além do buffer do worker antes do flush.
+        """
+        table = Table('TAB_MULTI_ROW_CAP')
+        table.columns.append(Column('ID', 'INTEGER', nullable=False))
+        table.columns.append(Column('B1', 'BLOB SUBTYPE 0', nullable=True))
+        table.columns.append(Column('B2', 'BLOB SUBTYPE 0', nullable=True))
+
+        # Cada BLOB respeita o limite individual (3KB < 4KB) mas a linha
+        # serializada (~12KB hex) excede o worker de 8KB.
+        mock_fb_cur = MagicMock()
+        mock_pg_cur = MagicMock()
+        mock_pg_con = MagicMock()
+        mock_fb_cur.fetchmany.side_effect = [[(1, b'A' * 3000, b'B' * 3000)], []]
+        with self.assertRaises(ValueError) as ctx:
+            _import_single_table(
+                table, mock_fb_cur, mock_pg_cur, mock_pg_con,
+                max_buffer_bytes=8 * 1024, max_blob_bytes=4 * 1024,
+            )
+        self.assertIn("exceeds per-worker buffer", str(ctx.exception))
+        mock_pg_con.commit.assert_not_called()
+
+        # Linha que cabe deve copiar conteúdo exato.
+        mock_fb_cur2 = MagicMock()
+        mock_pg_cur2 = MagicMock()
+        mock_fb_cur2.fetchmany.side_effect = [[(1, b'A' * 100, b'B' * 100)], []]
+        rows, _ = _import_single_table(
+            table, mock_fb_cur2, mock_pg_cur2, mock_pg_con,
+            max_buffer_bytes=8 * 1024, max_blob_bytes=4 * 1024,
+        )
+        self.assertEqual(rows, 1)
+        buf = mock_pg_cur2.copy_expert.call_args[0][1]
+        self.assertIn(r'\\x' + (b'A' * 100).hex(), buf.getvalue())
+        self.assertIn(r'\\x' + (b'B' * 100).hex(), buf.getvalue())
+
+    def test_aggregated_peak_across_workers_bounded_by_total(self):
+        """
+        Regressão: pico agregado dos processos (soma dos picos por worker)
+        deve caber no orçamento total, não apenas o pico individual.
+        """
+        blob_size = 1 * 1024 * 1024
+        per_worker = 8 * 1024 * 1024
+        max_blob = 4 * 1024 * 1024
+        workers = 2
+        total, worker_bytes, _ = DataMigrator.calculate_memory_budget(
+            max_workers=workers,
+            total_budget=workers * per_worker,
+            per_worker_budget=per_worker,
+            max_blob_bytes=max_blob,
+        )
+        self.assertLessEqual(workers * worker_bytes, total)
+
+        queue = multiprocessing.Queue()
+        procs = [
+            multiprocessing.Process(
+                target=_worker_measure_peak_memory,
+                args=(queue, blob_size, per_worker, max_blob),
+            )
+            for _ in range(workers)
+        ]
+        for p in procs:
+            p.start()
+        results = [queue.get(timeout=30) for _ in procs]
+        for p in procs:
+            p.join()
+
+        for res in results:
+            self.assertTrue(res.get('success'), f"Subprocess failed: {res.get('error')}")
+            self.assertTrue(res.get('is_exact'))
+        agg_peak = sum(r.get('peak_delta', 0) for r in results)
+        self.assertLessEqual(
+            agg_peak, total,
+            f"Aggregated peak ({agg_peak / (1024*1024):.2f}MB) exceeds total budget "
+            f"({total / (1024*1024):.2f}MB)!",
         )
 
 

@@ -315,13 +315,15 @@ class TestDataMigrator(unittest.TestCase):
         table.columns.append(Column('ID', 'INTEGER', nullable=False))
         table.columns.append(Column('ARQUIVO', 'BLOB SUBTYPE 0', nullable=True))
 
-        # 4 rows of 300 bytes each -> total serialized ~ 2400 hex chars + overhead
+        # 4 rows of 300 bytes each -> serialized ~600 hex chars + overhead (~610B/row).
+        # Worker must fit one serialized row: 350B raw -> ~700B serialized.
         raw_rows = [(i, b'X' * 300) for i in range(1, 5)]
         self.mock_fb_cur.fetchmany.side_effect = [raw_rows, []]
 
-        # Set a small budget (400 bytes) so each row or two triggers a flush
+        # Small budget (700 bytes) so each row triggers a flush
         rows_imported, _ = _import_single_table(
-            table, self.mock_fb_cur, self.mock_pg_cur, self.mock_pg_con, max_buffer_bytes=400
+            table, self.mock_fb_cur, self.mock_pg_cur, self.mock_pg_con,
+            max_buffer_bytes=700, max_blob_bytes=350
         )
         self.assertEqual(rows_imported, 4)
         # copy_expert should have been called multiple times (flushes) rather than once
@@ -355,7 +357,12 @@ class TestDataMigrator(unittest.TestCase):
         ]
         self.mock_fb_cur.fetchmany.side_effect = [rows, []]
 
-        _import_single_table(table, self.mock_fb_cur, self.mock_pg_cur, self.mock_pg_con, max_buffer_bytes=200)
+        # 300B raw -> ~600B hex; worker 650B fits one large row and forces
+        # flush-before/after it (3 COPYs total).
+        _import_single_table(
+            table, self.mock_fb_cur, self.mock_pg_cur, self.mock_pg_con,
+            max_buffer_bytes=650, max_blob_bytes=300
+        )
         self.assertEqual(self.mock_pg_cur.copy_expert.call_count, 3)
 
     def test_blob_table_uses_row_by_row_fetch_size(self):

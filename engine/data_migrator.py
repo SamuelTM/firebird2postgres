@@ -1,15 +1,17 @@
 import codecs
 import io
-import os
 import logging
-from typing import Any
+import os
 from concurrent.futures import ProcessPoolExecutor, as_completed, Executor
+from typing import Any
+
 import firebirdsql
 import psycopg2
 import psycopg2.extras
+
 from config import (
     get_firebird_connection, get_postgres_connection,
-    DEFAULT_MAX_BUFFER_BYTES_PER_WORKER, DEFAULT_MAX_BLOB_BYTES, DEFAULT_TOTAL_MEMORY_BUDGET
+    DEFAULT_MAX_BUFFER_BYTES_PER_WORKER, DEFAULT_MAX_BLOB_BYTES
 )
 from models import Table, Column, pg_quote_ident
 
@@ -258,9 +260,13 @@ def _write_text_value_chunked(
     return total_bytes
 
 
-def _estimate_row_bytes(row) -> int:
+def _estimate_row_bytes(row, max_blob_bytes: int = None) -> int:
     """
-    Lightweight, zero-copy estimation of row bytes for buffer management.
+    Lightweight estimation of serialized row bytes for buffer management.
+    For seekable streams (BytesIO/StringIO) measures exact length without
+    consuming; for opaque driver streams uses length/size hints when present,
+    otherwise assumes the worst case (max_blob serialized) so a multi-BLOB
+    row never silently accumulates past the per-worker budget.
     """
     est = len(row)  # tab separators + newline
     for val in row:
@@ -271,7 +277,30 @@ def _estimate_row_bytes(row) -> int:
         elif isinstance(val, str):
             est += len(val) * 3      # upper bound for UTF-8 without re-encoding
         elif hasattr(val, 'read'):
-            est += getattr(val, 'length', 0) or getattr(val, 'size', 0) or 65536
+            hint = getattr(val, 'length', 0) or getattr(val, 'size', 0) or 0
+            if not hint:
+                try:
+                    if hasattr(val, 'getvalue'):
+                        hint = len(val.getvalue())
+                    elif hasattr(val, 'getbuffer'):
+                        hint = val.getbuffer().nbytes
+                except Exception:
+                    hint = 0
+            if not hint and hasattr(val, 'seek') and hasattr(val, 'tell'):
+                try:
+                    pos = val.tell()
+                    val.seek(0, 2)
+                    hint = val.tell() - pos
+                    val.seek(pos)
+                except Exception:
+                    hint = 0
+            if hint:
+                # Serialized upper bound (hex doubles binary, escapes expand text)
+                est += hint * 2 + 16
+            elif max_blob_bytes:
+                est += max_blob_bytes * 2 + 16
+            else:
+                est += 65536
         elif isinstance(val, bool):
             est += 1
         else:
@@ -303,7 +332,19 @@ def _import_single_table(
     and returned in nul_stats for auditing and diagnostics.
 
     Returns (total_rows, nul_stats).
+
+    Raises ValueError when a single serialized row cannot fit in
+    max_buffer_bytes (e.g. several BLOBs in the same row accumulating
+    before flush) or when max_blob_bytes itself cannot fit serialized.
     """
+    if max_buffer_bytes is None or max_buffer_bytes <= 0:
+        raise ValueError("max_buffer_bytes must be positive.")
+    if max_blob_bytes is not None and max_blob_bytes > 0 and max_blob_bytes * 2 > max_buffer_bytes:
+        raise ValueError(
+            f"Incompatible row budget: max BLOB of {max_blob_bytes} bytes "
+            f"(~{max_blob_bytes * 2} bytes serialized) exceeds per-worker "
+            f"buffer of {max_buffer_bytes} bytes."
+        )
     logger.info(f"Importing data for '{table.name}'...")
 
     # Clean existing table data (no CASCADE: constraints don't exist at this pipeline stage,
@@ -346,12 +387,13 @@ def _import_single_table(
             break
 
         for row in rows:
-            row_est = _estimate_row_bytes(row)
+            row_est = _estimate_row_bytes(row, max_blob_bytes)
             if buf.byte_count > 0 and (buf.byte_count + row_est > max_buffer_bytes):
                 buf.seek(0)
                 pg_cur.copy_expert(copy_sql, buf)
                 buf = SerializedByteBuffer()
 
+            row_start = buf.byte_count
             try:
                 for col_idx, val in enumerate(row):
                     if col_idx > 0:
@@ -404,7 +446,26 @@ def _import_single_table(
                     else:
                         buf.write(str(val))
 
+                    # Early abort: several individually-legal BLOBs in the
+                    # same row accumulate in the buffer before any flush, so
+                    # enforce the per-worker row cap incrementally.
+                    if buf.byte_count - row_start > max_buffer_bytes:
+                        raise ValueError(
+                            f"Serialized row of at least {buf.byte_count - row_start} bytes "
+                            f"exceeds per-worker buffer of {max_buffer_bytes} bytes "
+                            f"(table '{table.name}'). Multiple BLOBs in the same row "
+                            f"accumulate before flush: raise per-worker budget, lower "
+                            f"max BLOB size, or split the row."
+                        )
+
                 buf.write('\n')
+                if buf.byte_count - row_start > max_buffer_bytes:
+                    raise ValueError(
+                        f"Serialized row of {buf.byte_count - row_start} bytes "
+                        f"exceeds per-worker buffer of {max_buffer_bytes} bytes "
+                        f"(table '{table.name}'). Raise per-worker budget, lower "
+                        f"max BLOB size, or split the row."
+                    )
 
             except Exception:
                 buf = SerializedByteBuffer()
@@ -492,28 +553,93 @@ class DataMigrator:
         max_workers: int = 4,
         total_budget: int = None,
         per_worker_budget: int = None,
-        max_blob_bytes: int = None
+        max_blob_bytes: int = None,
+        max_row_bytes: int = None,
     ) -> tuple[int, int, int]:
         """
-        Calculates memory budget distinguishing total memory from per-worker memory.
-        Returns (total_budget_bytes, per_worker_buffer_bytes, max_blob_bytes).
-        """
-        workers = max(1, max_workers)
+        Calculates and enforces memory budget reconciling total memory,
+        per-worker memory, worker count and maximum serialized row size.
 
-        if per_worker_budget is not None and per_worker_budget > 0:
-            worker_bytes = per_worker_budget
-            total_bytes = total_budget if total_budget is not None else worker_bytes * workers
-        elif total_budget is not None and total_budget > 0:
-            total_bytes = total_budget
-            worker_bytes = max(1024 * 1024, total_budget // workers)
+        Returns (total_budget_bytes, per_worker_buffer_bytes, max_blob_bytes).
+
+        Raises ValueError when the combination is incompatible:
+        - workers * per_worker exceeds total;
+        - total is too small to give each worker the 1 MiB minimum;
+        - serialized BLOB (~2x raw for binary hex) does not fit in one worker;
+        - max_row_bytes (when given) does not fit in one worker.
+        """
+        workers = max(1, int(max_workers))
+        min_worker = 1024 * 1024
+
+        total_specified = total_budget is not None and total_budget > 0
+        per_worker_specified = per_worker_budget is not None and per_worker_budget > 0
+
+        if per_worker_specified and total_specified:
+            worker_bytes = int(per_worker_budget)
+            total_bytes = int(total_budget)
+            if worker_bytes * workers > total_bytes:
+                raise ValueError(
+                    f"Incompatible memory budget: {workers} worker(s) x "
+                    f"{worker_bytes} bytes per worker = {worker_bytes * workers} bytes "
+                    f"exceeds total budget of {total_bytes} bytes. "
+                    f"Reduce max_workers, lower per-worker budget, or raise total budget."
+                )
+        elif per_worker_specified:
+            worker_bytes = int(per_worker_budget)
+            total_bytes = worker_bytes * workers
+        elif total_specified:
+            total_bytes = int(total_budget)
+            if total_bytes < workers * min_worker:
+                raise ValueError(
+                    f"Incompatible memory budget: total budget of {total_bytes} bytes "
+                    f"is too small for {workers} worker(s) "
+                    f"(minimum {min_worker} bytes per worker = "
+                    f"{workers * min_worker} bytes). "
+                    f"Reduce max_workers or raise total budget."
+                )
+            worker_bytes = total_bytes // workers
         else:
             worker_bytes = DEFAULT_MAX_BUFFER_BYTES_PER_WORKER
             total_bytes = worker_bytes * workers
 
+        if worker_bytes <= 0:
+            raise ValueError("per-worker budget must be positive.")
+
         if max_blob_bytes is not None and max_blob_bytes > 0:
-            blob_limit = max_blob_bytes
+            blob_limit = int(max_blob_bytes)
+            # Binary BLOBs serialize as hex (~2x raw + '\\x' prefix); the
+            # serialized form must fit in an empty per-worker buffer.
+            if blob_limit * 2 > worker_bytes:
+                raise ValueError(
+                    f"Incompatible memory budget: max BLOB of {blob_limit} bytes "
+                    f"(~{blob_limit * 2} bytes serialized as hex) exceeds "
+                    f"per-worker buffer of {worker_bytes} bytes. "
+                    f"Raise per-worker budget or lower max BLOB size."
+                )
+            if blob_limit > total_bytes:
+                raise ValueError(
+                    f"Incompatible memory budget: max BLOB of {blob_limit} bytes "
+                    f"exceeds total budget of {total_bytes} bytes."
+                )
         else:
-            blob_limit = max(1024 * 1024, (worker_bytes - 1024) // 2)
+            # Derived limit reserves room for COPY framing so 2x hex fits.
+            derived = (worker_bytes - 1024) // 2
+            floor = min(64 * 1024, worker_bytes // 2)
+            blob_limit = max(floor, derived)
+            if blob_limit > worker_bytes // 2:
+                blob_limit = worker_bytes // 2
+
+        if max_row_bytes is not None and max_row_bytes > 0:
+            if max_row_bytes > worker_bytes:
+                raise ValueError(
+                    f"Incompatible memory budget: maximum row size of {max_row_bytes} bytes "
+                    f"exceeds per-worker buffer of {worker_bytes} bytes. "
+                    f"Raise per-worker budget or lower max row/BLOB size."
+                )
+            if blob_limit * 2 > max_row_bytes >= 2:
+                # A single serialized BLOB must fit inside a row budget.
+                # Only enforce when row budget is meant to hold a BLOB row.
+                pass
 
         return total_bytes, worker_bytes, blob_limit
 
