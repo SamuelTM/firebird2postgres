@@ -14,6 +14,7 @@ from models import (
 )
 from transpiler import FirebirdToPostgresVisitor
 from utils import choose_dollar_tag
+from engine.schema_extractor import fetch_all_sequence_increments
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +153,7 @@ class DdlExporter:
 
         symbols = self._fetch_all_column_symbols(fb_cursor)
         domain_map = self._fetch_domain_map(fb_cursor)
-        seq_increments = self._fetch_all_sequence_increments(fb_cursor)
+        seq_increments = fetch_all_sequence_increments(fb_cursor)
 
         items = []
         for trigger in triggers:
@@ -208,7 +209,7 @@ class DdlExporter:
 
         symbols = self._fetch_all_column_symbols(fb_cursor)
         domain_map = self._fetch_domain_map(fb_cursor)
-        seq_increments = self._fetch_all_sequence_increments(fb_cursor)
+        seq_increments = fetch_all_sequence_increments(fb_cursor)
 
         items = []
         for proc in procedures:
@@ -402,7 +403,7 @@ class DdlExporter:
 
         symbols = self._fetch_all_column_symbols(fb_cursor)
         domain_map = self._fetch_domain_map(fb_cursor)
-        seq_increments = self._fetch_all_sequence_increments(fb_cursor)
+        seq_increments = fetch_all_sequence_increments(fb_cursor)
 
         view_map = {}
         for view in views:
@@ -514,40 +515,7 @@ class DdlExporter:
 
     @staticmethod
     def _fetch_all_sequence_increments(cursor) -> dict[str, int]:
-        query = """
-            SELECT TRIM(RDB$GENERATOR_NAME), COALESCE(RDB$GENERATOR_INCREMENT, 1)
-            FROM RDB$GENERATORS
-            WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
-              AND RDB$GENERATOR_NAME NOT STARTING WITH 'RDB$'
-              AND RDB$GENERATOR_NAME NOT STARTING WITH 'MON$';
-        """
-        increments = {}
-        try:
-            cursor.execute(query)
-            rows = cursor.fetchall()
-        except firebirdsql.Error:
-            try:
-                cursor.execute("""
-                    SELECT RDB$GENERATOR_NAME, 1
-                    FROM RDB$GENERATORS
-                    WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
-                      AND RDB$GENERATOR_NAME NOT STARTING WITH 'RDB$'
-                      AND RDB$GENERATOR_NAME NOT STARTING WITH 'MON$';
-                """)
-                rows = cursor.fetchall()
-            except Exception as e:
-                raise RuntimeError(f"Failed to fetch sequence increments from Firebird: {e}") from e
-        except Exception as e:
-            raise RuntimeError(f"Failed to fetch sequence increments from Firebird: {e}") from e
-
-        for row in rows:
-            if row and row[0]:
-                val = row[1] if len(row) > 1 and row[1] is not None else 1
-                try:
-                    increments[row[0].strip().lower()] = int(val)
-                except (ValueError, TypeError):
-                    increments[row[0].strip().lower()] = 1
-        return increments
+        return fetch_all_sequence_increments(cursor)
 
     @staticmethod
     def _format_view_firebird_ddl(view_name: str, col_names: list[str], source: str) -> str:
@@ -759,7 +727,7 @@ class DdlExporter:
         conv_file = converted_file or get_dump_path(DumpFiles.DOMAINS_PG)
 
         fb_cursor = self.fb_con.cursor()
-        seq_increments = self._fetch_all_sequence_increments(fb_cursor)
+        seq_increments = fetch_all_sequence_increments(fb_cursor)
 
         query = """
             SELECT 

@@ -391,42 +391,72 @@ class DataMigrator:
             for tbl, col, col_obj in identity_targets:
                 quoted_tbl = pg_quote_ident(tbl)
                 quoted_col = pg_quote_ident(col)
+                table_arg = quoted_tbl.replace("'", "''")
+                col_arg = col.replace("'", "''")
                 inc = col_obj.identity_increment if col_obj.identity_increment is not None else 1
                 curr = col_obj.identity_current
+                curr_lit = str(curr) if curr is not None else "NULL"
+
+                # Sequence and IDENTITY synchronization policy:
+                # 1. Unused generator (curr == 0) & empty table:
+                #    setval(seq, inc, false) ensures next insert produces inc (e.g. 1, 10, -2)
+                #    and avoids out-of-bounds error from setval(..., 0, true) below min_value.
+                # 2. Generator ahead of data:
+                #    Preserves position without regression (curr is taken with is_called=true).
+                # 3. Explicit IDs beyond generator:
+                #    Advances sequence to max_val (or min_val for descending) to prevent key collision.
+                # 4. Special identifiers:
+                #    table_arg and col_arg escape apostrophes for pg_get_serial_sequence string arguments.
                 if inc < 0:
-                    if curr is not None:
-                        sync_query = f"""
-                            SELECT setval(
-                                pg_get_serial_sequence('{quoted_tbl}', '{col}'),
-                                LEAST({curr}, COALESCE((SELECT MIN({quoted_col}) FROM {quoted_tbl}), {curr})),
-                                true
-                            );
-                        """
-                    else:
-                        sync_query = f"""
-                            SELECT setval(
-                                pg_get_serial_sequence('{quoted_tbl}', '{col}'),
-                                COALESCE((SELECT MIN({quoted_col}) FROM {quoted_tbl}), -1),
-                                (SELECT MIN({quoted_col}) IS NOT NULL FROM {quoted_tbl})
-                            );
-                        """
+                    sync_query = f"""
+                        SELECT setval(
+                            pg_get_serial_sequence('{table_arg}', '{col_arg}'),
+                            (
+                                SELECT
+                                    CASE
+                                        WHEN m.min_val IS NOT NULL AND {curr_lit} IS NOT NULL THEN LEAST({curr_lit}, m.min_val)
+                                        WHEN m.min_val IS NOT NULL THEN m.min_val
+                                        WHEN {curr_lit} IS NOT NULL AND {curr_lit} != 0 THEN {curr_lit}
+                                        ELSE {inc}
+                                    END
+                                FROM (SELECT MIN({quoted_col}) AS min_val FROM {quoted_tbl}) m
+                            ),
+                            (
+                                SELECT
+                                    CASE
+                                        WHEN m.min_val IS NOT NULL THEN true
+                                        WHEN {curr_lit} IS NOT NULL AND {curr_lit} != 0 THEN true
+                                        ELSE false
+                                    END
+                                FROM (SELECT MIN({quoted_col}) AS min_val FROM {quoted_tbl}) m
+                            )
+                        );
+                    """
                 else:
-                    if curr is not None:
-                        sync_query = f"""
-                            SELECT setval(
-                                pg_get_serial_sequence('{quoted_tbl}', '{col}'),
-                                GREATEST({curr}, COALESCE((SELECT MAX({quoted_col}) FROM {quoted_tbl}), {curr})),
-                                true
-                            );
-                        """
-                    else:
-                        sync_query = f"""
-                            SELECT setval(
-                                pg_get_serial_sequence('{quoted_tbl}', '{col}'),
-                                COALESCE((SELECT MAX({quoted_col}) FROM {quoted_tbl}), 1),
-                                (SELECT MAX({quoted_col}) IS NOT NULL FROM {quoted_tbl})
-                            );
-                        """
+                    sync_query = f"""
+                        SELECT setval(
+                            pg_get_serial_sequence('{table_arg}', '{col_arg}'),
+                            (
+                                SELECT
+                                    CASE
+                                        WHEN m.max_val IS NOT NULL AND {curr_lit} IS NOT NULL THEN GREATEST({curr_lit}, m.max_val)
+                                        WHEN m.max_val IS NOT NULL THEN m.max_val
+                                        WHEN {curr_lit} IS NOT NULL AND {curr_lit} != 0 THEN {curr_lit}
+                                        ELSE {inc}
+                                    END
+                                FROM (SELECT MAX({quoted_col}) AS max_val FROM {quoted_tbl}) m
+                            ),
+                            (
+                                SELECT
+                                    CASE
+                                        WHEN m.max_val IS NOT NULL THEN true
+                                        WHEN {curr_lit} IS NOT NULL AND {curr_lit} != 0 THEN true
+                                        ELSE false
+                                    END
+                                FROM (SELECT MAX({quoted_col}) AS max_val FROM {quoted_tbl}) m
+                            )
+                        );
+                    """
                 logger.debug(sync_query.strip())
                 pg_cur.execute(sync_query)
 

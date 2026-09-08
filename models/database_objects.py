@@ -107,6 +107,19 @@ def get_postgres_type(firebird_type: Optional[str]) -> str:
     return type_mapping.get(firebird_type, firebird_type)
 
 
+def get_integer_bounds(type_name: str) -> tuple[int, int]:
+    """
+    Returns (min_value, max_value) for PostgreSQL sequence-compatible integer types.
+    """
+    t = type_name.lower().strip()
+    if 'smallint' in t or t == 'int2':
+        return -32768, 32767
+    elif 'bigint' in t or t == 'int8':
+        return -9223372036854775808, 9223372036854775807
+    else:  # integer, int, int4
+        return -2147483648, 2147483647
+
+
 def pg_quote_ident(ident: str) -> str:
     escaped = ident.replace('"', '""')
     return f'"{escaped}"'
@@ -153,10 +166,13 @@ class Table:
             if not col.computed_source:
                 if col.identity_type:
                     opts = []
+                    min_val, max_val = get_integer_bounds(type_decl)
                     if col.identity_increment is not None and col.identity_increment != 1:
                         opts.append(f"INCREMENT BY {col.identity_increment}")
-                        if col.identity_increment < 0:
-                            opts.append("MAXVALUE 9223372036854775807")
+                    if col.identity_increment is not None and col.identity_increment < 0:
+                        opts.append(f"MAXVALUE {max_val}")
+                    elif col.identity_current is not None and col.identity_current < 1 and col.identity_current != 0:
+                        opts.append(f"MINVALUE {min_val}")
                     opts_str = f" ({' '.join(opts)})" if opts else ""
                     col_def += f' GENERATED {col.identity_type} AS IDENTITY{opts_str}'
                 elif col.sequence_name:

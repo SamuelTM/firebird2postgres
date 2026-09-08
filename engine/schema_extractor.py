@@ -8,6 +8,47 @@ from models import (
 from transpiler import FirebirdToPostgresVisitor, validate_immutable_expression
 
 
+def fetch_all_sequence_increments(cursor) -> dict[str, int]:
+    """
+    Fetches all user-defined sequence/generator increments from Firebird system catalog.
+    Returns a dict mapping lowercase generator name to its increment value.
+    """
+    query = """
+        SELECT TRIM(RDB$GENERATOR_NAME), COALESCE(RDB$GENERATOR_INCREMENT, 1)
+        FROM RDB$GENERATORS
+        WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
+          AND RDB$GENERATOR_NAME NOT STARTING WITH 'RDB$'
+          AND RDB$GENERATOR_NAME NOT STARTING WITH 'MON$';
+    """
+    increments = {}
+    try:
+        cursor.execute(query)
+        rows = cursor.fetchall()
+    except firebirdsql.Error:
+        try:
+            cursor.execute("""
+                SELECT RDB$GENERATOR_NAME, 1
+                FROM RDB$GENERATORS
+                WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
+                  AND RDB$GENERATOR_NAME NOT STARTING WITH 'RDB$'
+                  AND RDB$GENERATOR_NAME NOT STARTING WITH 'MON$';
+            """)
+            rows = cursor.fetchall()
+        except Exception as e:
+            raise RuntimeError(f"Failed to fetch sequence increments from Firebird: {e}") from e
+    except Exception as e:
+        raise RuntimeError(f"Failed to fetch sequence increments from Firebird: {e}") from e
+
+    for row in rows:
+        if row and row[0]:
+            val = row[1] if len(row) > 1 and row[1] is not None else 1
+            try:
+                increments[row[0].strip().lower()] = int(val)
+            except (ValueError, TypeError):
+                increments[row[0].strip().lower()] = 1
+    return increments
+
+
 class SchemaExtractor:
     """
     Extracts table schemas, column types, domains, constraints, indexes,
@@ -25,7 +66,7 @@ class SchemaExtractor:
         tables = self._fetch_user_tables(fb_cursor)
         relation_names = self._fetch_relation_names(fb_cursor)
         domain_map = self._fetch_domain_map(fb_cursor, relation_names)
-        seq_increments = self._fetch_all_sequence_increments(fb_cursor)
+        seq_increments = fetch_all_sequence_increments(fb_cursor)
 
         table_objs: list[Table] = []
         for table_name in tables:
@@ -46,11 +87,6 @@ class SchemaExtractor:
 
         self._bind_sequence_generators(fb_cursor, table_objs)
         return table_objs
-
-    @staticmethod
-    def _fetch_all_sequence_increments(cursor) -> dict[str, int]:
-        from .ddl_exporter import DdlExporter
-        return DdlExporter._fetch_all_sequence_increments(cursor)
 
     def extract_sequences(self) -> list[Sequence]:
         """
@@ -238,16 +274,29 @@ class SchemaExtractor:
                     try:
                         cursor.execute("SELECT COALESCE(RDB$GENERATOR_INCREMENT, 1) FROM RDB$GENERATORS WHERE RDB$GENERATOR_NAME = ?;", (gen_name,))
                         grow = cursor.fetchone()
-                        identity_increment = int(grow[0]) if grow and grow[0] is not None else 1
-                    except (firebirdsql.Error, ValueError, TypeError):
-                        identity_increment = 1
+                        if not grow or grow[0] is None:
+                            raise RuntimeError(
+                                f"Generator '{gen_name}' for identity column '{column_name}' in table '{table_name}' was not found in RDB$GENERATORS."
+                            )
+                        identity_increment = int(grow[0])
+                    except (firebirdsql.Error, ValueError, TypeError) as e:
+                        raise RuntimeError(
+                            f"Failed to read generator increment for identity column '{column_name}' in table '{table_name}' from generator '{gen_name}': {e}"
+                        ) from e
+
                     try:
                         safe_gen = gen_name.replace('"', '""')
                         cursor.execute(f'SELECT GEN_ID("{safe_gen}", 0) FROM RDB$DATABASE;')
                         vrow = cursor.fetchone()
-                        identity_current = int(vrow[0]) if vrow and vrow[0] is not None else None
-                    except (firebirdsql.Error, ValueError, TypeError):
-                        identity_current = None
+                        if not vrow or vrow[0] is None:
+                            raise RuntimeError(
+                                f"Failed to retrieve current value for generator '{gen_name}' of identity column '{column_name}' in table '{table_name}'."
+                            )
+                        identity_current = int(vrow[0])
+                    except (firebirdsql.Error, ValueError, TypeError) as e:
+                        raise RuntimeError(
+                            f"Failed to read current generator state for identity column '{column_name}' in table '{table_name}' from generator '{gen_name}': {e}"
+                        ) from e
 
             columns.append(
                 Column(
