@@ -1058,9 +1058,10 @@ class TableSource:
 
 
 class QueryScope:
-    def __init__(self, parent=None, tables: Optional[list[TableSource]] = None):
+    def __init__(self, parent=None, tables: Optional[list[TableSource]] = None, using_columns: Optional[set[str]] = None):
         self.parent: Optional[QueryScope] = parent
         self.tables: list[TableSource] = tables or []
+        self.using_columns: set[str] = using_columns or set()
 
 
 class ASTDialectRewriter(FirebirdParserVisitor):
@@ -1577,6 +1578,17 @@ class ASTDialectRewriter(FirebirdParserVisitor):
             col_name = raw_col_text.strip('":').lower()
 
             curr_s = scope
+            is_using_col = False
+            while curr_s:
+                if col_name in curr_s.using_columns:
+                    is_using_col = True
+                    break
+                curr_s = curr_s.parent
+
+            if is_using_col:
+                continue
+
+            curr_s = scope
             chosen_tbl = None
             ambiguous_candidates = []
             unresolvable_scope = None
@@ -1662,10 +1674,36 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                             tables.append(src)
         return tables
 
+    @staticmethod
+    def _extract_using_columns_from_query_block(qb: FirebirdParser.Query_blockContext) -> set[str]:
+        using_cols = set()
+        if not qb or not qb.from_clause():
+            return using_cols
+        trl = qb.from_clause().table_ref_list()
+        if not trl:
+            return using_cols
+        for tr in trl.table_ref():
+            if hasattr(tr, 'join_clause') and tr.join_clause():
+                for jc in tr.join_clause():
+                    if hasattr(jc, 'join_using_part') and jc.join_using_part():
+                        jups = jc.join_using_part()
+                        if not isinstance(jups, list):
+                            jups = [jups]
+                        for jup in jups:
+                            if hasattr(jup, 'paren_column_list') and jup.paren_column_list():
+                                pcl = jup.paren_column_list()
+                                if hasattr(pcl, 'column_list') and pcl.column_list():
+                                    for col in pcl.column_list().column_name():
+                                        raw_text = col.getText().strip('":').lower()
+                                        if raw_text:
+                                            using_cols.add(raw_text)
+        return using_cols
+
     def visitQuery_block(self, ctx: FirebirdParser.Query_blockContext):
         self._rewrite_first_skip(ctx)
         tables = self._extract_tables_from_query_block(ctx)
-        scope = QueryScope(parent=self.current_scope, tables=tables)
+        using_columns = self._extract_using_columns_from_query_block(ctx)
+        scope = QueryScope(parent=self.current_scope, tables=tables, using_columns=using_columns)
         self.current_scope = scope
         old_symbols = self.symbols.copy()
         try:
@@ -2534,6 +2572,12 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         # DROP first to guarantee idempotency, since changing the column list of an
         # existing view (names, order or types) requires recreating it
         return f'DROP VIEW IF EXISTS {pg_quote_ident(view_name)} CASCADE;\nCREATE VIEW {pg_quote_ident(view_name)}{view_opts} AS {select_stmt};'
+
+    def visitSelect_statement(self, ctx: FirebirdParser.Select_statementContext):
+        raw = self.get_raw_text(ctx).strip()
+        if raw.endswith(';'):
+            return raw
+        return raw + ';'
 
     def visitBody(self, ctx: FirebirdParser.BodyContext):
         # A body is usually BEGIN ... END

@@ -1,4 +1,4 @@
-# Generated from FirebirdParser.g4 by ANTLR 4.13.2
+# Generated from transpiler/firebird_grammar/FirebirdParser.g4 by ANTLR 4.13.2
 from antlr4 import *
 if "." in __name__:
     from .FirebirdParser import FirebirdParser

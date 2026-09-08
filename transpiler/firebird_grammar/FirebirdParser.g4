@@ -8379,7 +8379,6 @@ non_reserved_keywords_pre12c
     | CREATE_STORED_OUTLINES
     | CREATION
     | CROSSEDITION
-    | CROSS
     | CSCONVERT
     | CUBE_GB
     | CUBE
@@ -8575,7 +8574,6 @@ non_reserved_keywords_pre12c
     | FREEPOOLS
     | FRESH
     | FROM_TZ
-    | FULL
     | FULL_OUTER_JOIN_TO_OUTER
     | FUNCTION
     | FUNCTIONS
@@ -8667,7 +8665,6 @@ non_reserved_keywords_pre12c
     | INLINE
     | INLINE_XMLTYPE_NT
     | IN_MEMORY_METADATA
-    | INNER
     | INSERTCHILDXMLAFTER
     | INSERTCHILDXMLBEFORE
     | INSERTCHILDXML
@@ -8698,7 +8695,6 @@ non_reserved_keywords_pre12c
     | ITERATION_NUMBER
     | JAVA
     | JOB
-    | JOIN
     | KEEP_DUPLICATES
     | KEEP
     | KERBEROS
@@ -8720,7 +8716,6 @@ non_reserved_keywords_pre12c
     | LEAD
     | LEAF
     | LEAST
-    | LEFT
     | LENGTH2
     | LENGTH4
     | LENGTHB
@@ -8847,7 +8842,6 @@ non_reserved_keywords_pre12c
     | NATIONAL
     | NATIVE_FULL_OUTER_JOIN
     | NATIVE
-    | NATURAL
     | NAV
     | NCHAR_CS
     | NCHAR
@@ -9066,7 +9060,6 @@ non_reserved_keywords_pre12c
     | OTHER
     | OUTER_JOIN_TO_ANTI
     | OUTER_JOIN_TO_INNER
-    | OUTER
     | OUTLINE_LEAF
     | OUTLINE
     | OUT_OF_LINE
@@ -9276,7 +9269,6 @@ non_reserved_keywords_pre12c
     | REVERSE
     | REWRITE
     | REWRITE_OR_ERROR
-    | RIGHT
     | ROLE
     | ROLES
     | ROLLBACK
