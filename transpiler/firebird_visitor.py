@@ -713,23 +713,36 @@ def _normalize_type_of(sql: str, domain_types: dict[str, str] = None) -> str:
     return pat.sub(repl, sql)
 
 
+def convert_firebird_type_declaration(raw_type: str, domain_map: dict[str, str] = None) -> str:
+    if not raw_type:
+        return ""
+    cleaned = re.sub(r'(?i)\bBLOB\s+SUBTYPE\s+(?:1|TEXT)\b', 'TEXT', raw_type)
+    cleaned = re.sub(r'(?i)\bBLOB\s+SUBTYPE\s+(?:0|BINARY)\b', 'BYTEA', cleaned)
+    cleaned = re.sub(r'(?i)\bBLOB\b', 'BYTEA', cleaned)
+    cleaned = re.sub(r'(?i)\b(?:CHAR|VARCHAR)(?:\s*\(\s*\d+\s*\))?\s+CHARACTER\s+SET\s+OCTETS\b', 'BYTEA', cleaned)
+    cleaned = re.sub(r'(?i)\bDECFLOAT(?:\s*\(\s*(?:16|34)\s*\))?\b', 'NUMERIC', cleaned)
+    cleaned = re.sub(r'(?i)\bINT128\b', 'NUMERIC(39)', cleaned)
+    cleaned = re.sub(r'(?i)\bTIME\s+WITH\s+TIME\s+ZONE\b', 'TIMETZ', cleaned)
+    cleaned = re.sub(r'(?i)\bTIMESTAMP\s+WITH\s+TIME\s+ZONE\b', 'TIMESTAMPTZ', cleaned)
+    if domain_map:
+        u = cleaned.strip().upper()
+        if u in domain_map:
+            return domain_map[u]
+        u_clean = u.strip('"')
+        if u_clean in domain_map:
+            return domain_map[u_clean]
+    return cleaned
+
+
 def _normalize_data_types(sql: str) -> str:
     pat = re.compile(
-        r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|(\bDECFLOAT(?:\s*\(\s*(?:16|34)\s*\))?|\bINT128\b|(?:CHAR|VARCHAR)(?:\s*\(\s*\d+\s*\))?\s+CHARACTER\s+SET\s+OCTETS\b)",
+        r"('(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|/\*.*?\*/|--[^\n]*)|(\bDECFLOAT\s*\(\s*(?:16|34)\s*\))",
         flags=re.IGNORECASE
     )
     def repl(m):
         if m.group(1):
             return m.group(1)
-        token = m.group(2)
-        token_upper = token.upper()
-        if 'OCTETS' in token_upper:
-            return 'BYTEA'
-        if token_upper.startswith('DECFLOAT'):
-            return 'NUMERIC'
-        if token_upper == 'INT128':
-            return 'NUMERIC(39)'
-        return token
+        return 'NUMERIC'
     return pat.sub(repl, sql)
 
 
@@ -1008,12 +1021,13 @@ class ASTDialectRewriter(FirebirdParserVisitor):
     are performed in semantic context, leaving string literals and comments 100% untouched.
     """
 
-    def __init__(self, rewriter: TokenStreamRewriter, symbols: dict[str, str] = None, expr_map: dict[str, str] = None, sequence_increments: dict[str, int] = None):
+    def __init__(self, rewriter: TokenStreamRewriter, symbols: dict[str, str] = None, expr_map: dict[str, str] = None, sequence_increments: dict[str, int] = None, domain_map: dict[str, str] = None):
         super().__init__()
         self.rewriter = rewriter
         self.handled_qbs = set()
         self.symbols: dict[str, str] = {k.strip('":').lower(): v.upper() for k, v in symbols.items()} if symbols else {}
         self.expr_map: dict[str, str] = expr_map or {}
+        self.domain_map: dict[str, str] = domain_map or {}
         self.sequence_increments: dict[str, int] | None = (
             {k.strip('":').lower(): v for k, v in sequence_increments.items()}
             if sequence_increments is not None
@@ -1086,17 +1100,29 @@ class ASTDialectRewriter(FirebirdParserVisitor):
             self.is_trigger = old_is_trigger
             self.trigger_return = old_trigger_return
 
+    def _convert_type(self, raw_type: str) -> str:
+        return convert_firebird_type_declaration(raw_type, domain_map=self.domain_map)
+
+    def visitType_spec(self, ctx: FirebirdParser.Type_specContext):
+        raw_type = self._get_tokens_text(ctx)
+        converted = self._convert_type(raw_type)
+        if converted != raw_type:
+            self.rewriter.replaceRangeTokens(ctx.start, ctx.stop, converted)
+        return None
+
     def visitParameter(self, ctx: FirebirdParser.ParameterContext):
         if ctx.parameter_name() and ctx.type_spec():
             name = ctx.parameter_name().getText().strip('":').lower()
-            self.symbols[name] = ctx.type_spec().getText().upper()
+            raw_type = self._get_tokens_text(ctx.type_spec())
+            self.symbols[name] = self._convert_type(raw_type).upper()
             self.params.add(name)
         return self.visitChildren(ctx)
 
     def visitVariable_declaration(self, ctx: FirebirdParser.Variable_declarationContext):
         if ctx.identifier() and ctx.type_spec():
             name = ctx.identifier().getText().strip('":').lower()
-            self.symbols[name] = ctx.type_spec().getText().upper()
+            raw_type = self._get_tokens_text(ctx.type_spec())
+            self.symbols[name] = self._convert_type(raw_type).upper()
             self.local_vars.add(name)
         return self.visitChildren(ctx)
 
@@ -1944,7 +1970,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         rewriter = TokenStreamRewriter(stream)
 
         # Pass 1: Semantic token rewriting on AST
-        dialect_rewriter = ASTDialectRewriter(rewriter, symbols=symbols, expr_map=expr_map, sequence_increments=sequence_increments)
+        dialect_rewriter = ASTDialectRewriter(rewriter, symbols=symbols, expr_map=expr_map, sequence_increments=sequence_increments, domain_map=norm_domain_map)
         dialect_rewriter.visit(tree)
 
         # Pass 2: High-level PL/pgSQL structure visitor
@@ -2042,24 +2068,8 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         return "\n\n".join(statements)
 
     def _convert_type(self, raw_type: str) -> str:
-        if not raw_type:
-            return ""
-        cleaned = re.sub(r'(?i)\bBLOB\s+SUBTYPE\s+(?:1|TEXT)\b', 'TEXT', raw_type)
-        cleaned = re.sub(r'(?i)\bBLOB\s+SUBTYPE\s+(?:0|BINARY)\b', 'BYTEA', cleaned)
-        cleaned = re.sub(r'(?i)\bBLOB\b', 'BYTEA', cleaned)
-        cleaned = re.sub(r'(?i)\b(?:CHAR|VARCHAR)(?:\s*\(\s*\d+\s*\))?\s+CHARACTER\s+SET\s+OCTETS\b', 'BYTEA', cleaned)
-        cleaned = re.sub(r'(?i)\bDECFLOAT(?:\s*\(\s*(?:16|34)\s*\))?\b', 'NUMERIC', cleaned)
-        cleaned = re.sub(r'(?i)\bINT128\b', 'NUMERIC(39)', cleaned)
-        cleaned = re.sub(r'(?i)\bTIME\s+WITH\s+TIME\s+ZONE\b', 'TIMETZ', cleaned)
-        cleaned = re.sub(r'(?i)\bTIMESTAMP\s+WITH\s+TIME\s+ZONE\b', 'TIMESTAMPTZ', cleaned)
-        if hasattr(self, 'domain_map') and self.domain_map:
-            u = cleaned.strip().upper()
-            if u in self.domain_map:
-                return self.domain_map[u]
-            u_clean = u.strip('"')
-            if u_clean in self.domain_map:
-                return self.domain_map[u_clean]
-        return cleaned
+        dmap = getattr(self, 'domain_map', None)
+        return convert_firebird_type_declaration(raw_type, domain_map=dmap)
 
     def visitUnit_statement(self, ctx: FirebirdParser.Unit_statementContext):
         return self.visitChildren(ctx)

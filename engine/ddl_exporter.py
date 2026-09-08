@@ -244,9 +244,12 @@ class DdlExporter:
                 RDB$FIELD_SUB_TYPE, 
                 COALESCE(RDB$CHARACTER_LENGTH, RDB$FIELD_LENGTH), 
                 RDB$FIELD_PRECISION, 
-                RDB$FIELD_SCALE
+                RDB$FIELD_SCALE,
+                RDB$CHARACTER_SET_ID,
+                RDB$DIMENSIONS
             FROM RDB$FIELDS
-            WHERE RDB$SYSTEM_FLAG = 0 AND RDB$FIELD_NAME NOT STARTING WITH 'RDB$';
+            WHERE RDB$SYSTEM_FLAG = 0 AND RDB$FIELD_NAME NOT STARTING WITH 'RDB$'
+            ORDER BY RDB$FIELD_NAME;
         """)
         rows = cursor.fetchall()
         domain_names = [r[0].strip() for r in rows if r[0]]
@@ -262,12 +265,20 @@ class DdlExporter:
                 field_length = r[3] if len(r) > 3 else None
                 field_precision = r[4] if len(r) > 4 else None
                 field_scale = r[5] if len(r) > 5 else None
+                charset_id = r[6] if len(r) > 6 else None
+                dimensions = r[7] if len(r) > 7 else None
+                if dimensions is not None and dimensions > 0:
+                    raise NotImplementedError(
+                        f"Firebird array domains are not supported (domain '{d_name}')."
+                    )
                 fb_type = resolve_firebird_type(
                     field_type=field_type,
                     field_subtype=field_subtype,
                     field_length=field_length,
                     field_precision=field_precision,
                     field_scale=field_scale,
+                    character_set_id=charset_id,
+                    dimensions=dimensions,
                 )
                 if fb_type:
                     domain_types[d_name] = get_postgres_type(fb_type)
@@ -300,7 +311,9 @@ class DdlExporter:
                 pp.RDB$NULL_FLAG,
                 f.RDB$NULL_FLAG,
                 f.RDB$DEFAULT_SOURCE,
-                pp.RDB$PARAMETER_MECHANISM
+                pp.RDB$PARAMETER_MECHANISM,
+                f.RDB$CHARACTER_SET_ID,
+                f.RDB$DIMENSIONS
             FROM RDB$PROCEDURE_PARAMETERS pp
             JOIN RDB$FIELDS f ON pp.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
             WHERE pp.RDB$PROCEDURE_NAME = ?
@@ -324,7 +337,10 @@ class DdlExporter:
                     pp.RDB$DEFAULT_SOURCE,
                     pp.RDB$NULL_FLAG,
                     f.RDB$NULL_FLAG,
-                    f.RDB$DEFAULT_SOURCE
+                    f.RDB$DEFAULT_SOURCE,
+                    NULL,
+                    f.RDB$CHARACTER_SET_ID,
+                    f.RDB$DIMENSIONS
                 FROM RDB$PROCEDURE_PARAMETERS pp
                 JOIN RDB$FIELDS f ON pp.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
                 WHERE pp.RDB$PROCEDURE_NAME = ?
@@ -359,6 +375,13 @@ class DdlExporter:
             field_null_flag = param[11] if len(param) > 11 else None
             field_default = _clean_str(param[12]) if len(param) > 12 else None
             param_mechanism = param[13] if len(param) > 13 else None
+            charset_id = param[14] if len(param) > 14 else None
+            dimensions = param[15] if len(param) > 15 else None
+
+            if dimensions is not None and dimensions > 0:
+                raise NotImplementedError(
+                    f"Firebird array parameters are not supported (parameter '{param_name}' in procedure '{proc_name}')."
+                )
 
             # Preserve user-defined domain if not a system domain (RDB$...) and not TYPE OF domain (mechanism = 1)
             if field_source and not field_source.startswith('RDB$') and param_mechanism != 1:
@@ -379,6 +402,8 @@ class DdlExporter:
                     field_length=field_length,
                     field_precision=field_precision,
                     field_scale=field_scale,
+                    character_set_id=charset_id,
+                    dimensions=dimensions,
                 )
                 if type_name is None:
                     raise TypeError(
@@ -782,7 +807,9 @@ class DdlExporter:
                 RDB$FIELD_SCALE,
                 RDB$DEFAULT_SOURCE,
                 RDB$NULL_FLAG,
-                RDB$VALIDATION_SOURCE
+                RDB$VALIDATION_SOURCE,
+                RDB$CHARACTER_SET_ID,
+                RDB$DIMENSIONS
             FROM RDB$FIELDS
             WHERE RDB$SYSTEM_FLAG = 0
               AND RDB$FIELD_NAME NOT STARTING WITH 'RDB$'
@@ -814,6 +841,13 @@ class DdlExporter:
                 default_source = d[6].strip() if d[6] else None
                 not_null = (d[7] == 1)
                 validation_source = d[8].strip() if d[8] else None
+                charset_id = d[9] if len(d) > 9 else None
+                dimensions = d[10] if len(d) > 10 else None
+
+                if dimensions is not None and dimensions > 0:
+                    raise NotImplementedError(
+                        f"Firebird array domains are not supported (domain '{domain_name}')."
+                    )
 
                 fb_full_type = resolve_firebird_type(
                     field_type=field_type,
@@ -821,6 +855,8 @@ class DdlExporter:
                     field_length=field_length,
                     field_precision=field_precision,
                     field_scale=field_scale,
+                    character_set_id=charset_id,
+                    dimensions=dimensions,
                 )
                 if fb_full_type is None:
                     raise TypeError(

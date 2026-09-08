@@ -112,6 +112,18 @@ def _import_single_table(table: Table, fb_cur, pg_cur, pg_con, max_buffer_bytes:
                 else:
                     if hasattr(val, 'read') and callable(val.read):
                         val = val.read()
+                    col_obj = cols_to_import[col_idx]
+                    col_type = (col_obj.column_type or '').upper()
+                    is_binary = (
+                        col_type == 'BYTEA'
+                        or 'BYTEA' in col_type
+                        or 'BLOB' in col_type
+                        or 'OCTETS' in col_type
+                        or (col_obj.domain_name and 'OCTETS' in col_obj.domain_name.upper())
+                    )
+                    if is_binary and isinstance(val, str):
+                        val = val.encode('latin1')
+
                     if isinstance(val, (bytes, bytearray, memoryview)):
                         line.append(r'\\x' + bytes(val).hex())
                     elif isinstance(val, str):
