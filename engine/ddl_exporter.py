@@ -514,10 +514,6 @@ class DdlExporter:
         return symbols
 
     @staticmethod
-    def _fetch_all_sequence_increments(cursor) -> dict[str, int]:
-        return fetch_all_sequence_increments(cursor)
-
-    @staticmethod
     def _format_view_firebird_ddl(view_name: str, col_names: list[str], source: str) -> str:
         col_list = f" ({', '.join(col_names)})" if col_names else ""
         return f'CREATE OR ALTER VIEW "{view_name}"{col_list} AS\n{source}\n\n'
