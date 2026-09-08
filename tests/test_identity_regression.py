@@ -152,6 +152,8 @@ class TestIdentityUnitRegression(unittest.TestCase):
         # Must properly double-quote identifier in SQL FROM / MAX clause
         self.assertIn('FROM "tbl\'special"', query)
         self.assertIn('SELECT MAX("col\'id")', query)
+        self.assertEqual(query.count('SELECT MAX("col\'id")'), 1)
+        self.assertIn('s.seqmin', query)
 
 
 @unittest.skipUnless(HAS_REAL_PG, "Live PostgreSQL instance required for live identity regression tests")
@@ -165,6 +167,7 @@ class TestIdentityLivePostgresRegression(unittest.TestCase):
     - Explicit IDs beyond generator advance sequence to avoid collisions.
     - Tables and columns with apostrophes execute properly.
     - First and second inserts yield expected values in all cases.
+    - Explicit ID zero / negative IDs with generator state 0 do not produce setval out of bounds.
     """
 
     def setUp(self):
@@ -319,6 +322,66 @@ class TestIdentityLivePostgresRegression(unittest.TestCase):
         self.pg_cur.execute(f"INSERT INTO {quoted_tbl} (val) VALUES ('b') RETURNING {quoted_col};")
         second_id = self.pg_cur.fetchone()[0]
         self.assertEqual(second_id, 2)
+
+    def test_live_explicit_id_zero_with_generator_zero_inc_1(self):
+        # Firebird generator is at 0, table contains explicit ID 0.
+        # Must not produce setval(0, true) below min_value 1.
+        # Next insert must succeed and produce expected ID 1.
+        t = Table('t_live_id_zero')
+        t.columns.append(Column('id', 'INTEGER', nullable=False, identity_type='BY DEFAULT', identity_increment=1, identity_current=0))
+        t.columns.append(Column('val', 'TEXT', nullable=True))
+
+        self.pg_cur.execute(f"DROP TABLE IF EXISTS {t.pg_name} CASCADE;")
+        self.pg_cur.execute(t.get_create_table_query())
+
+        self._run_migrator_sync(t, fb_rows=[(0, 'zero_record')])
+
+        self.pg_cur.execute(f"INSERT INTO {t.pg_name} (val) VALUES ('next_val') RETURNING id;")
+        first_id = self.pg_cur.fetchone()[0]
+        self.assertEqual(first_id, 1)
+
+        self.pg_cur.execute(f"INSERT INTO {t.pg_name} (val) VALUES ('second_val') RETURNING id;")
+        second_id = self.pg_cur.fetchone()[0]
+        self.assertEqual(second_id, 2)
+
+    def test_live_explicit_negative_and_zero_ids_with_generator_zero(self):
+        # Table contains negative IDs and ID 0, generator is at 0.
+        # Upper data bound is 0, which is still below min_value 1.
+        # Sequence must be set to (1, false), next insert produces 1.
+        t = Table('t_live_neg_zero')
+        t.columns.append(Column('id', 'INTEGER', nullable=False, identity_type='BY DEFAULT', identity_increment=1, identity_current=0))
+        t.columns.append(Column('val', 'TEXT', nullable=True))
+
+        self.pg_cur.execute(f"DROP TABLE IF EXISTS {t.pg_name} CASCADE;")
+        self.pg_cur.execute(t.get_create_table_query())
+
+        self._run_migrator_sync(t, fb_rows=[(-10, 'neg10'), (-1, 'neg1'), (0, 'zero')])
+
+        self.pg_cur.execute(f"INSERT INTO {t.pg_name} (val) VALUES ('first') RETURNING id;")
+        first_id = self.pg_cur.fetchone()[0]
+        self.assertEqual(first_id, 1)
+
+    def test_live_explicit_id_zero_with_descending_generator_zero(self):
+        # Descending sequence (increment -1, maxvalue -1).
+        # ID 0 is above maxvalue -1. Generator at 0.
+        # Must not produce setval(0, true) above max_value -1.
+        # Sequence must be set to (-1, false), next insert produces -1.
+        t = Table('t_live_desc_zero')
+        t.columns.append(Column('id', 'INTEGER', nullable=False, identity_type='BY DEFAULT', identity_increment=-1, identity_current=0))
+        t.columns.append(Column('val', 'TEXT', nullable=True))
+
+        self.pg_cur.execute(f"DROP TABLE IF EXISTS {t.pg_name} CASCADE;")
+        self.pg_cur.execute(t.get_create_table_query())
+
+        self._run_migrator_sync(t, fb_rows=[(0, 'zero_record')])
+
+        self.pg_cur.execute(f"INSERT INTO {t.pg_name} (val) VALUES ('first') RETURNING id;")
+        first_id = self.pg_cur.fetchone()[0]
+        self.assertEqual(first_id, -1)
+
+        self.pg_cur.execute(f"INSERT INTO {t.pg_name} (val) VALUES ('second') RETURNING id;")
+        second_id = self.pg_cur.fetchone()[0]
+        self.assertEqual(second_id, -2)
 
 
 if __name__ == '__main__':

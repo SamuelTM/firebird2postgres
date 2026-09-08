@@ -793,64 +793,74 @@ class DataMigrator:
                 curr_lit = str(curr) if curr is not None else "NULL"
 
                 # Sequence and IDENTITY synchronization policy:
-                # 1. Unused generator (curr == 0) & empty table:
-                #    setval(seq, inc, false) ensures next insert produces inc (e.g. 1, 10, -2)
-                #    and avoids out-of-bounds error from setval(..., 0, true) below min_value.
+                # 1. Unused generator (curr == 0) & empty table or IDs below minimum:
+                #    setval(seq, bound, false) ensures next insert produces inc (e.g. 1, 10, -2)
+                #    and avoids out-of-bounds error from setval(..., 0, true) below min_value / above max_value.
                 # 2. Generator ahead of data:
                 #    Preserves position without regression (curr is taken with is_called=true).
                 # 3. Explicit IDs beyond generator:
                 #    Advances sequence to max_val (or min_val for descending) to prevent key collision.
-                # 4. Special identifiers:
+                # 4. Single scan:
+                #    Computes MAX/MIN once in a CTE to prevent duplicate full-table scans before index creation.
+                # 5. Special identifiers:
                 #    table_arg and col_arg escape apostrophes for pg_get_serial_sequence string arguments.
                 if inc < 0:
                     sync_query = f"""
+                        WITH seq_info AS (
+                            SELECT seqrelid, seqmin, seqmax, seqstart
+                            FROM pg_sequence
+                            WHERE seqrelid = pg_get_serial_sequence('{table_arg}', '{col_arg}')::regclass
+                        ),
+                        m AS (
+                            SELECT MIN({quoted_col}) AS min_val FROM {quoted_tbl}
+                        )
                         SELECT setval(
-                            pg_get_serial_sequence('{table_arg}', '{col_arg}'),
-                            (
-                                SELECT
-                                    CASE
-                                        WHEN m.min_val IS NOT NULL AND {curr_lit} IS NOT NULL THEN LEAST({curr_lit}, m.min_val)
-                                        WHEN m.min_val IS NOT NULL THEN m.min_val
-                                        WHEN {curr_lit} IS NOT NULL AND {curr_lit} != 0 THEN {curr_lit}
-                                        ELSE {inc}
-                                    END
-                                FROM (SELECT MIN({quoted_col}) AS min_val FROM {quoted_tbl}) m
-                            ),
-                            (
-                                SELECT
-                                    CASE
-                                        WHEN m.min_val IS NOT NULL THEN true
-                                        WHEN {curr_lit} IS NOT NULL AND {curr_lit} != 0 THEN true
-                                        ELSE false
-                                    END
-                                FROM (SELECT MIN({quoted_col}) AS min_val FROM {quoted_tbl}) m
-                            )
-                        );
+                            s.seqrelid,
+                            CASE
+                                WHEN m.min_val IS NOT NULL AND m.min_val <= s.seqmax AND {curr_lit} IS NOT NULL AND {curr_lit} <= s.seqmax
+                                    THEN LEAST({curr_lit}, m.min_val)
+                                WHEN m.min_val IS NOT NULL AND m.min_val <= s.seqmax
+                                    THEN m.min_val
+                                WHEN {curr_lit} IS NOT NULL AND {curr_lit} <= s.seqmax
+                                    THEN {curr_lit}
+                                ELSE LEAST({inc}, s.seqmax)
+                            END,
+                            CASE
+                                WHEN (m.min_val IS NOT NULL AND m.min_val <= s.seqmax) OR ({curr_lit} IS NOT NULL AND {curr_lit} <= s.seqmax)
+                                    THEN true
+                                ELSE false
+                            END
+                        )
+                        FROM seq_info s, m;
                     """
                 else:
                     sync_query = f"""
+                        WITH seq_info AS (
+                            SELECT seqrelid, seqmin, seqmax, seqstart
+                            FROM pg_sequence
+                            WHERE seqrelid = pg_get_serial_sequence('{table_arg}', '{col_arg}')::regclass
+                        ),
+                        m AS (
+                            SELECT MAX({quoted_col}) AS max_val FROM {quoted_tbl}
+                        )
                         SELECT setval(
-                            pg_get_serial_sequence('{table_arg}', '{col_arg}'),
-                            (
-                                SELECT
-                                    CASE
-                                        WHEN m.max_val IS NOT NULL AND {curr_lit} IS NOT NULL THEN GREATEST({curr_lit}, m.max_val)
-                                        WHEN m.max_val IS NOT NULL THEN m.max_val
-                                        WHEN {curr_lit} IS NOT NULL AND {curr_lit} != 0 THEN {curr_lit}
-                                        ELSE {inc}
-                                    END
-                                FROM (SELECT MAX({quoted_col}) AS max_val FROM {quoted_tbl}) m
-                            ),
-                            (
-                                SELECT
-                                    CASE
-                                        WHEN m.max_val IS NOT NULL THEN true
-                                        WHEN {curr_lit} IS NOT NULL AND {curr_lit} != 0 THEN true
-                                        ELSE false
-                                    END
-                                FROM (SELECT MAX({quoted_col}) AS max_val FROM {quoted_tbl}) m
-                            )
-                        );
+                            s.seqrelid,
+                            CASE
+                                WHEN m.max_val IS NOT NULL AND m.max_val >= s.seqmin AND {curr_lit} IS NOT NULL AND {curr_lit} >= s.seqmin
+                                    THEN GREATEST({curr_lit}, m.max_val)
+                                WHEN m.max_val IS NOT NULL AND m.max_val >= s.seqmin
+                                    THEN m.max_val
+                                WHEN {curr_lit} IS NOT NULL AND {curr_lit} >= s.seqmin
+                                    THEN {curr_lit}
+                                ELSE GREATEST({inc}, s.seqmin)
+                            END,
+                            CASE
+                                WHEN (m.max_val IS NOT NULL AND m.max_val >= s.seqmin) OR ({curr_lit} IS NOT NULL AND {curr_lit} >= s.seqmin)
+                                    THEN true
+                                ELSE false
+                            END
+                        )
+                        FROM seq_info s, m;
                     """
                 logger.debug(sync_query.strip())
                 pg_cur.execute(sync_query)
