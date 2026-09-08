@@ -2851,9 +2851,32 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
             indented_stmt = "\n".join(stmt_lines)
             return f"BEGIN\n{indented_stmt}\nEXCEPTION WHEN NO_DATA_FOUND THEN\n    NULL;\nEND;"
 
+        # DML RETURNING INTO (INSERT/UPDATE/DELETE ... RETURNING ... INTO :var)
+        # can assign NULL to NOT NULL output params — inject guards after the statement.
+        ret_ctx = _find_node(ctx, FirebirdParser.Static_returning_clauseContext)
+        if ret_ctx and getattr(self, 'current_not_null_outputs', None):
+            ret_into = _find_node(ret_ctx, FirebirdParser.Into_clauseContext)
+            if ret_into:
+                ret_vars = []
+                for c in ret_into.children:
+                    if isinstance(c, (FirebirdParser.General_elementContext, FirebirdParser.Bind_variableContext)):
+                        v_name = self.get_raw_text(c).strip().lstrip(':').strip('"').lower()
+                        ret_vars.append(v_name)
+                not_null_ret = [v for v in ret_vars if v in self.current_not_null_outputs]
+                if not_null_ret:
+                    raw_stmt = self.get_raw_text(ctx).strip()
+                    if not raw_stmt.endswith(';'):
+                        raw_stmt += ';'
+                    ret_guards = [
+                        f"IF {self.current_not_null_outputs[v]['ident']} IS NULL THEN RAISE EXCEPTION 'validation error for variable %, value null', '{self.current_not_null_outputs[v]['name']}'; END IF;"
+                        for v in not_null_ret
+                    ]
+                    return f"{raw_stmt}\n" + "\n".join(ret_guards)
+
         # For all other SQL statements (UPDATE, DELETE, EXECUTE, plain SELECT, etc.)
         # we just return their rewritten text.
         return self.get_raw_text(ctx)
+
 
     def visitExit_statement(self, ctx: FirebirdParser.Exit_statementContext):
         first_tok = ctx.getChild(0).getText().upper()

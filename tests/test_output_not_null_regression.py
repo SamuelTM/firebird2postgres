@@ -549,6 +549,152 @@ class TestOutputNotNullRegression(unittest.TestCase):
             self.pg_cur.execute('SELECT * FROM "p_test_mixed_out"();')
             self.assertEqual(self.pg_cur.fetchall(), [(99, None)])
 
+    def test_returning_into_not_null_guard_transpile(self):
+        """
+        INSERT/UPDATE/DELETE ... RETURNING ... INTO :R must inject NOT NULL guard
+        when R is a NOT NULL output parameter.
+        """
+        fb_insert = """
+        CREATE OR ALTER PROCEDURE P_RET_INSERT
+        RETURNS (R INTEGER NOT NULL)
+        AS
+        BEGIN
+            INSERT INTO T(V) VALUES(NULL) RETURNING V INTO :R;
+            R = 1;
+            SUSPEND;
+        END
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_insert)
+        # Guard must appear after the INSERT RETURNING INTO
+        self.assertIn("RETURNING V INTO R;", pg_sql)
+        # NOT NULL guard right after the RETURNING INTO statement
+        lines = pg_sql.split('\n')
+        returning_idx = next(i for i, l in enumerate(lines) if 'RETURNING V INTO R;' in l)
+        guard_after = lines[returning_idx + 1]
+        self.assertIn("IF R IS NULL THEN RAISE EXCEPTION", guard_after)
+
+        # UPDATE RETURNING INTO
+        fb_update = """
+        CREATE OR ALTER PROCEDURE P_RET_UPDATE
+        RETURNS (R INTEGER NOT NULL)
+        AS
+        BEGIN
+            UPDATE T SET V = NULL WHERE ID = 1 RETURNING V INTO :R;
+            SUSPEND;
+        END
+        """
+        pg_upd = FirebirdToPostgresVisitor.transpile(fb_update)
+        self.assertIn("RETURNING V INTO R;", pg_upd)
+        lines_upd = pg_upd.split('\n')
+        ret_idx = next(i for i, l in enumerate(lines_upd) if 'RETURNING V INTO R;' in l)
+        self.assertIn("IF R IS NULL THEN RAISE EXCEPTION", lines_upd[ret_idx + 1])
+
+        # DELETE RETURNING INTO
+        fb_delete = """
+        CREATE OR ALTER PROCEDURE P_RET_DELETE
+        RETURNS (R INTEGER NOT NULL)
+        AS
+        BEGIN
+            DELETE FROM T WHERE ID = 1 RETURNING V INTO :R;
+            SUSPEND;
+        END
+        """
+        pg_del = FirebirdToPostgresVisitor.transpile(fb_delete)
+        self.assertIn("RETURNING V INTO R;", pg_del)
+        lines_del = pg_del.split('\n')
+        ret_idx_d = next(i for i, l in enumerate(lines_del) if 'RETURNING V INTO R;' in l)
+        self.assertIn("IF R IS NULL THEN RAISE EXCEPTION", lines_del[ret_idx_d + 1])
+
+    def test_returning_into_nullable_output_no_guard(self):
+        """
+        RETURNING INTO a nullable output should NOT inject guards.
+        """
+        fb_sql = """
+        CREATE OR ALTER PROCEDURE P_RET_NULLABLE
+        RETURNS (R INTEGER)
+        AS
+        BEGIN
+            INSERT INTO T(V) VALUES(NULL) RETURNING V INTO :R;
+            SUSPEND;
+        END
+        """
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        # No NOT NULL guard after RETURNING INTO for nullable output
+        lines = pg_sql.split('\n')
+        for i, line in enumerate(lines):
+            if 'RETURNING V INTO R;' in line:
+                if i + 1 < len(lines):
+                    self.assertNotIn("RAISE EXCEPTION", lines[i + 1])
+
+    @unittest.skipUnless(HAS_REAL_FB and HAS_REAL_PG, "Live Firebird and PostgreSQL required")
+    def test_returning_into_not_null_live_equivalence(self):
+        """
+        Execute INSERT RETURNING INTO :R (NOT NULL output) with NULL value
+        on both Firebird and PostgreSQL, demanding equivalent error.
+        """
+        fb_sql = """
+        CREATE OR ALTER PROCEDURE P_RET_LIVE
+        RETURNS (R INTEGER NOT NULL)
+        AS
+        BEGIN
+            INSERT INTO T_RET_LIVE(V) VALUES(NULL) RETURNING V INTO :R;
+            SUSPEND;
+        END
+        """
+        # Setup table in Firebird
+        self._cleanup_fb_proc("P_RET_LIVE")
+        for ddl in ["DROP TRIGGER T_RET_LIVE_BI", "DROP TABLE T_RET_LIVE", "DROP SEQUENCE GEN_T_RET_LIVE"]:
+            try:
+                self.fb_cur.execute(ddl)
+                self.fb_con.commit()
+            except Exception:
+                self.fb_con.rollback()
+        self.fb_cur.execute("CREATE TABLE T_RET_LIVE (ID INTEGER NOT NULL PRIMARY KEY, V INTEGER)")
+        self.fb_cur.execute("CREATE GENERATOR GEN_T_RET_LIVE")
+        self.fb_cur.execute("""
+            CREATE OR ALTER TRIGGER T_RET_LIVE_BI FOR T_RET_LIVE
+            ACTIVE BEFORE INSERT POSITION 0 AS BEGIN
+                IF (NEW.ID IS NULL) THEN NEW.ID = GEN_ID(GEN_T_RET_LIVE, 1);
+            END
+        """)
+        self.fb_con.commit()
+
+        self._cleanup_fb_proc("P_RET_LIVE")
+        self.fb_cur.execute(fb_sql)
+        self.fb_con.commit()
+
+        # Firebird: should raise validation error
+        with self.assertRaises(Exception) as fb_cm:
+            self.fb_cur.execute("SELECT R FROM P_RET_LIVE")
+            self.fb_cur.fetchall()
+        self.assertIn("validation error for variable R", str(fb_cm.exception))
+        self.fb_con.rollback()
+
+        # PostgreSQL setup
+        self.pg_cur.execute("DROP TABLE IF EXISTS t_ret_live CASCADE;")
+        self.pg_cur.execute("CREATE TABLE t_ret_live (id SERIAL PRIMARY KEY, v INTEGER);")
+        self.pg_con.commit()
+
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql)
+        self.pg_cur.execute(pg_sql)
+
+        with self.assertRaises(psycopg2.Error) as pg_cm:
+            self.pg_cur.execute('SELECT * FROM "p_ret_live"();')
+        self.assertIn("validation error for variable R, value null", str(pg_cm.exception))
+        self.pg_con.rollback()
+
+        # Cleanup
+        self._cleanup_fb_proc("P_RET_LIVE")
+        try:
+            self.fb_cur.execute("DROP TABLE T_RET_LIVE")
+            self.fb_con.commit()
+        except Exception:
+            self.fb_con.rollback()
+
+        self.pg_cur.execute("DROP TABLE IF EXISTS t_ret_live CASCADE;")
+        self.pg_con.commit()
+
 
 if __name__ == '__main__':
     unittest.main()
+
