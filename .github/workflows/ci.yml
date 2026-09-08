@@ -48,12 +48,12 @@ jobs:
           --health-timeout 5s
           --health-retries 10
       firebird:
-        image: firebirdsql/firebird:4.0
+        # NOTE: there is no plain "4.0" tag; use a pinned release tag
+        # (see https://github.com/FirebirdSQL/firebird-docker#supported-tags).
+        image: firebirdsql/firebird:4.0.7
         env:
           FIREBIRD_ROOT_PASSWORD: masterkey
           FIREBIRD_DATABASE: firebird2postgres_test.fdb
-          FIREBIRD_USER: sysdba
-          FIREBIRD_PASSWORD: masterkey
         ports:
           - 3050:3050
     env:
@@ -65,7 +65,7 @@ jobs:
       TEST_PG_PASSWORD: postgres
       TEST_FB_HOST: localhost
       TEST_FB_PORT: 3050
-      TEST_FB_DATABASE: /firebird/data/firebird2postgres_test.fdb
+      TEST_FB_DATABASE: /var/lib/firebird/data/firebird2postgres_test.fdb
       TEST_FB_USER: sysdba
       TEST_FB_PASSWORD: masterkey
       # Mandatory stage: unavailable databases must FAIL, never skip.
@@ -79,5 +79,50 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+      - name: Wait for disposable databases
+        # The Firebird service has no Docker healthcheck; poll both
+        # databases so strict mode (REQUIRE_INTEGRATION=1) never fails
+        # on a slow container start instead of a real regression.
+        run: |
+          python - <<'EOF'
+          import time
+          import firebirdsql
+          import psycopg2
+
+          deadline = time.time() + 180
+          pg_ok = fb_ok = False
+          while time.time() < deadline and not (pg_ok and fb_ok):
+              if not pg_ok:
+                  try:
+                      conn = psycopg2.connect(
+                          host='localhost', port=5432,
+                          dbname='firebird2postgres_test',
+                          user='postgres', password='postgres',
+                          connect_timeout=3,
+                      )
+                      conn.close()
+                      pg_ok = True
+                  except Exception:
+                      pass
+              if not fb_ok:
+                  try:
+                      conn = firebirdsql.connect(
+                          host='localhost', port=3050,
+                          database='/var/lib/firebird/data/firebird2postgres_test.fdb',
+                          user='sysdba', password='masterkey',
+                      )
+                      cur = conn.cursor()
+                      cur.execute('SELECT 1 FROM RDB$DATABASE;')
+                      assert cur.fetchone()[0] == 1
+                      conn.close()
+                      fb_ok = True
+                  except Exception:
+                      pass
+              if not (pg_ok and fb_ok):
+                  time.sleep(3)
+          assert pg_ok, 'PostgreSQL service did not become ready in time'
+          assert fb_ok, 'Firebird service did not become ready in time'
+          print('Disposable databases ready (postgres + firebird).')
+          EOF
       - name: Run full suite against live disposable databases
         run: python -m pytest tests/ -q
