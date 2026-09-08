@@ -48,6 +48,36 @@ class TestIdentifyObject(unittest.TestCase):
                             'CREATE TRIGGER "TRG_X" BEFORE INSERT ON "tabela" FOR EACH ROW EXECUTE FUNCTION f();'),
             ('TRIGGER', 'TRG_X'))
 
+    def test_function_with_hyphen_and_space(self):
+        self.assertEqual(
+            identify_object('CREATE FUNCTION "p-with-dash"() RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;'),
+            ('FUNCTION', 'p-with-dash')
+        )
+        self.assertEqual(
+            identify_object('CREATE OR REPLACE FUNCTION "func with spaces"() RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;'),
+            ('FUNCTION', 'func with spaces')
+        )
+        self.assertEqual(
+            identify_object('CREATE FUNCTION public."p-with-dash"() RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;'),
+            ('FUNCTION', 'p-with-dash')
+        )
+
+    def test_procedure_with_hyphen(self):
+        self.assertEqual(
+            identify_object('CREATE PROCEDURE "p-with-dash"() AS $$ BEGIN END; $$ LANGUAGE plpgsql;'),
+            ('PROCEDURE', 'p-with-dash')
+        )
+
+    def test_view_and_trigger_with_hyphen(self):
+        self.assertEqual(
+            identify_object('CREATE VIEW "v-with-dash" AS SELECT 1;'),
+            ('VIEW', 'v-with-dash')
+        )
+        self.assertEqual(
+            identify_object('CREATE TRIGGER "trg-with-dash" BEFORE INSERT ON "table" FOR EACH ROW EXECUTE FUNCTION f();'),
+            ('TRIGGER', 'trg-with-dash')
+        )
+
     def test_other_statement(self):
         self.assertEqual(identify_object('SELECT 1;'), ('OTHER', 'UNKNOWN'))
 
@@ -278,6 +308,48 @@ class TestPlpgsqlCheckValidationUnit(unittest.TestCase):
         self.assertEqual(status, CHECK_ISSUES_FOUND)
         mock_cursor.execute.assert_any_call("ROLLBACK TO SAVEPOINT sp_plpgsql_check_1;")
         mock_cursor.execute.assert_any_call("SAVEPOINT sp_plpgsql_check_2;")
+
+    def test_zero_targets_when_functions_expected_fails_if_require_checker_true(self):
+        from unittest.mock import MagicMock
+        from validate_postgres_ddl import check_plpgsql_runtime_validity, CHECK_ISSUES_FOUND
+
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = (1,)  # Extension present
+        mock_cursor.fetchall.side_effect = [
+            [],  # 0 regular functions found in catalog
+            [],  # 0 triggers found in catalog
+        ]
+
+        val_results, issues, status = check_plpgsql_runtime_validity(
+            mock_cursor,
+            function_names=['p-with-dash'],
+            require_checker=True
+        )
+        self.assertEqual(len(val_results), 1)
+        self.assertFalse(val_results[0].success)
+        self.assertEqual(val_results[0].pg_code, 'TARGET_NOT_VERIFIED')
+        self.assertIn("Alvo obrigatório 'p-with-dash' não foi verificado", val_results[0].error_message)
+        self.assertEqual(status, CHECK_ISSUES_FOUND)
+        self.assertTrue(any("alvo não verificado" in iss[1] for iss in issues))
+
+    def test_zero_targets_when_functions_expected_reports_issue_and_does_not_pass(self):
+        from unittest.mock import MagicMock
+        from validate_postgres_ddl import check_plpgsql_runtime_validity, CHECK_ISSUES_FOUND
+
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = (1,)  # Extension present
+        mock_cursor.fetchall.side_effect = [
+            [],  # 0 regular functions found in catalog
+            [],  # 0 triggers found in catalog
+        ]
+
+        val_results, issues, status = check_plpgsql_runtime_validity(
+            mock_cursor,
+            function_names=['p-with-dash'],
+            require_checker=False
+        )
+        self.assertEqual(status, CHECK_ISSUES_FOUND)
+        self.assertTrue(any("alvo não verificado" in iss[1] for iss in issues))
 
 
 def check_live_postgres_available() -> bool:
@@ -703,6 +775,78 @@ class TestValidatePostgresDdlRegression(unittest.TestCase):
             f"WHERE table_schema = '{self.schema_name}' AND table_name = 'reg_tbl_req';"
         )
         self.assertIsNone(cur.fetchone())
+
+    def test_function_with_hyphen_in_name_and_invalid_sql_fails_with_require_checker(self):
+        """
+        Regression: Function with hyphen in name ('p-with-dash') and invalid internal SQL
+        must be properly identified, targeted by plpgsql_check, and rejected when require_checker=True.
+        """
+        import tempfile, os
+        from validate_postgres_ddl import validate_postgres_ddl
+
+        with tempfile.NamedTemporaryFile("w+", suffix=".sql", delete=False) as f:
+            f.write(
+                "CREATE TABLE reg_tbl_dash (id INT PRIMARY KEY);\n"
+                'CREATE FUNCTION "p-with-dash"() RETURNS void AS $$\n'
+                "BEGIN\n"
+                "    SELECT non_existent_col FROM reg_tbl_dash;\n"
+                "END;\n"
+                "$$ LANGUAGE plpgsql;\n"
+            )
+            fpath = f.name
+        self.addCleanup(os.remove, fpath)
+
+        success = validate_postgres_ddl(
+            pg_connection=self.conn,
+            target_files=[fpath],
+            apply_changes=True,
+            require_checker=True
+        )
+        self.assertFalse(success, "Function 'p-with-dash' with invalid SQL must fail validation")
+
+        # Confirm rollback: neither table nor function were persisted
+        cur = self.conn.cursor()
+        cur.execute(
+            f"SELECT 1 FROM information_schema.tables "
+            f"WHERE table_schema = '{self.schema_name}' AND table_name = 'reg_tbl_dash';"
+        )
+        self.assertIsNone(cur.fetchone(), "Table must be rolled back on checker failure")
+
+    def test_function_with_space_in_name_and_invalid_sql_fails_with_require_checker(self):
+        """
+        Regression: Function with space in name ('func with space') and invalid internal SQL
+        must be properly identified, targeted by plpgsql_check, and rejected when require_checker=True.
+        """
+        import tempfile, os
+        from validate_postgres_ddl import validate_postgres_ddl
+
+        with tempfile.NamedTemporaryFile("w+", suffix=".sql", delete=False) as f:
+            f.write(
+                "CREATE TABLE reg_tbl_space (id INT PRIMARY KEY);\n"
+                'CREATE FUNCTION "func with space"() RETURNS void AS $$\n'
+                "BEGIN\n"
+                "    SELECT non_existent_col FROM reg_tbl_space;\n"
+                "END;\n"
+                "$$ LANGUAGE plpgsql;\n"
+            )
+            fpath = f.name
+        self.addCleanup(os.remove, fpath)
+
+        success = validate_postgres_ddl(
+            pg_connection=self.conn,
+            target_files=[fpath],
+            apply_changes=True,
+            require_checker=True
+        )
+        self.assertFalse(success, "Function 'func with space' with invalid SQL must fail validation")
+
+        # Confirm rollback
+        cur = self.conn.cursor()
+        cur.execute(
+            f"SELECT 1 FROM information_schema.tables "
+            f"WHERE table_schema = '{self.schema_name}' AND table_name = 'reg_tbl_space';"
+        )
+        self.assertIsNone(cur.fetchone(), "Table must be rolled back on checker failure")
 
 
 if __name__ == '__main__':
