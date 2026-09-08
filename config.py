@@ -1,7 +1,7 @@
 import os
 import logging
 from dataclasses import dataclass, field
-from typing import Callable, TypeVar
+from typing import Callable, TypeVar, Any
 from dotenv import load_dotenv
 import firebirdsql
 import psycopg2
@@ -96,6 +96,23 @@ class PostgresConfig:
     dbname: str = field(default_factory=env_default('POSTGRES_DB', 'sample_database'))
     user: str = field(default_factory=env_default('POSTGRES_USER', 'postgres'))
     password: str = field(default_factory=env_default('POSTGRES_PASSWORD', 'mypassword'))
+
+
+
+def _bool_converter(val: Any) -> bool:
+    if isinstance(val, bool):
+        return val
+    return str(val).lower() in ('1', 'true', 'yes', 't')
+
+
+@dataclass(frozen=True)
+class MigrationConfig:
+    require_frozen_source: bool = field(
+        default_factory=env_default('REQUIRE_FROZEN_SOURCE', True, _bool_converter)
+    )
+    allow_live_source: bool = field(
+        default_factory=env_default('ALLOW_LIVE_SOURCE', False, _bool_converter)
+    )
 
 
 def get_firebird_connection(config: FirebirdConfig = None):

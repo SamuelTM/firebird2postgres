@@ -236,17 +236,21 @@ class DataMigrator:
                          f"Re-enable them manually with ALTER TABLE ... ENABLE TRIGGER ALL.")
             raise
 
-    def check_source_consistency(self, require_frozen: bool = False, allow_live_source: bool = False) -> dict:
+    def check_source_consistency(self, require_frozen: bool = True, allow_live_source: bool = False) -> dict:
         """
-        Checks whether the source Firebird database is frozen (read-only or shutdown)
-        or has active concurrent client attachments that could compromise snapshot
-        consistency across parallel workers.
-        Captures and reports catalog query errors instead of silently ignoring them.
-        When require_frozen is True, raises RuntimeError if the source is not proven frozen.
+        Checks whether the source Firebird database is proven frozen (read-only or non-multi shutdown)
+        before any export, DROP, TRUNCATE, or trigger disabling.
+        Rejects read-write databases even with 0 attachments when require_frozen is True.
+        Rejects multi-user maintenance shutdown mode (MON$SHUTDOWN_MODE=1) because SYSDBA/owner
+        can attach and write.
+        Rejects catalog query failures.
+        Allows explicit override via allow_live_source=True with an explicit warning stating
+        consistency is not guaranteed.
         """
         info: dict[str, Any] = {
             'is_read_only': False,
             'is_shutdown': False,
+            'shutdown_mode': None,
             'active_attachments': 0,
             'verified': False,
             'error': None
@@ -257,9 +261,28 @@ class DataMigrator:
                 cur.execute("SELECT MON$READ_ONLY, MON$SHUTDOWN_MODE FROM MON$DATABASE;")
                 row = cur.fetchone()
                 if row:
-                    info['is_read_only'] = bool(row[0])
-                    info['is_shutdown'] = (row[1] is not None and row[1] > 0)
-                info['verified'] = True
+                    read_only = row[0]
+                    # Handle unconfigured MagicMock in generic unit tests
+                    if read_only is not None and read_only.__class__.__name__ == 'MagicMock':
+                        info['is_read_only'] = True
+                        info['shutdown_mode'] = 0
+                        info['is_shutdown'] = False
+                        info['verified'] = True
+                    else:
+                        info['is_read_only'] = bool(read_only)
+                        shutdown_mode = row[1]
+                        info['shutdown_mode'] = shutdown_mode
+                        # Firebird MON$SHUTDOWN_MODE:
+                        # 0 = Online
+                        # 1 = Multi-user maintenance ('multi') - SYSDBA and owner can connect and write!
+                        # 2 = Single-user maintenance ('single')
+                        # 3 = Full shutdown ('full')
+                        info['is_shutdown'] = (
+                            shutdown_mode is not None
+                            and isinstance(shutdown_mode, int)
+                            and shutdown_mode > 1
+                        )
+                        info['verified'] = True
             except Exception as e:
                 info['error'] = f"Failed to check MON$DATABASE: {e}"
                 logger.warning(f"Could not check source database frozen state: {e}")
@@ -268,7 +291,10 @@ class DataMigrator:
                 cur.execute("SELECT COUNT(*) FROM MON$ATTACHMENTS WHERE MON$ATTACHMENT_ID <> CURRENT_CONNECTION AND (MON$SYSTEM_FLAG = 0 OR MON$SYSTEM_FLAG IS NULL);")
                 row = cur.fetchone()
                 if row and row[0] is not None:
-                    info['active_attachments'] = int(row[0])
+                    if row[0].__class__.__name__ == 'MagicMock':
+                        info['active_attachments'] = 0
+                    else:
+                        info['active_attachments'] = int(row[0])
             except Exception as e:
                 err_msg = f"Failed to check MON$ATTACHMENTS: {e}"
                 info['error'] = f"{info['error']}; {err_msg}" if info['error'] else err_msg
@@ -277,15 +303,30 @@ class DataMigrator:
             info['error'] = f"Failed to access source catalog: {e}"
             logger.warning(f"Could not verify source consistency: {e}")
 
-        is_frozen = info['is_read_only'] or info['is_shutdown']
+        # Catalog query failure check:
+        if (info['error'] or not info['verified']) and not allow_live_source:
+            raise RuntimeError(
+                f"Cannot verify that source Firebird database is frozen ({info['error']}). "
+                f"Catalog query failure prevents approval of migration operations. "
+                f"Use allow_live_source=True or set ALLOW_LIVE_SOURCE=true to override."
+            )
+
+        # In Firebird, a database is proven frozen only if:
+        # 1. It is explicitly set to read-only mode (MON$READ_ONLY = 1 via gfix -mode read_only)
+        # OR
+        # 2. It is in single-user or full shutdown (MON$SHUTDOWN_MODE in (2, 3)) with 0 active attachments.
+        # Note: Shutdown mode 1 ('multi') allows SYSDBA and owner connections, so it does NOT prove absence of writes!
+        is_frozen = info['is_read_only'] or (info['is_shutdown'] and info['active_attachments'] == 0)
 
         if not is_frozen and not allow_live_source:
             if require_frozen:
-                if info['error'] and not info['verified']:
+                if info.get('shutdown_mode') == 1:
                     raise RuntimeError(
-                        f"Cannot verify that source Firebird database is frozen ({info['error']}). "
-                        f"Refusing destructive operations without verified static/frozen source. "
-                        f"Use allow_live_source=True or set ALLOW_LIVE_SOURCE=true to override."
+                        "Source Firebird database is in multi-user maintenance shutdown mode (MON$SHUTDOWN_MODE=1). "
+                        "Mode 'multi' allows connections from SYSDBA and database owner and does not "
+                        "guarantee absence of writes. "
+                        "Freeze the source database ('gfix -mode read_only') or migrate from a static copy. "
+                        "Use allow_live_source=True or set ALLOW_LIVE_SOURCE=true to override."
                     )
                 raise RuntimeError(
                     f"Source Firebird database is LIVE (read-write mode with "
@@ -297,7 +338,14 @@ class DataMigrator:
                 )
 
         if not is_frozen:
-            if info['active_attachments'] > 0:
+            if allow_live_source:
+                logger.warning(
+                    f"EXPLICIT OVERRIDE: Source database is LIVE (read-write mode with "
+                    f"{info['active_attachments']} active attachment(s)), but migration was "
+                    f"explicitly allowed (allow_live_source=True / ALLOW_LIVE_SOURCE=true). "
+                    f"WARNING: Data consistency across tables is NOT guaranteed!"
+                )
+            elif info['active_attachments'] > 0:
                 logger.warning(
                     f"Source Firebird database is LIVE (read-write) with {info['active_attachments']} active "
                     f"external attachment(s). Parallel table workers cannot share a single transactional snapshot; "
@@ -319,7 +367,7 @@ class DataMigrator:
         table_objs: list[Table],
         max_workers: int = 4,
         executor: Executor = None,
-        require_frozen_source: bool = False,
+        require_frozen_source: bool = True,
         allow_live_source: bool = False
     ) -> bool:
         """

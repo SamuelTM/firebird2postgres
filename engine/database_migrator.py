@@ -14,12 +14,14 @@ class DatabaseMigrator:
     DdlExporter, and SqlRunner.
     """
 
-    def __init__(self, fb_con, pg_con):
+    def __init__(self, fb_con, pg_con, config=None):
         """
         Initializes the migrator with live connection objects to Firebird and PostgreSQL.
         """
+        from config import MigrationConfig
         self.fb_con = fb_con
         self.pg_con = pg_con
+        self.config = config or MigrationConfig()
         self.table_objs: list[Table] = []
         self.sequence_objs: list[Sequence] = []
         self.verified_empty: dict[str, bool] = {}
@@ -80,17 +82,32 @@ class DatabaseMigrator:
         self._ensure_schema()
         self.schema_migrator.analyze_tables(self.table_objs)
 
-    def import_data(self, max_workers: int = 4, require_frozen_source: bool = False, allow_live_source: bool = False) -> bool:
+    def check_source_consistency(self, require_frozen: bool = None, allow_live_source: bool = None) -> dict:
+        """
+        Verifies source database consistency and freeze state before export and destructive operations.
+        Defaults require_frozen to MigrationConfig.require_frozen_source (True).
+        Defaults allow_live_source to MigrationConfig.allow_live_source (False).
+        """
+        req_frozen = self.config.require_frozen_source if require_frozen is None else require_frozen
+        allow_live = self.config.allow_live_source if allow_live_source is None else allow_live_source
+        return self.data_migrator.check_source_consistency(
+            require_frozen=req_frozen,
+            allow_live_source=allow_live
+        )
+
+    def import_data(self, max_workers: int = 4, require_frozen_source: bool = None, allow_live_source: bool = None) -> bool:
         """
         Imports data from Firebird to PostgreSQL using parallel worker pool.
         Returns True if successful, False if any table failed.
         """
         self._ensure_schema()
+        req_frozen = self.config.require_frozen_source if require_frozen_source is None else require_frozen_source
+        allow_live = self.config.allow_live_source if allow_live_source is None else allow_live_source
         return self.data_migrator.import_data(
             self.table_objs,
             max_workers=max_workers,
-            require_frozen_source=require_frozen_source,
-            allow_live_source=allow_live_source
+            require_frozen_source=req_frozen,
+            allow_live_source=allow_live
         )
 
     def export_firebird_triggers(self, output_file: str = None,

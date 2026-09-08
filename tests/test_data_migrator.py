@@ -267,7 +267,7 @@ class TestDataMigrator(unittest.TestCase):
             (3,),    # active_attachments = 3
         ]
         with self.assertLogs('engine.data_migrator', level='WARNING') as cm:
-            info = self.migrator.check_source_consistency()
+            info = self.migrator.check_source_consistency(require_frozen=False)
             self.assertFalse(info['is_read_only'])
             self.assertEqual(info['active_attachments'], 3)
             self.assertTrue(any('Source Firebird database is LIVE' in msg for msg in cm.output))
