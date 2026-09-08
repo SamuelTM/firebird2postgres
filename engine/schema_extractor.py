@@ -332,10 +332,14 @@ class SchemaExtractor:
         if not computed_cols:
             return
 
+        _ident = r'(?:"(?:""|[^"])+"|[A-Za-z0-9_$]+)'
         token_pat = re.compile(
             r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)"
-            r"|((?:(?:\"[^\"]+\"|[A-Za-z0-9_$]+)\s*\.\s*)?(?:\"[^\"]+\"|[A-Za-z0-9_$]+))",
+            r"|((?:(?:" + _ident + r")\s*\.\s*)?(?:" + _ident + r"))",
             flags=re.DOTALL
+        )
+        split_pat = re.compile(
+            r"^(?:(" + _ident + r")\s*\.\s*)?(" + _ident + r")$"
         )
 
         _SQL_EXPR_KEYWORDS = {
@@ -344,6 +348,21 @@ class SchemaExtractor:
             'BETWEEN', 'IN', 'LIKE', 'SIMILAR', 'DISTINCT',
             'ESCAPE', 'COLLATE', 'AS', 'FROM'
         }
+
+        def _unquote_ident(ident: str) -> str:
+            ident = ident.strip()
+            if ident.startswith('"') and ident.endswith('"') and len(ident) >= 2:
+                return ident[1:-1].replace('""', '"')
+            return ident
+
+        def _parse_ident(ident_full: str) -> tuple[str | None, str]:
+            m = split_pat.match(ident_full)
+            if not m:
+                return None, ident_full
+            tbl_raw, col_raw = m.group(1), m.group(2)
+            tbl_name = _unquote_ident(tbl_raw).lower() if tbl_raw else None
+            col_name = _unquote_ident(col_raw).lower()
+            return tbl_name, col_name
 
         def is_column_ref(m: re.Match, s: str) -> bool:
             # Function call: followed by '(' (ignoring whitespace)
@@ -378,13 +397,9 @@ class SchemaExtractor:
                 ident_full = m.group(2)
                 if not ident_full or not is_column_ref(m, expr):
                     continue
-                parts = re.split(r"\s*\.\s*", ident_full)
-                if len(parts) == 1:
-                    col_refs.add(parts[0].strip('"').lower())
-                elif len(parts) == 2:
-                    tbl_part = parts[0].strip('"').lower()
-                    if tbl_part == table_name.lower():
-                        col_refs.add(parts[1].strip('"').lower())
+                tbl_name, col_name = _parse_ident(ident_full)
+                if tbl_name is None or tbl_name == table_name.lower():
+                    col_refs.add(col_name)
             return col_refs
 
         def replace_col_ident(expr: str, col_target: str, repl_sql: str) -> str:
@@ -395,15 +410,9 @@ class SchemaExtractor:
                 ident_full = m.group(2)
                 if not ident_full or not is_column_ref(m, expr):
                     return m.group(0)
-                parts = re.split(r"\s*\.\s*", ident_full)
-                if len(parts) == 1:
-                    col_part = parts[0].strip('"').lower()
-                    if col_part == col_target.lower():
-                        return repl_sql
-                elif len(parts) == 2:
-                    tbl_part = parts[0].strip('"').lower()
-                    col_part = parts[1].strip('"').lower()
-                    if tbl_part == table_name.lower() and col_part == col_target.lower():
+                tbl_name, col_name = _parse_ident(ident_full)
+                if tbl_name is None or tbl_name == table_name.lower():
+                    if col_name == col_target.lower():
                         return repl_sql
                 return ident_full
 
