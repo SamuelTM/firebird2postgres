@@ -703,24 +703,29 @@ class SchemaExtractor:
 
         col_esc = re.escape(col_name)
         col_ref_pat = rf'(?:\"?NEW\"?\s*\.\s*\"?{col_esc}\"?)'
-        branch_patterns = [
+        null_branch_patterns = [
             rf'^{col_ref_pat}\s+IS\s+NULL$',
-            rf'^{col_ref_pat}\s*(?:<=?|=)\s*0$',
-            rf'^{col_ref_pat}\s*<\s*1$',
             rf'^COALESCE\s*\(\s*{col_ref_pat}\s*,\s*0\s*\)\s*(?:<=?|=)\s*0$',
             rf'^COALESCE\s*\(\s*{col_ref_pat}\s*,\s*0\s*\)\s*<\s*1$',
+        ]
+        zero_branch_patterns = [
+            rf'^{col_ref_pat}\s*(?:<=?|=)\s*0$',
+            rf'^{col_ref_pat}\s*<\s*1$',
         ]
 
         branches = re.split(r"\bOR\b", cond, flags=re.IGNORECASE)
         if not branches:
             return False
 
+        has_null_cover = False
         for b in branches:
             b_clean = cls._strip_outer_parens(b)
-            if not any(re.match(p, b_clean, re.IGNORECASE) for p in branch_patterns):
+            if any(re.match(p, b_clean, re.IGNORECASE) for p in null_branch_patterns):
+                has_null_cover = True
+            elif not any(re.match(p, b_clean, re.IGNORECASE) for p in zero_branch_patterns):
                 return False
 
-        return True
+        return has_null_cover
 
     @classmethod
     def _bind_sequence_generators(cls, cursor, table_objs: list[Table]) -> None:
