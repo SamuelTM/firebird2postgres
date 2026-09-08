@@ -734,70 +734,119 @@ class DdlExporter:
 
         return dict(self.exported_counts)
 
+    def get_source_objects(self) -> dict[str, list[str]]:
+        """
+        Queries Firebird catalog to retrieve user-defined object names for each category.
+        Returns a dict mapping dump filename (e.g. DumpFiles.PROCEDURES_PG) to a list of object names.
+        Raises an exception if any catalog query fails (catalog failures must not be swallowed).
+        """
+        cursor = self.fb_con.cursor()
+        objects = {}
+
+        # Domains
+        cursor.execute("""
+            SELECT DISTINCT RDB$FIELD_NAME FROM RDB$FIELDS
+            WHERE RDB$SYSTEM_FLAG = 0
+              AND RDB$FIELD_NAME NOT STARTING WITH 'RDB$'
+            ORDER BY RDB$FIELD_NAME;
+        """)
+        objects[DumpFiles.DOMAINS_PG] = [r[0].strip() for r in cursor.fetchall() if r and r[0]]
+
+        # Procedures
+        cursor.execute("""
+            SELECT RDB$PROCEDURE_NAME FROM RDB$PROCEDURES
+            WHERE RDB$SYSTEM_FLAG = 0
+              AND RDB$PROCEDURE_SOURCE IS NOT NULL
+            ORDER BY RDB$PROCEDURE_NAME;
+        """)
+        objects[DumpFiles.PROCEDURES_PG] = [r[0].strip() for r in cursor.fetchall() if r and r[0]]
+
+        # Views
+        cursor.execute("""
+            SELECT RDB$RELATION_NAME FROM RDB$RELATIONS
+            WHERE RDB$SYSTEM_FLAG = 0
+              AND RDB$VIEW_BLR IS NOT NULL
+            ORDER BY RDB$RELATION_NAME;
+        """)
+        objects[DumpFiles.VIEWS_PG] = [r[0].strip() for r in cursor.fetchall() if r and r[0]]
+
+        # Triggers
+        cursor.execute("""
+            SELECT RDB$TRIGGER_NAME FROM RDB$TRIGGERS
+            WHERE RDB$SYSTEM_FLAG = 0
+              AND RDB$TRIGGER_SOURCE IS NOT NULL
+              AND (RDB$TRIGGER_INACTIVE = 0 OR RDB$TRIGGER_INACTIVE IS NULL)
+            ORDER BY RDB$TRIGGER_NAME;
+        """)
+        objects[DumpFiles.TRIGGERS_PG] = [r[0].strip() for r in cursor.fetchall() if r and r[0]]
+
+        # Generators / Sequences
+        cursor.execute("""
+            SELECT RDB$GENERATOR_NAME FROM RDB$GENERATORS
+            WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
+              AND RDB$GENERATOR_NAME NOT STARTING WITH 'RDB$'
+              AND RDB$GENERATOR_NAME NOT STARTING WITH 'MON$'
+            ORDER BY RDB$GENERATOR_NAME;
+        """)
+        objects[DumpFiles.SEQUENCES_PG] = [r[0].strip() for r in cursor.fetchall() if r and r[0]]
+
+        return objects
+
     def get_source_object_counts(self) -> dict[str, int]:
         """
         Queries Firebird catalog to count user-defined objects for each category.
         Returns a dict mapping dump filename (e.g. DumpFiles.DOMAINS_PG) to expected count.
+        Raises an exception if any catalog query fails (catalog failures must not be swallowed).
         """
         cursor = self.fb_con.cursor()
         counts = {}
 
         # Domains
-        try:
-            cursor.execute("""
-                SELECT COUNT(*) FROM RDB$FIELDS
-                WHERE RDB$SYSTEM_FLAG = 0
-                  AND RDB$FIELD_NAME NOT STARTING WITH 'RDB$';
-            """)
-            counts[DumpFiles.DOMAINS_PG] = cursor.fetchone()[0] or 0
-        except Exception:
-            counts[DumpFiles.DOMAINS_PG] = 0
+        cursor.execute("""
+            SELECT COUNT(*) FROM RDB$FIELDS
+            WHERE RDB$SYSTEM_FLAG = 0
+              AND RDB$FIELD_NAME NOT STARTING WITH 'RDB$';
+        """)
+        row = cursor.fetchone()
+        counts[DumpFiles.DOMAINS_PG] = row[0] if row and row[0] is not None else 0
 
         # Procedures
-        try:
-            cursor.execute("""
-                SELECT COUNT(*) FROM RDB$PROCEDURES
-                WHERE RDB$SYSTEM_FLAG = 0
-                  AND RDB$PROCEDURE_SOURCE IS NOT NULL;
-            """)
-            counts[DumpFiles.PROCEDURES_PG] = cursor.fetchone()[0] or 0
-        except Exception:
-            counts[DumpFiles.PROCEDURES_PG] = 0
+        cursor.execute("""
+            SELECT COUNT(*) FROM RDB$PROCEDURES
+            WHERE RDB$SYSTEM_FLAG = 0
+              AND RDB$PROCEDURE_SOURCE IS NOT NULL;
+        """)
+        row = cursor.fetchone()
+        counts[DumpFiles.PROCEDURES_PG] = row[0] if row and row[0] is not None else 0
 
         # Views
-        try:
-            cursor.execute("""
-                SELECT COUNT(*) FROM RDB$RELATIONS
-                WHERE RDB$SYSTEM_FLAG = 0
-                  AND RDB$VIEW_BLR IS NOT NULL;
-            """)
-            counts[DumpFiles.VIEWS_PG] = cursor.fetchone()[0] or 0
-        except Exception:
-            counts[DumpFiles.VIEWS_PG] = 0
+        cursor.execute("""
+            SELECT COUNT(*) FROM RDB$RELATIONS
+            WHERE RDB$SYSTEM_FLAG = 0
+              AND RDB$VIEW_BLR IS NOT NULL;
+        """)
+        row = cursor.fetchone()
+        counts[DumpFiles.VIEWS_PG] = row[0] if row and row[0] is not None else 0
 
         # Triggers
-        try:
-            cursor.execute("""
-                SELECT COUNT(*) FROM RDB$TRIGGERS
-                WHERE RDB$SYSTEM_FLAG = 0
-                  AND RDB$TRIGGER_SOURCE IS NOT NULL
-                  AND (RDB$TRIGGER_INACTIVE = 0 OR RDB$TRIGGER_INACTIVE IS NULL);
-            """)
-            counts[DumpFiles.TRIGGERS_PG] = cursor.fetchone()[0] or 0
-        except Exception:
-            counts[DumpFiles.TRIGGERS_PG] = 0
+        cursor.execute("""
+            SELECT COUNT(*) FROM RDB$TRIGGERS
+            WHERE RDB$SYSTEM_FLAG = 0
+              AND RDB$TRIGGER_SOURCE IS NOT NULL
+              AND (RDB$TRIGGER_INACTIVE = 0 OR RDB$TRIGGER_INACTIVE IS NULL);
+        """)
+        row = cursor.fetchone()
+        counts[DumpFiles.TRIGGERS_PG] = row[0] if row and row[0] is not None else 0
 
         # Generators / Sequences
-        try:
-            cursor.execute("""
-                SELECT COUNT(*) FROM RDB$GENERATORS
-                WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
-                  AND RDB$GENERATOR_NAME NOT STARTING WITH 'RDB$'
-                  AND RDB$GENERATOR_NAME NOT STARTING WITH 'MON$';
-            """)
-            counts[DumpFiles.SEQUENCES_PG] = cursor.fetchone()[0] or 0
-        except Exception:
-            counts[DumpFiles.SEQUENCES_PG] = 0
+        cursor.execute("""
+            SELECT COUNT(*) FROM RDB$GENERATORS
+            WHERE (RDB$SYSTEM_FLAG = 0 OR RDB$SYSTEM_FLAG IS NULL)
+              AND RDB$GENERATOR_NAME NOT STARTING WITH 'RDB$'
+              AND RDB$GENERATOR_NAME NOT STARTING WITH 'MON$';
+        """)
+        row = cursor.fetchone()
+        counts[DumpFiles.SEQUENCES_PG] = row[0] if row and row[0] is not None else 0
 
         return counts
 

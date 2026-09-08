@@ -229,13 +229,15 @@ class DatabaseMigrator:
         return self.ddl_exporter.export_all_firebird_ddl(output_dir=output_dir)
 
     def validate_artifacts(self, output_dir: str = None,
-                           expected_counts: dict[str, int] = None) -> dict[str, bool]:
+                           expected_counts: dict[str, int] = None,
+                           expected_objects: dict[str, list[str] | set[str]] = None) -> dict[str, bool]:
         """
         Validates that all expected DDL artifact files exist and are complete
         BEFORE dropping the destination database.
+        Checks objects by identity and type against source database catalog.
         Returns a dict mapping filename -> allow_empty (True if legitimately 0 objects).
         Raises FileNotFoundError or ValueError if any artifact is missing, truncated,
-        or contains no executable statements when objects were expected.
+        or missing expected objects. Catalog query errors propagate and prevent approval.
         """
         from config import DumpFiles, get_dump_path
 
@@ -246,16 +248,59 @@ class DatabaseMigrator:
             DumpFiles.TRIGGERS_PG,
         ]
 
-        if expected_counts is None:
-            catalog_counts = self.ddl_exporter.get_source_object_counts()
-            expected_counts = catalog_counts
+        category_types = {
+            DumpFiles.DOMAINS_PG: 'DOMAIN',
+            DumpFiles.PROCEDURES_PG: 'PROCEDURE',
+            DumpFiles.VIEWS_PG: 'VIEW',
+            DumpFiles.TRIGGERS_PG: 'TRIGGER',
+        }
+
+        # If neither expected_objects nor expected_counts passed, query catalog for objects
+        if expected_objects is None and expected_counts is None:
+            expected_objects = self.ddl_exporter.get_source_objects()
 
         verified_empty = {}
         for fname in target_files:
             file_path = get_dump_path(fname, output_dir)
-            expected = expected_counts.get(fname, 0)
-            allow_empty = (expected == 0)
-            self.sql_runner.validate_file(file_path, expected_count=expected, allow_empty=allow_empty)
+            cat_type = category_types.get(fname)
+
+            if expected_objects is not None:
+                exp_objs = expected_objects.get(fname, [])
+                if isinstance(exp_objs, int):
+                    allow_empty = (exp_objs == 0)
+                    self.sql_runner.validate_file(
+                        file_path,
+                        expected_count=exp_objs,
+                        allow_empty=allow_empty,
+                        object_type=cat_type
+                    )
+                else:
+                    allow_empty = (len(exp_objs) == 0)
+                    self.sql_runner.validate_file(
+                        file_path,
+                        expected_objects=exp_objs,
+                        allow_empty=allow_empty,
+                        object_type=cat_type
+                    )
+            elif expected_counts is not None:
+                exp_val = expected_counts.get(fname, 0)
+                if isinstance(exp_val, (list, set, tuple)):
+                    allow_empty = (len(exp_val) == 0)
+                    self.sql_runner.validate_file(
+                        file_path,
+                        expected_objects=exp_val,
+                        allow_empty=allow_empty,
+                        object_type=cat_type
+                    )
+                else:
+                    allow_empty = (exp_val == 0)
+                    self.sql_runner.validate_file(
+                        file_path,
+                        expected_count=exp_val,
+                        allow_empty=allow_empty,
+                        object_type=cat_type
+                    )
+
             verified_empty[fname] = allow_empty
 
         self.verified_empty = verified_empty
