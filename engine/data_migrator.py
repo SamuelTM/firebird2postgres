@@ -686,7 +686,17 @@ class DataMigrator:
         env_allow_live = os.getenv('ALLOW_LIVE_SOURCE', 'false').lower() in ('1', 'true', 'yes')
         allow_live = allow_live_source or env_allow_live
 
-        self.check_source_consistency(require_frozen=require_frozen_source, allow_live_source=allow_live)
+        source_info = self.check_source_consistency(require_frozen=require_frozen_source, allow_live_source=allow_live)
+
+        # Single-user shutdown (mode 2) allows only one connection — the main one.
+        # Workers each open their own, so parallel execution is impossible.
+        if source_info.get('shutdown_mode') == 2 and max_workers > 1:
+            logger.warning(
+                "Source Firebird database is in single-user shutdown mode (MON$SHUTDOWN_MODE=2). "
+                "Only one connection is allowed; forcing sequential execution (max_workers=1)."
+            )
+            max_workers = 1
+
         self.last_nul_stats = {}
 
         total_bytes, worker_bytes, blob_limit = self.calculate_memory_budget(

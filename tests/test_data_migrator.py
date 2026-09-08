@@ -369,5 +369,56 @@ class TestDataMigrator(unittest.TestCase):
         _import_single_table(table, self.mock_fb_cur, self.mock_pg_cur, self.mock_pg_con)
         self.mock_fb_cur.fetchmany.assert_called_with(1)
 
+    def test_single_user_shutdown_forces_sequential(self):
+        """
+        Single-user shutdown (MON$SHUTDOWN_MODE=2) allows only one Firebird connection.
+        import_data must force max_workers=1 to avoid worker connection failures.
+        """
+        # MON$READ_ONLY=0, MON$SHUTDOWN_MODE=2 (single), 0 attachments
+        self.mock_fb_cur.fetchone.side_effect = [
+            (0, 2),  # MON$DATABASE
+            (0,),    # active_attachments
+        ]
 
+        table = Table('T_SEQ')
+        table.columns.append(Column('ID', 'INTEGER', nullable=False))
+
+        self.mock_fb_cur.fetchmany.return_value = []
+
+        import logging
+        with self.assertLogs('engine.data_migrator', level='WARNING') as cm:
+            self.migrator.import_data([table], max_workers=4)
+
+        # Must log warning about single-user forcing sequential
+        self.assertTrue(
+            any('single-user shutdown mode' in msg and 'forcing sequential' in msg for msg in cm.output),
+            f"Expected single-user warning in logs, got: {cm.output}"
+        )
+
+    def test_full_shutdown_preserves_parallel(self):
+        """
+        Full shutdown (MON$SHUTDOWN_MODE=3) allows no external connections but
+        workers connect from child processes, which are still allowed.
+        Must NOT force sequential.
+        """
+        # MON$READ_ONLY=0, MON$SHUTDOWN_MODE=3 (full), 0 attachments
+        self.mock_fb_cur.fetchone.side_effect = [
+            (0, 3),  # MON$DATABASE
+            (0,),    # active_attachments
+        ]
+
+        table = Table('T_PAR')
+        table.columns.append(Column('ID', 'INTEGER', nullable=False))
+
+        self.mock_fb_cur.fetchmany.return_value = []
+
+        # Should NOT emit single-user warning
+        import logging
+        with self.assertLogs('engine.data_migrator', level='INFO') as cm:
+            self.migrator.import_data([table], max_workers=4)
+
+        self.assertFalse(
+            any('single-user shutdown mode' in msg for msg in cm.output),
+            f"Full shutdown should not force sequential, got: {cm.output}"
+        )
 
