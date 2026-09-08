@@ -1,3 +1,4 @@
+import codecs
 import io
 import os
 import logging
@@ -54,8 +55,9 @@ class SerializedByteBuffer:
 
 def is_blob_column(col: Column, blob_domains: set[str] = None) -> bool:
     """
-    Returns True if the column is a BLOB, BYTEA, or OCTETS type,
+    Returns True if the column is a Large Object (BLOB), whether text or binary,
     or is based on a domain that resolves to a BLOB/BYTEA/OCTETS.
+    Used for fetch_size=1 row streaming, LPT table scheduling, and memory budget enforcement.
     """
     col_type = (col.column_type or '').upper()
     domain = (col.domain_name or '').upper()
@@ -66,6 +68,37 @@ def is_blob_column(col: Column, blob_domains: set[str] = None) -> bool:
         or 'BYTEA' in col_type
         or 'OCTETS' in col_type
         or 'BLOB' in domain
+        or 'BYTEA' in domain
+        or 'OCTETS' in domain
+    )
+
+
+def is_binary_column(col: Column, binary_domains: set[str] = None) -> bool:
+    """
+    Returns True ONLY if the column is of a binary data type (e.g. BYTEA, BLOB SUBTYPE 0, OCTETS)
+    requiring PostgreSQL hex encoding (\\x...) during COPY.
+    Returns False for textual BLOBs (BLOB SUBTYPE 1 / TEXT), which must remain UTF-8 text.
+    """
+    col_type = (col.column_type or '').upper()
+    domain = (col.domain_name or '').upper()
+
+    # Explicit textual representations are NOT binary
+    if 'BLOB SUBTYPE 1' in col_type or 'SUBTYPE TEXT' in col_type:
+        return False
+    if col_type == 'TEXT' or col_type.startswith('VARCHAR') or (col_type.startswith('CHAR') and 'OCTETS' not in col_type):
+        return False
+
+    # Domain check
+    if binary_domains and (domain.lower() in binary_domains or domain in binary_domains):
+        return True
+
+    # Check for binary keywords in column type or domain name
+    return (
+        'BYTEA' in col_type
+        or 'OCTETS' in col_type
+        or 'BLOB SUBTYPE 0' in col_type
+        or 'SUBTYPE BINARY' in col_type
+        or col_type.strip() == 'BLOB'
         or 'BYTEA' in domain
         or 'OCTETS' in domain
     )
@@ -93,7 +126,10 @@ def _write_binary_value_chunked(
             if not chunk:
                 break
             if isinstance(chunk, str):
-                chunk = chunk.encode('latin1')
+                try:
+                    chunk = chunk.encode('latin1')
+                except UnicodeEncodeError:
+                    chunk = chunk.encode('utf-8')
             elif isinstance(chunk, memoryview):
                 chunk = chunk.tobytes()
 
@@ -107,7 +143,10 @@ def _write_binary_value_chunked(
     else:
         # In-memory value (bytes, bytearray, memoryview, str)
         if isinstance(val, str):
-            val = val.encode('latin1')
+            try:
+                val = val.encode('latin1')
+            except UnicodeEncodeError:
+                val = val.encode('utf-8')
 
         raw_len = len(val)
         if max_blob_bytes is not None and raw_len > max_blob_bytes:
@@ -120,6 +159,101 @@ def _write_binary_value_chunked(
         mv = memoryview(val) if isinstance(val, (bytes, bytearray)) else memoryview(bytes(val))
         for offset in range(0, raw_len, chunk_size):
             buf.write(mv[offset:offset + chunk_size].hex())
+
+    return total_bytes
+
+
+def _write_text_value_chunked(
+    buf: SerializedByteBuffer,
+    val: Any,
+    col_name: str,
+    nul_stats: dict[str, int],
+    max_blob_bytes: int = None,
+    chunk_size: int = 65536
+) -> int:
+    """
+    Writes textual BLOB value directly to buffer in chunks, escaping special COPY
+    characters (\\, \\n, \\r, \\t) and sanitizing NUL (0x00) bytes while preserving
+    UTF-8 text encoding. Enforces max_blob_bytes before or during streaming.
+    Returns the total UTF-8 bytes written.
+    """
+    total_bytes = 0
+
+    if hasattr(val, 'read') and callable(val.read):
+        decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+        while True:
+            chunk = val.read(chunk_size)
+            if not chunk:
+                break
+            if isinstance(chunk, (bytes, bytearray, memoryview)):
+                chunk = decoder.decode(chunk, final=False)
+
+            chunk_bytes = len(chunk.encode('utf-8'))
+            total_bytes += chunk_bytes
+            if max_blob_bytes is not None and total_bytes > max_blob_bytes:
+                raise ValueError(
+                    f"BLOB in column '{col_name}' exceeds maximum allowed size of "
+                    f"{max_blob_bytes} bytes (found at least {total_bytes} bytes)."
+                )
+
+            if '\x00' in chunk:
+                nul_stats[col_name] = nul_stats.get(col_name, 0) + chunk.count('\x00')
+                chunk = chunk.replace('\x00', '')
+
+            buf.write(
+                chunk.replace('\\', '\\\\')
+                     .replace('\n', '\\n')
+                     .replace('\r', '\\r')
+                     .replace('\t', '\\t')
+            )
+
+        rem = decoder.decode(b'', final=True)
+        if rem:
+            total_bytes += len(rem.encode('utf-8'))
+            if '\x00' in rem:
+                nul_stats[col_name] = nul_stats.get(col_name, 0) + rem.count('\x00')
+                rem = rem.replace('\x00', '')
+            buf.write(
+                rem.replace('\\', '\\\\')
+                   .replace('\n', '\\n')
+                   .replace('\r', '\\r')
+                   .replace('\t', '\\t')
+            )
+    else:
+        if isinstance(val, (bytes, bytearray, memoryview)):
+            val = bytes(val).decode('utf-8', errors='replace')
+
+        if not isinstance(val, str):
+            val = str(val)
+
+        raw_bytes = len(val.encode('utf-8'))
+        if max_blob_bytes is not None and raw_bytes > max_blob_bytes:
+            raise ValueError(
+                f"BLOB in column '{col_name}' exceeds maximum allowed size of "
+                f"{max_blob_bytes} bytes (size is {raw_bytes} bytes)."
+            )
+        total_bytes = raw_bytes
+
+        if '\x00' in val:
+            nul_stats[col_name] = nul_stats.get(col_name, 0) + val.count('\x00')
+            val = val.replace('\x00', '')
+
+        if len(val) > chunk_size:
+            for offset in range(0, len(val), chunk_size):
+                part = val[offset:offset + chunk_size]
+                buf.write(
+                    part.replace('\\', '\\\\')
+                        .replace('\n', '\\n')
+                        .replace('\r', '\\r')
+                        .replace('\t', '\\t')
+                )
+        else:
+            buf.write(
+                val.replace('\\', '\\\\')
+                   .replace('\n', '\\n')
+                   .replace('\r', '\\r')
+                   .replace('\t', '\\t')
+            )
 
     return total_bytes
 
@@ -152,7 +286,8 @@ def _import_single_table(
     pg_con,
     max_buffer_bytes: int = DEFAULT_MAX_BUFFER_BYTES_PER_WORKER,
     max_blob_bytes: int = DEFAULT_MAX_BLOB_BYTES,
-    blob_domains: set[str] = None
+    blob_domains: set[str] = None,
+    binary_domains: set[str] = None
 ) -> tuple[int, dict[str, int]]:
     """
     Imports data for a single table:
@@ -224,7 +359,8 @@ def _import_single_table(
 
                     col_obj = cols_to_import[col_idx]
                     col_name = col_names[col_idx]
-                    is_binary = is_blob_column(col_obj, blob_domains)
+                    is_blob = is_blob_column(col_obj, blob_domains)
+                    is_binary = is_binary_column(col_obj, binary_domains)
 
                     if val is None:
                         buf.write(r'\N')
@@ -236,30 +372,37 @@ def _import_single_table(
                             buf, val, col_name,
                             max_blob_bytes=max_blob_bytes
                         )
-                    else:
-                        if hasattr(val, 'read') and callable(val.read):
-                            val = val.read()
-
-                        if isinstance(val, (bytes, bytearray, memoryview)):
-                            buf.write(r'\\x')
-                            _write_binary_value_chunked(
-                                buf, val, col_name,
-                                max_blob_bytes=max_blob_bytes
-                            )
-                        elif isinstance(val, str):
-                            if '\x00' in val:
-                                nul_stats[col_name] = nul_stats.get(col_name, 0) + val.count('\x00')
-                                val = val.replace('\x00', '')
-                            buf.write(
-                                val.replace('\\', '\\\\')
+                    elif is_blob or hasattr(val, 'read') or (isinstance(val, str) and len(val) > 65536):
+                        _write_text_value_chunked(
+                            buf, val, col_name,
+                            nul_stats=nul_stats,
+                            max_blob_bytes=max_blob_bytes if is_blob else None
+                        )
+                    elif isinstance(val, str):
+                        if '\x00' in val:
+                            nul_stats[col_name] = nul_stats.get(col_name, 0) + val.count('\x00')
+                            val = val.replace('\x00', '')
+                        buf.write(
+                            val.replace('\\', '\\\\')
+                               .replace('\n', '\\n')
+                               .replace('\r', '\\r')
+                               .replace('\t', '\\t')
+                        )
+                    elif isinstance(val, (bytes, bytearray, memoryview)):
+                        decoded = bytes(val).decode('utf-8', errors='replace')
+                        if '\x00' in decoded:
+                            nul_stats[col_name] = nul_stats.get(col_name, 0) + decoded.count('\x00')
+                            decoded = decoded.replace('\x00', '')
+                        buf.write(
+                            decoded.replace('\\', '\\\\')
                                    .replace('\n', '\\n')
                                    .replace('\r', '\\r')
                                    .replace('\t', '\\t')
-                            )
-                        elif isinstance(val, bool):
-                            buf.write('t' if val else 'f')
-                        else:
-                            buf.write(str(val))
+                        )
+                    elif isinstance(val, bool):
+                        buf.write('t' if val else 'f')
+                    else:
+                        buf.write(str(val))
 
                 buf.write('\n')
 
@@ -291,7 +434,8 @@ def _migrate_table_worker(
     table: Table,
     max_buffer_bytes: int = DEFAULT_MAX_BUFFER_BYTES_PER_WORKER,
     max_blob_bytes: int = DEFAULT_MAX_BLOB_BYTES,
-    blob_domains: set[str] = None
+    blob_domains: set[str] = None,
+    binary_domains: set[str] = None
 ) -> tuple[str, int, str | None, dict[str, int]]:
     """
     Top-level worker function for ProcessPoolExecutor: establishes isolated database
@@ -309,7 +453,8 @@ def _migrate_table_worker(
             table, fb_cur, pg_cur, pg_con,
             max_buffer_bytes=max_buffer_bytes,
             max_blob_bytes=max_blob_bytes,
-            blob_domains=blob_domains
+            blob_domains=blob_domains,
+            binary_domains=binary_domains
         )
         return table.name, rows_imported, None, nul_stats
     except (psycopg2.Error, firebirdsql.Error, OSError, ValueError, TypeError) as e:
@@ -529,7 +674,8 @@ class DataMigrator:
         total_memory_budget: int = None,
         per_worker_budget: int = None,
         max_blob_bytes: int = None,
-        blob_domains: set[str] = None
+        blob_domains: set[str] = None,
+        binary_domains: set[str] = None
     ) -> bool:
         """
         Reads data from Firebird and bulk inserts into PostgreSQL using a multi-process worker pool.
@@ -588,7 +734,8 @@ class DataMigrator:
                                 table, fb_cur, pg_cur, self.pg_con,
                                 max_buffer_bytes=worker_bytes,
                                 max_blob_bytes=blob_limit,
-                                blob_domains=blob_domains
+                                blob_domains=blob_domains,
+                                binary_domains=binary_domains
                             )
                             results.append((table.name, rows_imported, None, nul_stats))
                         except (psycopg2.Error, firebirdsql.Error, OSError, ValueError, TypeError) as e:
@@ -615,7 +762,8 @@ class DataMigrator:
                             table,
                             worker_bytes,
                             blob_limit,
-                            blob_domains
+                            blob_domains,
+                            binary_domains
                         ): table for table in sorted_tables
                     }
                     for future in as_completed(futures):

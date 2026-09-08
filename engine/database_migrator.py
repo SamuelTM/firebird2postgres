@@ -113,7 +113,7 @@ class DatabaseMigrator:
                 FROM RDB$FIELDS
                 WHERE RDB$SYSTEM_FLAG = 0
                   AND RDB$FIELD_NAME NOT STARTING WITH 'RDB$'
-                  AND RDB$FIELD_TYPE = 261
+                  AND (RDB$FIELD_TYPE = 261 OR RDB$CHARACTER_SET_ID = 1)
             """)
             rows = cur.fetchall()
             for r in rows:
@@ -126,6 +126,37 @@ class DatabaseMigrator:
             logger.warning(f"Could not retrieve BLOB domains from Firebird catalog: {e}")
         return blob_domains
 
+    def _get_binary_domains(self) -> set[str]:
+        """
+        Retrieves user domains that represent binary data (BYTEA):
+        Firebird BLOBs with SUBTYPE != 1 (binary BLOB) or CHARACTER SET OCTETS.
+        """
+        binary_domains = set()
+        if not self.fb_con:
+            return binary_domains
+        try:
+            cur = self.fb_con.cursor()
+            cur.execute("""
+                SELECT DISTINCT RDB$FIELD_NAME, RDB$FIELD_SUB_TYPE, RDB$CHARACTER_SET_ID, RDB$FIELD_TYPE
+                FROM RDB$FIELDS
+                WHERE RDB$SYSTEM_FLAG = 0
+                  AND RDB$FIELD_NAME NOT STARTING WITH 'RDB$'
+                  AND (
+                      (RDB$FIELD_TYPE = 261 AND COALESCE(RDB$FIELD_SUB_TYPE, 0) != 1)
+                      OR RDB$CHARACTER_SET_ID = 1
+                  )
+            """)
+            rows = cur.fetchall()
+            for r in rows:
+                if r and r[0]:
+                    name = r[0].strip()
+                    binary_domains.add(name)
+                    binary_domains.add(name.upper())
+                    binary_domains.add(name.lower())
+        except Exception as e:
+            logger.warning(f"Could not retrieve binary domains from Firebird catalog: {e}")
+        return binary_domains
+
     def import_data(
         self,
         max_workers: int = 4,
@@ -134,7 +165,8 @@ class DatabaseMigrator:
         total_memory_budget: int = None,
         per_worker_budget: int = None,
         max_blob_bytes: int = None,
-        blob_domains: set[str] = None
+        blob_domains: set[str] = None,
+        binary_domains: set[str] = None
     ) -> bool:
         """
         Imports data from Firebird to PostgreSQL using parallel worker pool.
@@ -150,6 +182,7 @@ class DatabaseMigrator:
         blob_limit = getattr(self.config, 'max_blob_bytes', None) if max_blob_bytes is None else max_blob_bytes
 
         domains = blob_domains if blob_domains is not None else self._get_blob_domains()
+        bin_domains = binary_domains if binary_domains is not None else self._get_binary_domains()
 
         return self.data_migrator.import_data(
             self.table_objs,
@@ -159,7 +192,8 @@ class DatabaseMigrator:
             total_memory_budget=tot_budget,
             per_worker_budget=worker_budget,
             max_blob_bytes=blob_limit,
-            blob_domains=domains
+            blob_domains=domains,
+            binary_domains=bin_domains
         )
 
     def export_firebird_triggers(self, output_file: str = None,

@@ -12,6 +12,7 @@ from engine.data_migrator import (
     _estimate_row_bytes,
     _import_single_table,
     is_blob_column,
+    is_binary_column,
 )
 from engine.database_migrator import DatabaseMigrator
 from models import Column, Table
@@ -285,7 +286,159 @@ class TestBlobMemoryBudgetRegression(unittest.TestCase):
             )
         self.assertIn("exceeds maximum allowed size of 1000 bytes", str(ctx.exception))
 
-    def test_memory_budget_distinguishes_worker_from_total(self):
+    def test_textual_blob_direct_and_domain_preserves_accents_emojis_tabs_newlines_and_sanitizes_nul(self):
+        """
+        Regression for:
+        'BLOB textual é carregado como hexadecimal'
+        Verifies:
+        1. Textual BLOB (BLOB SUBTYPE 1) and domain-based text BLOB are NEVER converted to hex (\\x).
+        2. Accents ('Olá'), emojis ('🙂'), tabs ('\\t'), newlines ('\\n') are preserved 100% exact.
+        3. NUL (0x00) bytes are stripped and audited in nul_stats.
+        4. No UnicodeEncodeError occurs on emojis.
+        """
+        table = Table('TAB_TEXT_BLOB')
+        table.columns.append(Column('ID', 'INTEGER', nullable=False))
+        table.columns.append(Column('COL_TEXT_DIRECT', 'BLOB SUBTYPE 1', nullable=True))
+        table.columns.append(Column('COL_TEXT_DOMAIN', 'TEXT', nullable=True, domain_name='DM_OBS_TEXT'))
+
+        blob_domains = {'DM_OBS_TEXT'}
+        binary_domains = set()  # DM_OBS_TEXT is text, not binary
+
+        # Test value with accents, emojis, newlines, tabs, and embedded NUL bytes
+        raw_text = "Olá mundo! 🙂\nSegunda linha\tcom tab\x00e NUL\x00e acentuação: Atenção & Coração"
+        expected_cleaned = "Olá mundo! 🙂\nSegunda linha\tcom tabe NULe acentuação: Atenção & Coração"
+
+        mock_fb_cur = MagicMock()
+        mock_pg_cur = MagicMock()
+        mock_pg_con = MagicMock()
+
+        # Row 1: string values
+        # Row 2: stream values (io.StringIO and io.BytesIO containing emojis)
+        row1 = (1, raw_text, raw_text)
+        row2 = (2, io.StringIO(raw_text), io.BytesIO(raw_text.encode('utf-8')))
+
+        mock_fb_cur.fetchmany.side_effect = [[row1], [row2], []]
+
+        total_rows, nul_stats = _import_single_table(
+            table, mock_fb_cur, mock_pg_cur, mock_pg_con,
+            blob_domains=blob_domains,
+            binary_domains=binary_domains
+        )
+
+        self.assertEqual(total_rows, 2)
+        # NUL stats: 2 NUL bytes per column per row = 4 per column
+        self.assertEqual(nul_stats.get('COL_TEXT_DIRECT'), 4)
+        self.assertEqual(nul_stats.get('COL_TEXT_DOMAIN'), 4)
+
+        # Inspect COPY buffer output
+        self.assertEqual(mock_pg_cur.copy_expert.call_count, 1)
+        buf = mock_pg_cur.copy_expert.call_args[0][1]
+        buffer_content = buf.getvalue()
+
+        # 1. Must NOT contain hex prefix for text columns
+        self.assertNotIn(r'\\x', buffer_content)
+
+        # 2. Must contain properly escaped text with emojis and accents
+        expected_escaped = expected_cleaned.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+        self.assertIn("Olá mundo! 🙂", buffer_content)
+        self.assertIn("Atenção & Coração", buffer_content)
+        self.assertIn(expected_escaped, buffer_content)
+
+        # 3. Must not contain raw NUL bytes
+        self.assertNotIn('\x00', buffer_content)
+
+    def test_binary_blob_separated_from_textual_blob(self):
+        """
+        Criteria:
+        - Separar 'objeto grande' de 'tipo binário'.
+        - Testar BLOB binário separadamente, garantindo formato \\x<hex>.
+        """
+        table = Table('TAB_SEPARATION')
+        table.columns.append(Column('ID', 'INTEGER', nullable=False))
+        table.columns.append(Column('FOTO_BIN', 'BLOB SUBTYPE 0', nullable=True))
+        table.columns.append(Column('OBS_TEXT', 'BLOB SUBTYPE 1', nullable=True))
+        table.columns.append(Column('ARQ_DOM_BIN', 'BYTEA', nullable=True, domain_name='DM_ARQ_BIN'))
+        table.columns.append(Column('NOTA_DOM_TEXT', 'TEXT', nullable=True, domain_name='DM_NOTA_TEXT'))
+
+        blob_domains = {'DM_ARQ_BIN', 'DM_NOTA_TEXT'}
+        binary_domains = {'DM_ARQ_BIN'}
+
+        bin_data = b'\xde\xad\xbe\xef\x00\xff'
+        text_data = "Texto de observação com acento: 'Último' e emoji 🙂\tcom tab\ncom newline"
+
+        mock_fb_cur = MagicMock()
+        mock_pg_cur = MagicMock()
+        mock_pg_con = MagicMock()
+
+        mock_fb_cur.fetchmany.side_effect = [[(1, bin_data, text_data, bin_data, text_data)], []]
+
+        total_rows, _ = _import_single_table(
+            table, mock_fb_cur, mock_pg_cur, mock_pg_con,
+            blob_domains=blob_domains,
+            binary_domains=binary_domains
+        )
+        self.assertEqual(total_rows, 1)
+
+        mock_pg_cur.copy_expert.assert_called_once()
+        buf = mock_pg_cur.copy_expert.call_args[0][1]
+        line = buf.getvalue().strip()
+        parts = line.split('\t')
+
+        self.assertEqual(len(parts), 5)
+        self.assertEqual(parts[0], '1')
+
+        # Binary columns: must be hex formatted with \\x prefix
+        expected_hex = r'\\x' + bin_data.hex()
+        self.assertEqual(parts[1], expected_hex)
+        self.assertEqual(parts[3], expected_hex)
+
+        # Textual columns: must NOT be hex formatted, but escaped UTF-8 text
+        expected_text = text_data.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+        self.assertEqual(parts[2], expected_text)
+        self.assertEqual(parts[4], expected_text)
+
+    def test_is_binary_column_vs_is_blob_column_separation(self):
+        """
+        Verifies helper classification separating large objects (LOB) from binary types.
+        """
+        # Textual BLOB: LOB = True, Binary = False
+        col_text_blob = Column('T1', 'BLOB SUBTYPE 1', nullable=True)
+        self.assertTrue(is_blob_column(col_text_blob))
+        self.assertFalse(is_binary_column(col_text_blob))
+
+        col_text_blob_alt = Column('T2', 'BLOB SUBTYPE TEXT', nullable=True)
+        self.assertTrue(is_blob_column(col_text_blob_alt))
+        self.assertFalse(is_binary_column(col_text_blob_alt))
+
+        # Binary BLOB: LOB = True, Binary = True
+        col_bin_blob = Column('B1', 'BLOB SUBTYPE 0', nullable=True)
+        self.assertTrue(is_blob_column(col_bin_blob))
+        self.assertTrue(is_binary_column(col_bin_blob))
+
+        col_bytea = Column('B2', 'BYTEA', nullable=True)
+        self.assertTrue(is_blob_column(col_bytea))
+        self.assertTrue(is_binary_column(col_bytea))
+
+        col_octets = Column('B3', 'CHAR(16) CHARACTER SET OCTETS', nullable=True)
+        self.assertTrue(is_blob_column(col_octets))
+        self.assertTrue(is_binary_column(col_octets))
+
+        # Regular text: LOB = False, Binary = False
+        col_varchar = Column('V1', 'VARCHAR(255)', nullable=True)
+        self.assertFalse(is_blob_column(col_varchar))
+        self.assertFalse(is_binary_column(col_varchar))
+
+        # Domain classification
+        col_dom_text = Column('D1', 'TEXT', nullable=True, domain_name='DM_TEXT')
+        col_dom_bin = Column('D2', 'BYTEA', nullable=True, domain_name='DM_BIN')
+        blob_domains = {'DM_TEXT', 'DM_BIN'}
+        binary_domains = {'DM_BIN'}
+
+        self.assertTrue(is_blob_column(col_dom_text, blob_domains))
+        self.assertFalse(is_binary_column(col_dom_text, binary_domains))
+
+        self.assertTrue(is_blob_column(col_dom_bin, blob_domains))
+        self.assertTrue(is_binary_column(col_dom_bin, binary_domains))
         """
         Criteria:
         - Orçamento distingue memória por worker de memória total.
