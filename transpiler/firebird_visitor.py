@@ -392,130 +392,130 @@ def _split_param_literals(s: str) -> list[tuple[bool, str]]:
     return chunks
 
 
-def _normalize_procedure_params(sql: str, not_null_params: dict[str, list[str]] = None) -> str:
-    proc_pat = re.compile(
-        r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|(\b(?:CREATE(?:\s+OR\s+ALTER)?|RECREATE|ALTER)\s+PROCEDURE\s+([a-zA-Z0-9_$]+|\"[^\"]+\")\s*\()",
-        flags=re.IGNORECASE
-    )
-    pos = 0
-    result = []
-    while pos < len(sql):
-        m = proc_pat.search(sql, pos)
-        if not m:
-            result.append(sql[pos:])
-            break
-        result.append(sql[pos:m.start()])
-        if m.group(1):
-            result.append(m.group(1))
-            pos = m.end()
-            continue
-
-        result.append(m.group(2))
-        proc_name = m.group(3).strip('"').lower() if m.group(3) else ""
-        header_start = m.end()
-        idx = header_start
-        d = 1
-        in_str = False
-        in_line_cmt = False
-        in_block_cmt = False
-
-        while idx < len(sql) and d > 0:
-            c = sql[idx]
-            if in_line_cmt:
-                if c == '\n':
-                    in_line_cmt = False
-            elif in_block_cmt:
-                if c == '*' and idx + 1 < len(sql) and sql[idx + 1] == '/':
-                    in_block_cmt = False
-                    idx += 1
-            elif in_str:
-                if c == "'":
-                    if idx + 1 < len(sql) and sql[idx + 1] == "'":
-                        idx += 1
-                    else:
-                        in_str = False
-            else:
-                if c == "'":
-                    in_str = True
-                elif c == '-' and idx + 1 < len(sql) and sql[idx + 1] == '-':
-                    in_line_cmt = True
-                    idx += 1
-                elif c == '/' and idx + 1 < len(sql) and sql[idx + 1] == '*':
-                    in_block_cmt = True
-                    idx += 1
-                elif c == '(':
-                    d += 1
-                elif c == ')':
-                    d -= 1
+def _skip_comments_and_ws(sql: str, pos: int) -> int:
+    idx = pos
+    while idx < len(sql):
+        c = sql[idx]
+        if c.isspace():
             idx += 1
-
-        if d > 0:
-            result.append(sql[header_start:])
+        elif c == '-' and idx + 1 < len(sql) and sql[idx + 1] == '-':
+            idx += 2
+            while idx < len(sql) and sql[idx] != '\n':
+                idx += 1
+        elif c == '/' and idx + 1 < len(sql) and sql[idx + 1] == '*':
+            idx += 2
+            while idx + 1 < len(sql) and not (sql[idx] == '*' and sql[idx + 1] == '/'):
+                idx += 1
+            idx += 2
+        else:
             break
+    return idx
 
-        params_body = sql[header_start:idx - 1]
-        pos = idx - 1
 
-        p_d = 0
-        p_in_str = False
-        p_in_line = False
-        p_in_block = False
-        parts = []
-        last_p = 0
-        for i, c in enumerate(params_body):
-            if p_in_line:
-                if c == '\n':
-                    p_in_line = False
-            elif p_in_block:
-                if c == '*' and i + 1 < len(params_body) and params_body[i + 1] == '/':
-                    p_in_block = False
-                    i += 1
-            elif p_in_str:
-                if c == "'":
-                    if i + 1 < len(params_body) and params_body[i + 1] == "'":
-                        pass
-                    else:
-                        p_in_str = False
-            else:
-                if c == "'":
-                    p_in_str = True
-                elif c == '-' and i + 1 < len(params_body) and params_body[i + 1] == '-':
-                    p_in_line = True
-                    i += 1
-                elif c == '/' and i + 1 < len(params_body) and params_body[i + 1] == '*':
-                    p_in_block = True
-                    i += 1
-                elif c in ('(', '['):
-                    p_d += 1
-                elif c in (')', ']'):
-                    p_d -= 1
-                elif c == ',' and p_d == 0:
-                    parts.append(params_body[last_p:i])
-                    last_p = i + 1
-        parts.append(params_body[last_p:])
-
-        norm_parts = []
-        for part in parts:
-            chunks = _split_param_literals(part)
-            has_not_null = False
-            cleaned_chunks = []
-            param_name = None
-            for is_lit, text in chunks:
-                if is_lit:
-                    cleaned_chunks.append((is_lit, text))
+def _scan_balanced_parens(sql: str, start_idx: int) -> tuple[int, str]:
+    d = 1
+    idx = start_idx + 1
+    in_str = False
+    in_line_cmt = False
+    in_block_cmt = False
+    while idx < len(sql) and d > 0:
+        c = sql[idx]
+        if in_line_cmt:
+            if c == '\n':
+                in_line_cmt = False
+        elif in_block_cmt:
+            if c == '*' and idx + 1 < len(sql) and sql[idx + 1] == '/':
+                in_block_cmt = False
+                idx += 1
+        elif in_str:
+            if c == "'":
+                if idx + 1 < len(sql) and sql[idx + 1] == "'":
+                    idx += 1
                 else:
-                    if param_name is None:
-                        m_name = re.match(r'^\s*([a-zA-Z0-9_$]+|"[^"]+")', text)
-                        if m_name:
-                            param_name = m_name.group(1)
-                    if re.search(r"\bNOT\s+NULL\b", text, re.IGNORECASE):
-                        has_not_null = True
-                        text = re.sub(r"\bNOT\s+NULL\b", "", text, flags=re.IGNORECASE)
-                    cleaned_chunks.append((is_lit, text))
+                    in_str = False
+        else:
+            if c == "'":
+                in_str = True
+            elif c == '-' and idx + 1 < len(sql) and sql[idx + 1] == '-':
+                in_line_cmt = True
+                idx += 1
+            elif c == '/' and idx + 1 < len(sql) and sql[idx + 1] == '*':
+                in_block_cmt = True
+                idx += 1
+            elif c == '(':
+                d += 1
+            elif c == ')':
+                d -= 1
+        idx += 1
+    if d > 0:
+        return -1, ""
+    return idx - 1, sql[start_idx + 1:idx - 1]
 
-            if has_not_null and param_name and not_null_params is not None and proc_name:
-                not_null_params.setdefault(proc_name, []).append(_normalize_ident_case(param_name))
 
+def _normalize_single_param_list(params_body: str, is_output: bool = False,
+                                 proc_name: str = "",
+                                 not_null_dict: dict[str, list[str]] = None) -> str:
+    p_d = 0
+    p_in_str = False
+    p_in_line = False
+    p_in_block = False
+    parts = []
+    last_p = 0
+    for i, c in enumerate(params_body):
+        if p_in_line:
+            if c == '\n':
+                p_in_line = False
+        elif p_in_block:
+            if c == '*' and i + 1 < len(params_body) and params_body[i + 1] == '/':
+                p_in_block = False
+                i += 1
+        elif p_in_str:
+            if c == "'":
+                if i + 1 < len(params_body) and params_body[i + 1] == "'":
+                    pass
+                else:
+                    p_in_str = False
+        else:
+            if c == "'":
+                p_in_str = True
+            elif c == '-' and i + 1 < len(params_body) and params_body[i + 1] == '-':
+                p_in_line = True
+                i += 1
+            elif c == '/' and i + 1 < len(params_body) and params_body[i + 1] == '*':
+                p_in_block = True
+                i += 1
+            elif c in ('(', '['):
+                p_d += 1
+            elif c in (')', ']'):
+                p_d -= 1
+            elif c == ',' and p_d == 0:
+                parts.append(params_body[last_p:i])
+                last_p = i + 1
+    parts.append(params_body[last_p:])
+
+    norm_parts = []
+    for part in parts:
+        chunks = _split_param_literals(part)
+        has_not_null = False
+        cleaned_chunks = []
+        param_name = None
+        for is_lit, text in chunks:
+            if is_lit:
+                cleaned_chunks.append((is_lit, text))
+            else:
+                if param_name is None:
+                    m_name = re.match(r'^\s*([a-zA-Z0-9_$]+|"[^"]+")', text)
+                    if m_name:
+                        param_name = m_name.group(1)
+                if re.search(r"\bNOT\s+NULL\b", text, re.IGNORECASE):
+                    has_not_null = True
+                    text = re.sub(r"\bNOT\s+NULL\b", "", text, flags=re.IGNORECASE)
+                cleaned_chunks.append((is_lit, text))
+
+        if has_not_null and param_name and not_null_dict is not None and proc_name:
+            not_null_dict.setdefault(proc_name, []).append(_normalize_ident_case(param_name))
+
+        if not is_output:
             e_d = 0
             eq_chunk_idx = None
             eq_char_idx = None
@@ -546,9 +546,59 @@ def _normalize_procedure_params(sql: str, not_null_params: dict[str, list[str]] 
                         txt[:eq_char_idx] + " DEFAULT " + txt[eq_char_idx + 1:]
                     )
 
-            norm_parts.append("".join(text for _, text in cleaned_chunks))
+        norm_parts.append("".join(text for _, text in cleaned_chunks))
 
-        result.append(",".join(norm_parts))
+    return ",".join(norm_parts)
+
+
+def _normalize_procedure_params(sql: str, not_null_params: dict[str, list[str]] = None,
+                                not_null_outputs: dict[str, list[str]] = None) -> str:
+    proc_pat = re.compile(
+        r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|(\b(?:CREATE(?:\s+OR\s+ALTER)?|RECREATE|ALTER)\s+PROCEDURE\s+([a-zA-Z0-9_$]+|\"[^\"]+\"))",
+        flags=re.IGNORECASE
+    )
+    pos = 0
+    result = []
+    while pos < len(sql):
+        m = proc_pat.search(sql, pos)
+        if not m:
+            result.append(sql[pos:])
+            break
+        result.append(sql[pos:m.start()])
+        if m.group(1):
+            result.append(m.group(1))
+            pos = m.end()
+            continue
+
+        result.append(m.group(2))
+        proc_name = m.group(3).strip('"').lower() if m.group(3) else ""
+        cur = m.end()
+
+        # Check for input parameters (...)
+        next_tok_idx = _skip_comments_and_ws(sql, cur)
+        if next_tok_idx < len(sql) and sql[next_tok_idx] == '(':
+            end_paren, inside = _scan_balanced_parens(sql, next_tok_idx)
+            if end_paren != -1:
+                result.append(sql[cur:next_tok_idx])
+                norm_in = _normalize_single_param_list(inside, is_output=False, proc_name=proc_name, not_null_dict=not_null_params)
+                result.append(f"({norm_in})")
+                cur = end_paren + 1
+
+        # Check for RETURNS (...)
+        next_tok_idx = _skip_comments_and_ws(sql, cur)
+        m_ret = re.match(r'^RETURNS\b', sql[next_tok_idx:], re.IGNORECASE)
+        if m_ret:
+            ret_kw_end = next_tok_idx + m_ret.end()
+            after_ret_idx = _skip_comments_and_ws(sql, ret_kw_end)
+            if after_ret_idx < len(sql) and sql[after_ret_idx] == '(':
+                end_ret_paren, ret_inside = _scan_balanced_parens(sql, after_ret_idx)
+                if end_ret_paren != -1:
+                    result.append(sql[cur:after_ret_idx])
+                    norm_out = _normalize_single_param_list(ret_inside, is_output=True, proc_name=proc_name, not_null_dict=not_null_outputs)
+                    result.append(f"({norm_out})")
+                    cur = end_ret_paren + 1
+
+        pos = cur
 
     return "".join(result)
 
@@ -1808,14 +1858,21 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
     Visitor that traverses the Firebird AST and translates it into PostgreSQL PL/pgSQL code.
     """
 
-    def __init__(self, rewriter: TokenStreamRewriter = None, domain_map: dict[str, str] = None, not_null_params: dict[str, list[str]] = None):
+    def __init__(self, rewriter: TokenStreamRewriter = None, domain_map: dict[str, str] = None,
+                 not_null_params: dict[str, list[str]] = None,
+                 not_null_outputs: dict[str, list[str]] = None):
         super().__init__()
         self.rewriter = rewriter
         self.domain_map = {k.strip().upper(): v.strip() for k, v in domain_map.items()} if domain_map else {}
         self.not_null_params = not_null_params or {}
+        self.not_null_outputs = not_null_outputs or {}
+        self.current_not_null_outputs: dict[str, dict[str, str]] = {}
+        self.current_proc_has_suspend: bool = False
 
     @classmethod
-    def _normalize_sql(cls, sql: str, expr_map: dict[str, str] = None, not_null_params: dict[str, list[str]] = None,
+    def _normalize_sql(cls, sql: str, expr_map: dict[str, str] = None,
+                       not_null_params: dict[str, list[str]] = None,
+                       not_null_outputs: dict[str, list[str]] = None,
                        domain_types: dict[str, str] = None) -> str:
         """
         Pre-parse normalization:
@@ -1877,7 +1934,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         sql = _normalize_variable_declarations(sql)
 
         # Step 7: Normalize procedure parameters (= to DEFAULT, strip NOT NULL)
-        sql = _normalize_procedure_params(sql, not_null_params=not_null_params)
+        sql = _normalize_procedure_params(sql, not_null_params=not_null_params, not_null_outputs=not_null_outputs)
 
         # Step 8: Normalize EXECUTE PROCEDURE ... RETURNING_VALUES ...
         sql = _normalize_returning_values(sql)
@@ -1922,10 +1979,12 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
 
         expr_map = {}
         not_null_params = {}
+        not_null_outputs = {}
         normalized_sql = cls._normalize_sql(
             firebird_sql_string,
             expr_map=expr_map,
             not_null_params=not_null_params,
+            not_null_outputs=not_null_outputs,
             domain_types=combined_domain_types
         )
 
@@ -1974,7 +2033,7 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         dialect_rewriter.visit(tree)
 
         # Pass 2: High-level PL/pgSQL structure visitor
-        visitor = cls(rewriter=rewriter, domain_map=norm_domain_map, not_null_params=not_null_params)
+        visitor = cls(rewriter=rewriter, domain_map=norm_domain_map, not_null_params=not_null_params, not_null_outputs=not_null_outputs)
         pg_sql = visitor.visit(tree)
 
         if pg_sql:
@@ -2203,8 +2262,28 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
             if decl_str:
                 decl_str = f"DECLARE\n{decl_str}\n"
 
+        # Determine if procedure is selectable (has SUSPEND)
+        has_return_next = self._has_suspend_node(ctx.body()) if ctx.body() else False
+        not_null_out_list = self.not_null_outputs.get(proc_name.lower(), [])
+
+        prev_not_null_outputs = getattr(self, 'current_not_null_outputs', {})
+        prev_proc_has_suspend = getattr(self, 'current_proc_has_suspend', False)
+        self.current_not_null_outputs = {}
+        for p in not_null_out_list:
+            p_clean = p.strip('"')
+            p_ident = pg_quote_ident(p_clean.lower()) if (p.startswith('"') and p.endswith('"')) else p
+            self.current_not_null_outputs[p_clean.lower()] = {
+                'ident': p_ident,
+                'name': p_clean
+            }
+        self.current_proc_has_suspend = has_return_next
+
         # Translate the body
-        body_str = self.visit(ctx.body()) if ctx.body() else ""
+        try:
+            body_str = self.visit(ctx.body()) if ctx.body() else ""
+        finally:
+            self.current_not_null_outputs = prev_not_null_outputs
+            self.current_proc_has_suspend = prev_proc_has_suspend
 
         # Inject runtime NOT NULL guards for input parameters declared NOT NULL in Firebird
         not_null_list = self.not_null_params.get(proc_name.lower(), [])
@@ -2223,8 +2302,18 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
                 else:
                     body_str = re.sub(r'(\bBEGIN\b)', r'\1\n' + guards_str, body_str, count=1, flags=re.IGNORECASE)
 
+        # Inject runtime NOT NULL guards at routine end for output parameters in executable procedures
+        if not has_return_next and not_null_out_list and body_str:
+            end_guards = []
+            for p in not_null_out_list:
+                p_clean = p.strip('"')
+                p_ident = pg_quote_ident(p_clean) if p.startswith('"') else p_clean
+                end_guards.append(f"IF {p_ident} IS NULL THEN RAISE EXCEPTION 'validation error for variable %, value null', '{p_clean}'; END IF;")
+            if end_guards:
+                end_guards_str = "\n".join(f"    {g}" for g in end_guards)
+                body_str = re.sub(r'(\n?\s*\bEND\s*;\s*)$', r'\n' + end_guards_str + r'\nEND;', body_str.rstrip(), flags=re.IGNORECASE)
+
         # Determine correct return type for PostgreSQL
-        has_return_next = self._has_suspend_node(ctx.body()) if ctx.body() else False
         if not out_params:
             return_type = "RETURNS void"
             # In void functions, SUSPEND / RETURN NEXT must be a plain RETURN;
@@ -2458,7 +2547,11 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         stop_token_idx = ctx.stop.tokenIndex - 1 if ctx.stop else 0
         items = self._collect_with_comments(stmt_contexts, start_token_idx, stop_token_idx, ensure_semicolon=True)
 
-        inner_code = "\n".join(f"    {s}" for s in items)
+        indented_lines = []
+        for s in items:
+            for line in s.split('\n'):
+                indented_lines.append(f"    {line}" if line.strip() else line)
+        inner_code = "\n".join(indented_lines)
         return f"BEGIN\n{inner_code}\nEND;"
 
     @staticmethod
@@ -2517,10 +2610,21 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
                 FirebirdParser.BodyContext,
                 FirebirdParser.BlockContext,
                 FirebirdParser.Assignment_statementContext,
+                FirebirdParser.Exit_statementContext,
                 FirebirdParser.If_statementContext,
                 FirebirdParser.Loop_statementContext
         )):
             return self.visit(child)
+
+        # Check for SUSPEND
+        if (hasattr(ctx, 'SUSPEND') and ctx.SUSPEND()) or (child and hasattr(child, 'getText') and child.getText().upper() == 'SUSPEND'):
+            if getattr(self, 'current_not_null_outputs', None):
+                guards = []
+                for p_clean, info in self.current_not_null_outputs.items():
+                    guards.append(f"IF {info['ident']} IS NULL THEN RAISE EXCEPTION 'validation error for variable %, value null', '{info['name']}'; END IF;")
+                guards.append("RETURN NEXT;")
+                return "\n".join(guards)
+            return "RETURN NEXT;"
 
         # Singleton SELECT ... INTO statements are wrapped in BEGIN ... EXCEPTION WHEN NO_DATA_FOUND THEN NULL; END;
         # to match Firebird PSQL semantics (preserving target variable values when no rows are found).
@@ -2528,6 +2632,33 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         # queries without FROM, or pure aggregates without GROUP BY) to eliminate subtransaction overhead.
         into_ctx = _find_node(ctx, FirebirdParser.Into_clauseContext)
         select_ctx = _find_node(ctx, FirebirdParser.Select_statementContext)
+        if into_ctx and select_ctx:
+            into_vars = []
+            for c in into_ctx.children:
+                if isinstance(c, (FirebirdParser.General_elementContext, FirebirdParser.Bind_variableContext)):
+                    v_name = self.get_raw_text(c).strip().lstrip(':').strip('"').lower()
+                    into_vars.append(v_name)
+            not_null_into = [v for v in into_vars if v in getattr(self, 'current_not_null_outputs', {})]
+            if not_null_into:
+                into_guards = [
+                    f"IF {self.current_not_null_outputs[v]['ident']} IS NULL THEN RAISE EXCEPTION 'validation error for variable %, value null', '{self.current_not_null_outputs[v]['name']}'; END IF;"
+                    for v in not_null_into
+                ]
+                into_guards_str = "\n".join(into_guards)
+                if not self._guarantees_single_row(select_ctx):
+                    raw_stmt = self.get_raw_text(ctx).strip()
+                    if not raw_stmt.endswith(';'):
+                        raw_stmt += ';'
+                    stmt_lines = [f"    {line}" for line in raw_stmt.split('\n')]
+                    stmt_lines.extend(f"    {g}" for g in into_guards)
+                    indented_stmt = "\n".join(stmt_lines)
+                    return f"BEGIN\n{indented_stmt}\nEXCEPTION WHEN NO_DATA_FOUND THEN\n    NULL;\nEND;"
+                else:
+                    raw_stmt = self.get_raw_text(ctx).strip()
+                    if not raw_stmt.endswith(';'):
+                        raw_stmt += ';'
+                    return f"{raw_stmt}\n{into_guards_str}"
+
         if into_ctx and select_ctx and not self._guarantees_single_row(select_ctx):
             raw_stmt = self.get_raw_text(ctx).strip()
             if not raw_stmt.endswith(';'):
@@ -2538,6 +2669,25 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
 
         # For all other SQL statements (UPDATE, DELETE, EXECUTE, plain SELECT, etc.)
         # we just return their rewritten text.
+        return self.get_raw_text(ctx)
+
+    def visitExit_statement(self, ctx: FirebirdParser.Exit_statementContext):
+        first_tok = ctx.getChild(0).getText().upper()
+        if first_tok == 'LEAVE' or ctx.label_name():
+            return self.get_raw_text(ctx)
+
+        if not getattr(self, 'current_proc_has_suspend', False) and getattr(self, 'current_not_null_outputs', None):
+            guards = []
+            for p_clean, info in self.current_not_null_outputs.items():
+                guards.append(f"IF {info['ident']} IS NULL THEN RAISE EXCEPTION 'validation error for variable %, value null', '{info['name']}'; END IF;")
+            guards.append("RETURN;")
+            guards_block = "\n".join(guards)
+            if ctx.condition():
+                cond = self.get_raw_text(ctx.condition())
+                indented = "\n".join(f"    {line}" for line in guards_block.split('\n'))
+                return f"IF {cond} THEN\n{indented}\nEND IF;"
+            return guards_block
+
         return self.get_raw_text(ctx)
 
     def visitBlock(self, ctx: FirebirdParser.BlockContext):
@@ -2622,10 +2772,21 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         return f"    {var_name}{is_const} {type_spec}{not_null}{default_part};"
 
     def visitAssignment_statement(self, ctx: FirebirdParser.Assignment_statementContext):
-        left = self.get_raw_text(ctx.getChild(0)).lstrip(':')
+        left = self.get_raw_text(ctx.getChild(0)).strip().lstrip(':')
         if ctx.expression():
             self.visit(ctx.expression())
         right = self.get_raw_text(ctx.expression())
+        left_clean = left.strip('"').lower()
+        if getattr(self, 'current_not_null_outputs', None) and left_clean in self.current_not_null_outputs:
+            info = self.current_not_null_outputs[left_clean]
+            p_ident = info['ident']
+            p_name = info['name']
+            return (
+                f"{left} := {right};\n"
+                f"IF {p_ident} IS NULL THEN\n"
+                f"    RAISE EXCEPTION 'validation error for variable %, value null', '{p_name}';\n"
+                f"END IF;"
+            )
         return f"{left} := {right};"
 
     def visitLoop_statement(self, ctx: FirebirdParser.Loop_statementContext):
@@ -2641,12 +2802,22 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
                         into_vars.append(self.get_raw_text(child).strip().lstrip(':'))
 
             target = ", ".join(into_vars) if into_vars else "_rec"
+            loop_guards = []
+            for v in into_vars:
+                v_clean = v.strip('"').lower()
+                if getattr(self, 'current_not_null_outputs', None) and v_clean in self.current_not_null_outputs:
+                    info = self.current_not_null_outputs[v_clean]
+                    loop_guards.append(f"IF {info['ident']} IS NULL THEN RAISE EXCEPTION 'validation error for variable %, value null', '{info['name']}'; END IF;")
+
             loop_comments = self._get_comments_in_range(end_header_token.tokenIndex + 1,
                                                         ctx.statement().start.tokenIndex - 1) \
                 if end_header_token and ctx.statement().start else []
             comment_str = ('\n    ' + '\n    '.join(loop_comments) + '\n') if loop_comments else ' '
 
             body_sql = self.visit(ctx.statement())
+            if loop_guards:
+                guards_prefix = "\n".join(loop_guards) + "\n"
+                body_sql = guards_prefix + (body_sql or "")
             if body_sql:
                 body_sql = body_sql.strip()
                 if not body_sql.endswith(';'):
@@ -2668,6 +2839,12 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
             select_sql = self.get_text_without_node(ctx.select_statement(), into_ctx).strip()
             select_sql = select_sql.rstrip(';').strip()
             target = ", ".join(into_vars) if into_vars else "_rec"
+            loop_guards = []
+            for v in into_vars:
+                v_clean = v.strip('"').lower()
+                if getattr(self, 'current_not_null_outputs', None) and v_clean in self.current_not_null_outputs:
+                    info = self.current_not_null_outputs[v_clean]
+                    loop_guards.append(f"IF {info['ident']} IS NULL THEN RAISE EXCEPTION 'validation error for variable %, value null', '{info['name']}'; END IF;")
 
             end_header_token = ctx.select_statement().stop
             loop_comments = self._get_comments_in_range(end_header_token.tokenIndex + 1,
@@ -2676,6 +2853,9 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
             comment_str = ('\n    ' + '\n    '.join(loop_comments) + '\n') if loop_comments else ' '
 
             body_sql = self.visit(ctx.statement())
+            if loop_guards:
+                guards_prefix = "\n".join(loop_guards) + "\n"
+                body_sql = guards_prefix + (body_sql or "")
             if body_sql:
                 body_sql = body_sql.strip()
                 if not body_sql.endswith(';'):
