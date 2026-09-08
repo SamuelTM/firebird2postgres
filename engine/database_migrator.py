@@ -1,3 +1,5 @@
+import logging
+
 from models import Table, Sequence
 from transpiler import FirebirdToPostgresVisitor
 from utils import SqlRunner
@@ -5,6 +7,8 @@ from .schema_extractor import SchemaExtractor
 from .schema_migrator import SchemaMigrator
 from .data_migrator import DataMigrator
 from .ddl_exporter import DdlExporter
+
+logger = logging.getLogger(__name__)
 
 
 class DatabaseMigrator:
@@ -95,19 +99,67 @@ class DatabaseMigrator:
             allow_live_source=allow_live
         )
 
-    def import_data(self, max_workers: int = 4, require_frozen_source: bool = None, allow_live_source: bool = None) -> bool:
+    def _get_blob_domains(self) -> set[str]:
+        """
+        Retrieves user domains that are based on BLOB types (RDB$FIELD_TYPE = 261).
+        """
+        blob_domains = set()
+        if not self.fb_con:
+            return blob_domains
+        try:
+            cur = self.fb_con.cursor()
+            cur.execute("""
+                SELECT DISTINCT RDB$FIELD_NAME
+                FROM RDB$FIELDS
+                WHERE RDB$SYSTEM_FLAG = 0
+                  AND RDB$FIELD_NAME NOT STARTING WITH 'RDB$'
+                  AND RDB$FIELD_TYPE = 261
+            """)
+            rows = cur.fetchall()
+            for r in rows:
+                if r and r[0]:
+                    name = r[0].strip()
+                    blob_domains.add(name)
+                    blob_domains.add(name.upper())
+                    blob_domains.add(name.lower())
+        except Exception as e:
+            logger.warning(f"Could not retrieve BLOB domains from Firebird catalog: {e}")
+        return blob_domains
+
+    def import_data(
+        self,
+        max_workers: int = 4,
+        require_frozen_source: bool = None,
+        allow_live_source: bool = None,
+        total_memory_budget: int = None,
+        per_worker_budget: int = None,
+        max_blob_bytes: int = None,
+        blob_domains: set[str] = None
+    ) -> bool:
         """
         Imports data from Firebird to PostgreSQL using parallel worker pool.
+        Enforces memory budgets per worker and overall, and streaming BLOB constraints.
         Returns True if successful, False if any table failed.
         """
         self._ensure_schema()
         req_frozen = self.config.require_frozen_source if require_frozen_source is None else require_frozen_source
         allow_live = self.config.allow_live_source if allow_live_source is None else allow_live_source
+
+        tot_budget = getattr(self.config, 'total_memory_budget_bytes', None) if total_memory_budget is None else total_memory_budget
+        worker_budget = getattr(self.config, 'max_buffer_bytes_per_worker', None) if per_worker_budget is None else per_worker_budget
+        blob_limit = getattr(self.config, 'max_blob_bytes', None) if max_blob_bytes is None else max_blob_bytes
+
+        domains = blob_domains if blob_domains is not None else self._get_blob_domains()
+
         return self.data_migrator.import_data(
             self.table_objs,
             max_workers=max_workers,
             require_frozen_source=req_frozen,
-            allow_live_source=allow_live
+            allow_live_source=allow_live,
+            total_memory_budget=tot_budget,
+            per_worker_budget=worker_budget,
+            max_blob_bytes=blob_limit,
+            blob_domains=domains
         )
 
     def export_firebird_triggers(self, output_file: str = None,

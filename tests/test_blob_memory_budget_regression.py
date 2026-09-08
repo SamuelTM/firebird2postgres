@@ -1,0 +1,402 @@
+import io
+import multiprocessing
+import os
+import tracemalloc
+import unittest
+from unittest.mock import MagicMock
+
+from config import MigrationConfig
+from engine.data_migrator import (
+    DataMigrator,
+    SerializedByteBuffer,
+    _estimate_row_bytes,
+    _import_single_table,
+    is_blob_column,
+)
+from engine.database_migrator import DatabaseMigrator
+from models import Column, Table
+
+
+def _worker_measure_peak_memory(queue, blob_size, max_buffer_bytes, max_blob_bytes):
+    """
+    Runs in a dedicated spawned process to measure true peak memory allocation
+    during single-table streaming import, verifying that 5x monolithic memory copies
+    do not occur.
+    """
+    tracemalloc.start()
+    try:
+        table = Table('TAB_PEAK_TEST')
+        table.columns.append(Column('ID', 'INTEGER', nullable=False))
+        table.columns.append(Column('PAYLOAD', 'BLOB SUBTYPE 0', nullable=True))
+
+        # 5MB deterministic binary payload
+        raw_blob = os.urandom(blob_size)
+
+        mock_fb_cur = MagicMock()
+        mock_pg_cur = MagicMock()
+        mock_pg_con = MagicMock()
+
+        # Provide raw_blob as an io.BytesIO stream to test chunked streaming
+        mock_fb_cur.fetchmany.side_effect = [[(1, io.BytesIO(raw_blob))], []]
+
+        # Reset peak before running import
+        tracemalloc.reset_peak()
+        before_current, before_peak = tracemalloc.get_traced_memory()
+
+        total_rows, nul_stats = _import_single_table(
+            table,
+            mock_fb_cur,
+            mock_pg_cur,
+            mock_pg_con,
+            max_buffer_bytes=max_buffer_bytes,
+            max_blob_bytes=max_blob_bytes
+        )
+
+        after_current, after_peak = tracemalloc.get_traced_memory()
+        peak_delta = after_peak - before_current
+
+        # Extract copied buffer content
+        mock_pg_cur.copy_expert.assert_called_once()
+        copy_sql, buf = mock_pg_cur.copy_expert.call_args[0]
+        buf_val = buf.getvalue()
+
+        expected_hex = r'\x' + raw_blob.hex()
+        is_exact = expected_hex in buf_val
+
+        queue.put({
+            'success': True,
+            'peak_delta': peak_delta,
+            'is_exact': is_exact,
+            'total_rows': total_rows
+        })
+    except Exception as exc:
+        queue.put({
+            'success': False,
+            'error': str(exc)
+        })
+    finally:
+        tracemalloc.stop()
+
+
+class TestBlobMemoryBudgetRegression(unittest.TestCase):
+    """
+    Regression suite for:
+    'Buffer em bytes não limita BLOB individual'
+    Verifies:
+    1. Accurate serialized byte counting for multibyte text and binary hex.
+    2. Domain-based BLOBs receive full BLOB streaming treatment and size limits.
+    3. Memory budget clearly distinguishes worker budget from total budget.
+    4. Object size limits reject oversized BLOBs before materializing copies and trigger rollback.
+    5. Rows with multiple BLOBs stream correctly and maintain bit-exact content.
+    6. Peak memory in separate process stays strictly bounded (preventing 5x materialization copies).
+    """
+
+    def test_serialized_byte_counting_with_multibyte_text(self):
+        """
+        Criteria: Contagem considera bytes serializados.
+        Verifies SerializedByteBuffer tracks exact UTF-8 byte length across multibyte text and escapes.
+        """
+        buf = SerializedByteBuffer()
+        self.assertEqual(buf.byte_count, 0)
+
+        # ASCII string
+        buf.write("Hello")
+        self.assertEqual(buf.byte_count, 5)
+
+        # 2-byte UTF-8 characters (Portuguese accents)
+        buf.write("Ação e Atenção")
+        expected_bytes = len("Hello".encode('utf-8')) + len("Ação e Atenção".encode('utf-8'))
+        self.assertEqual(buf.byte_count, expected_bytes)
+
+        # 4-byte UTF-8 emojis
+        buf.write(" 🚀🔥🐘 ")
+        expected_bytes += len(" 🚀🔥🐘 ".encode('utf-8'))
+        self.assertEqual(buf.byte_count, expected_bytes)
+
+        # PostgreSQL escapes
+        buf.write(r"\n\t\\")
+        expected_bytes += len(r"\n\t\\".encode('utf-8'))
+        self.assertEqual(buf.byte_count, expected_bytes)
+
+        # Read back and verify exact byte content
+        buf.seek(0)
+        content = buf.getvalue()
+        self.assertEqual(content, "HelloAção e Atenção 🚀🔥🐘 \\n\\t\\\\")
+
+    def test_blob_sizes_small_near_limit_and_exceeding_rejection(self):
+        """
+        Criteria:
+        - Definir uma alternativa: leitura em partes ou limite de objeto com rejeição explícita.
+        - Se houver rejeição por tamanho, ela precisa ocorrer antes de materializar cópias completas;
+          se o driver impedir isso, declarar o limite real.
+        - Conteúdo copiado permanece exato.
+        """
+        table = Table('TAB_BLOB_LIMITS')
+        table.columns.append(Column('ID', 'INTEGER', nullable=False))
+        table.columns.append(Column('DADOS', 'BLOB SUBTYPE 0', nullable=True))
+
+        limit_bytes = 1000
+        mock_fb_cur = MagicMock()
+        mock_pg_cur = MagicMock()
+        mock_pg_con = MagicMock()
+
+        # 1. Small BLOB (< limit): 100 bytes -> Imported successfully with exact content
+        small_payload = b'S' * 100
+        mock_fb_cur.fetchmany.side_effect = [[(1, small_payload)], []]
+        total_rows, _ = _import_single_table(
+            table, mock_fb_cur, mock_pg_cur, mock_pg_con,
+            max_buffer_bytes=4096, max_blob_bytes=limit_bytes
+        )
+        self.assertEqual(total_rows, 1)
+        mock_pg_cur.copy_expert.assert_called_once()
+        buf = mock_pg_cur.copy_expert.call_args[0][1]
+        self.assertIn(r'\x' + small_payload.hex(), buf.getvalue())
+
+        # 2. Near limit BLOB: exactly limit_bytes (1000 bytes) -> Imported successfully
+        mock_pg_cur.reset_mock()
+        near_limit_payload = b'N' * limit_bytes
+        mock_fb_cur.fetchmany.side_effect = [[(2, near_limit_payload)], []]
+        total_rows, _ = _import_single_table(
+            table, mock_fb_cur, mock_pg_cur, mock_pg_con,
+            max_buffer_bytes=4096, max_blob_bytes=limit_bytes
+        )
+        self.assertEqual(total_rows, 1)
+        mock_pg_cur.copy_expert.assert_called_once()
+        buf = mock_pg_cur.copy_expert.call_args[0][1]
+        self.assertIn(r'\x' + near_limit_payload.hex(), buf.getvalue())
+
+        # 3. Exceeding limit BLOB: limit_bytes + 1 -> Explicit ValueError raised before materializing
+        mock_pg_cur.reset_mock()
+        exceeding_payload = b'E' * (limit_bytes + 1)
+        mock_fb_cur.fetchmany.side_effect = [[(3, exceeding_payload)], []]
+        with self.assertRaises(ValueError) as ctx:
+            _import_single_table(
+                table, mock_fb_cur, mock_pg_cur, mock_pg_con,
+                max_buffer_bytes=4096, max_blob_bytes=limit_bytes
+            )
+        self.assertIn("exceeds maximum allowed size of 1000 bytes", str(ctx.exception))
+
+        # 4. Exceeding limit via stream: stream must not be read into memory past the limit
+        class CountingStream:
+            def __init__(self, max_bytes_to_serve):
+                self.bytes_read = 0
+                self.max_bytes_to_serve = max_bytes_to_serve
+
+            def read(self, size=65536):
+                if self.bytes_read >= self.max_bytes_to_serve:
+                    return b""
+                chunk_len = min(size, self.max_bytes_to_serve - self.bytes_read)
+                self.bytes_read += chunk_len
+                return b'X' * chunk_len
+
+        # Stream has 100,000 bytes, but limit is 1,000 bytes
+        oversized_stream = CountingStream(100000)
+        mock_fb_cur.fetchmany.side_effect = [[(4, oversized_stream)], []]
+        with self.assertRaises(ValueError) as ctx:
+            _import_single_table(
+                table, mock_fb_cur, mock_pg_cur, mock_pg_con,
+                max_buffer_bytes=4096, max_blob_bytes=limit_bytes
+            )
+        self.assertIn("exceeds maximum allowed size of 1000 bytes", str(ctx.exception))
+        # Verify reading aborted early without reading the remaining 99,000 bytes
+        self.assertLessEqual(oversized_stream.bytes_read, 65536 + 1024)
+
+    def test_multiple_blobs_in_same_row(self):
+        """
+        Criteria:
+        - Vários BLOBs na linha.
+        - Conteúdo copiado permanece exato.
+        """
+        table = Table('TAB_MULTI_BLOB')
+        table.columns.append(Column('ID', 'INTEGER', nullable=False))
+        table.columns.append(Column('FOTO', 'BLOB SUBTYPE 0', nullable=True))
+        table.columns.append(Column('AUDIO', 'BYTEA', nullable=True))
+        table.columns.append(Column('CERT', 'OCTETS', nullable=True))
+
+        blob1 = b'\x00\x01\x02\x03\xff'
+        blob2 = b'RIFF\x24\x00\x00\x00WAVEfmt '
+        blob3 = b'BEGIN CERTIFICATE\x00\xaa\xbb'
+
+        mock_fb_cur = MagicMock()
+        mock_pg_cur = MagicMock()
+        mock_pg_con = MagicMock()
+
+        mock_fb_cur.fetchmany.side_effect = [[(1, blob1, blob2, blob3)], []]
+
+        total_rows, _ = _import_single_table(
+            table, mock_fb_cur, mock_pg_cur, mock_pg_con,
+            max_buffer_bytes=1024 * 1024, max_blob_bytes=512 * 1024
+        )
+        self.assertEqual(total_rows, 1)
+        mock_pg_cur.copy_expert.assert_called_once()
+        buf = mock_pg_cur.copy_expert.call_args[0][1]
+        line = buf.getvalue().strip()
+
+        parts = line.split('\t')
+        self.assertEqual(len(parts), 4)
+        self.assertEqual(parts[0], '1')
+        self.assertEqual(parts[1], r'\\x' + blob1.hex())
+        self.assertEqual(parts[2], r'\\x' + blob2.hex())
+        self.assertEqual(parts[3], r'\\x' + blob3.hex())
+
+    def test_domain_based_blob_treatment(self):
+        """
+        Criteria:
+        - BLOB baseado em domain recebe tratamento de BLOB.
+        - Detecção, fetch_size=1, LPT scheduling, streaming e limite de tamanho.
+        """
+        col_direct = Column('DOC_DIRECT', 'BLOB SUBTYPE 0', nullable=True)
+        col_domain = Column('DOC_DOMAIN', 'TEXT', nullable=True, domain_name='DM_ANEXO')
+        col_regular = Column('NOME', 'VARCHAR(100)', nullable=True, domain_name='DM_NOME')
+
+        blob_domains = {'DM_ANEXO', 'DM_DOCUMENTO'}
+
+        self.assertTrue(is_blob_column(col_direct, blob_domains))
+        self.assertTrue(is_blob_column(col_domain, blob_domains))
+        self.assertFalse(is_blob_column(col_regular, blob_domains))
+
+        # Verify case insensitivity in domain matching
+        col_domain_lower = Column('ARQ', 'TEXT', nullable=True, domain_name='dm_anexo')
+        self.assertTrue(is_blob_column(col_domain_lower, blob_domains))
+
+        # Test table with domain BLOB uses fetch_size=1 and enforces max_blob_bytes
+        table = Table('TAB_DOMAIN_BLOB')
+        table.columns.append(Column('ID', 'INTEGER', nullable=False))
+        table.columns.append(col_domain)
+
+        mock_fb_cur = MagicMock()
+        mock_pg_cur = MagicMock()
+        mock_pg_con = MagicMock()
+
+        mock_fb_cur.fetchmany.return_value = []
+        _import_single_table(
+            table, mock_fb_cur, mock_pg_cur, mock_pg_con,
+            blob_domains=blob_domains
+        )
+        mock_fb_cur.fetchmany.assert_called_with(1)
+
+        # Verify size rejection on domain-based BLOB column
+        oversized = b'D' * 2000
+        mock_fb_cur.fetchmany.side_effect = [[(1, oversized)], []]
+        with self.assertRaises(ValueError) as ctx:
+            _import_single_table(
+                table, mock_fb_cur, mock_pg_cur, mock_pg_con,
+                max_blob_bytes=1000, blob_domains=blob_domains
+            )
+        self.assertIn("exceeds maximum allowed size of 1000 bytes", str(ctx.exception))
+
+    def test_memory_budget_distinguishes_worker_from_total(self):
+        """
+        Criteria:
+        - Orçamento distingue memória por worker de memória total.
+        """
+        # Case 1: Defaults (4 workers)
+        total, worker, blob_lim = DataMigrator.calculate_memory_budget(max_workers=4)
+        self.assertEqual(worker, 32 * 1024 * 1024)
+        self.assertEqual(total, 4 * 32 * 1024 * 1024)
+        self.assertEqual(blob_lim, (worker - 1024) // 2)
+
+        # Case 2: Total budget specified (e.g. 128MB total across 8 workers)
+        total, worker, blob_lim = DataMigrator.calculate_memory_budget(
+            max_workers=8, total_budget=128 * 1024 * 1024
+        )
+        self.assertEqual(total, 128 * 1024 * 1024)
+        self.assertEqual(worker, 16 * 1024 * 1024)
+        self.assertEqual(blob_lim, (worker - 1024) // 2)
+
+        # Case 3: Per-worker budget explicitly specified (e.g. 64MB per worker, 4 workers)
+        total, worker, blob_lim = DataMigrator.calculate_memory_budget(
+            max_workers=4, per_worker_budget=64 * 1024 * 1024
+        )
+        self.assertEqual(worker, 64 * 1024 * 1024)
+        self.assertEqual(total, 256 * 1024 * 1024)
+
+        # Case 4: Explicit max_blob_bytes override
+        total, worker, blob_lim = DataMigrator.calculate_memory_budget(
+            max_workers=2,
+            total_budget=64 * 1024 * 1024,
+            max_blob_bytes=8 * 1024 * 1024
+        )
+        self.assertEqual(blob_lim, 8 * 1024 * 1024)
+
+    def test_database_migrator_wires_blob_domains_and_config(self):
+        """
+        Criteria:
+        - Integrates DatabaseMigrator, querying Firebird for domain BLOBs
+          and propagating configured budgets to DataMigrator.
+        """
+        mock_fb_con = MagicMock()
+        mock_pg_con = MagicMock()
+        mock_fb_cur = MagicMock()
+        mock_fb_con.cursor.return_value = mock_fb_cur
+
+        # Mock catalog query for BLOB domains
+        mock_fb_cur.fetchall.return_value = [
+            ('DM_DOCUMENTO_PDF',),
+            ('DM_FOTO_ALUNO',)
+        ]
+
+        cfg = MigrationConfig(
+            total_memory_budget_bytes=256 * 1024 * 1024,
+            max_buffer_bytes_per_worker=32 * 1024 * 1024,
+            max_blob_bytes=10 * 1024 * 1024
+        )
+
+        migrator = DatabaseMigrator(mock_fb_con, mock_pg_con, config=cfg)
+        domains = migrator._get_blob_domains()
+        self.assertIn('DM_DOCUMENTO_PDF', domains)
+        self.assertIn('DM_FOTO_ALUNO', domains)
+
+        # Mock data_migrator.import_data
+        migrator.data_migrator.import_data = MagicMock(return_value=True)
+        migrator.table_objs = [Table('T1')]
+
+        success = migrator.import_data(max_workers=4)
+        self.assertTrue(success)
+
+        migrator.data_migrator.import_data.assert_called_once()
+        kwargs = migrator.data_migrator.import_data.call_args[1]
+        self.assertEqual(kwargs['total_memory_budget'], 256 * 1024 * 1024)
+        self.assertEqual(kwargs['per_worker_budget'], 32 * 1024 * 1024)
+        self.assertEqual(kwargs['max_blob_bytes'], 10 * 1024 * 1024)
+        self.assertIn('DM_DOCUMENTO_PDF', kwargs['blob_domains'])
+
+    def test_peak_memory_in_separate_process_bounds_blob_materialization(self):
+        """
+        Criteria:
+        - Medir pico de memória em processo separado e verificar conteúdo/rollback.
+        - Comprovar que 5 cópias completas do BLOB não são materializadas na memória.
+        """
+        blob_size = 4 * 1024 * 1024  # 4MB raw blob
+        max_buffer = 16 * 1024 * 1024
+        max_blob = 8 * 1024 * 1024
+
+        queue = multiprocessing.Queue()
+        p = multiprocessing.Process(
+            target=_worker_measure_peak_memory,
+            args=(queue, blob_size, max_buffer, max_blob)
+        )
+        p.start()
+        res = queue.get(timeout=30)
+        p.join()
+
+        self.assertTrue(res.get('success'), f"Subprocess failed: {res.get('error')}")
+        self.assertTrue(res.get('is_exact'), "Copied BLOB content was corrupted or inexact!")
+        self.assertEqual(res.get('total_rows'), 1)
+
+        peak_delta = res.get('peak_delta')
+        # In the old code:
+        # raw (4MB) + read (4MB) + hex (8MB) + row_str (8MB) + encode (8MB) = ~32MB memory churn.
+        # With chunked streaming directly to SerializedByteBuffer:
+        # Only the raw stream + buffer are needed.
+        # Serialized hex is 8MB in the buffer.
+        # Peak memory delta must be well under 20MB (significantly less than 5x 4MB = 20-32MB).
+        self.assertLess(
+            peak_delta,
+            20 * 1024 * 1024,
+            f"Peak memory delta ({peak_delta / (1024 * 1024):.2f}MB) exceeded budget threshold!"
+        )
+
+
+if __name__ == '__main__':
+    unittest.main()

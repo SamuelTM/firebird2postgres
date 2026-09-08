@@ -99,6 +99,11 @@ class PostgresConfig:
 
 
 
+DEFAULT_MAX_BUFFER_BYTES_PER_WORKER: int = 32 * 1024 * 1024  # 32 MB buffer budget per worker
+DEFAULT_MAX_BLOB_BYTES: int = 16 * 1024 * 1024               # 16 MB per individual BLOB (serializes to ~32 MB hex)
+DEFAULT_TOTAL_MEMORY_BUDGET: int = 128 * 1024 * 1024         # 128 MB total budget across workers
+
+
 def _bool_converter(val: Any) -> bool:
     if isinstance(val, bool):
         return val
@@ -112,6 +117,15 @@ class MigrationConfig:
     )
     allow_live_source: bool = field(
         default_factory=env_default('ALLOW_LIVE_SOURCE', False, _bool_converter)
+    )
+    max_buffer_bytes_per_worker: int = field(
+        default_factory=env_default('MAX_BUFFER_BYTES', DEFAULT_MAX_BUFFER_BYTES_PER_WORKER, int)
+    )
+    max_blob_bytes: int = field(
+        default_factory=env_default('MAX_BLOB_BYTES', DEFAULT_MAX_BLOB_BYTES, int)
+    )
+    total_memory_budget_bytes: int = field(
+        default_factory=env_default('TOTAL_MEMORY_BUDGET', DEFAULT_TOTAL_MEMORY_BUDGET, int)
     )
 
 

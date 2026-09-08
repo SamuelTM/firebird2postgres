@@ -6,13 +6,15 @@ from concurrent.futures import ProcessPoolExecutor, as_completed, Executor
 import firebirdsql
 import psycopg2
 import psycopg2.extras
-from config import get_firebird_connection, get_postgres_connection
+from config import (
+    get_firebird_connection, get_postgres_connection,
+    DEFAULT_MAX_BUFFER_BYTES_PER_WORKER, DEFAULT_MAX_BLOB_BYTES, DEFAULT_TOTAL_MEMORY_BUDGET
+)
 from models import Table, Column, pg_quote_ident
 
 logger = logging.getLogger(__name__)
 
-
-DEFAULT_MAX_BUFFER_BYTES = 32 * 1024 * 1024  # 32 MB buffer budget per worker
+DEFAULT_MAX_BUFFER_BYTES = DEFAULT_MAX_BUFFER_BYTES_PER_WORKER
 
 
 class SerializedByteBuffer:
@@ -50,7 +52,108 @@ class SerializedByteBuffer:
         self._bytes = 0
 
 
-def _import_single_table(table: Table, fb_cur, pg_cur, pg_con, max_buffer_bytes: int = DEFAULT_MAX_BUFFER_BYTES) -> tuple[int, dict[str, int]]:
+def is_blob_column(col: Column, blob_domains: set[str] = None) -> bool:
+    """
+    Returns True if the column is a BLOB, BYTEA, or OCTETS type,
+    or is based on a domain that resolves to a BLOB/BYTEA/OCTETS.
+    """
+    col_type = (col.column_type or '').upper()
+    domain = (col.domain_name or '').upper()
+    if blob_domains and (domain.lower() in blob_domains or domain in blob_domains):
+        return True
+    return (
+        'BLOB' in col_type
+        or 'BYTEA' in col_type
+        or 'OCTETS' in col_type
+        or 'BLOB' in domain
+        or 'BYTEA' in domain
+        or 'OCTETS' in domain
+    )
+
+
+def _write_binary_value_chunked(
+    buf: SerializedByteBuffer,
+    val: Any,
+    col_name: str,
+    max_blob_bytes: int = None,
+    chunk_size: int = 65536
+) -> int:
+    """
+    Writes binary value directly to buffer in PostgreSQL hex format (\\x...) in chunks,
+    preventing runaway memory materialization of multiple full copies.
+    Enforces max_blob_bytes before or during streaming.
+    Returns the total raw binary bytes written.
+    """
+    total_bytes = 0
+
+    if hasattr(val, 'read') and callable(val.read):
+        # Stream-based reader (e.g. Firebird BLOB or file-like stream)
+        while True:
+            chunk = val.read(chunk_size)
+            if not chunk:
+                break
+            if isinstance(chunk, str):
+                chunk = chunk.encode('latin1')
+            elif isinstance(chunk, memoryview):
+                chunk = chunk.tobytes()
+
+            total_bytes += len(chunk)
+            if max_blob_bytes is not None and total_bytes > max_blob_bytes:
+                raise ValueError(
+                    f"BLOB in column '{col_name}' exceeds maximum allowed size of "
+                    f"{max_blob_bytes} bytes (found at least {total_bytes} bytes)."
+                )
+            buf.write(chunk.hex())
+    else:
+        # In-memory value (bytes, bytearray, memoryview, str)
+        if isinstance(val, str):
+            val = val.encode('latin1')
+
+        raw_len = len(val)
+        if max_blob_bytes is not None and raw_len > max_blob_bytes:
+            raise ValueError(
+                f"BLOB in column '{col_name}' exceeds maximum allowed size of "
+                f"{max_blob_bytes} bytes (size is {raw_len} bytes)."
+            )
+
+        total_bytes = raw_len
+        mv = memoryview(val) if isinstance(val, (bytes, bytearray)) else memoryview(bytes(val))
+        for offset in range(0, raw_len, chunk_size):
+            buf.write(mv[offset:offset + chunk_size].hex())
+
+    return total_bytes
+
+
+def _estimate_row_bytes(row) -> int:
+    """
+    Lightweight, zero-copy estimation of row bytes for buffer management.
+    """
+    est = len(row)  # tab separators + newline
+    for val in row:
+        if val is None:
+            est += 2
+        elif isinstance(val, (bytes, bytearray, memoryview)):
+            est += len(val) * 2 + 3  # \\x prefix + hex chars
+        elif isinstance(val, str):
+            est += len(val) * 3      # upper bound for UTF-8 without re-encoding
+        elif hasattr(val, 'read'):
+            est += getattr(val, 'length', 0) or getattr(val, 'size', 0) or 65536
+        elif isinstance(val, bool):
+            est += 1
+        else:
+            est += 32
+    return est
+
+
+def _import_single_table(
+    table: Table,
+    fb_cur,
+    pg_cur,
+    pg_con,
+    max_buffer_bytes: int = DEFAULT_MAX_BUFFER_BYTES_PER_WORKER,
+    max_blob_bytes: int = DEFAULT_MAX_BLOB_BYTES,
+    blob_domains: set[str] = None
+) -> tuple[int, dict[str, int]]:
     """
     Imports data for a single table:
     1. Truncates table in PostgreSQL (no CASCADE)
@@ -72,18 +175,21 @@ def _import_single_table(table: Table, fb_cur, pg_cur, pg_con, max_buffer_bytes:
     # and CASCADE would be dangerous with concurrent workers if they did)
     pg_cur.execute(f'TRUNCATE TABLE {pg_quote_ident(table.pg_name)};')
 
-    blob_count = sum(1 for col in table.columns if 'BLOB' in col.column_type)
+    blob_count = sum(1 for col in table.columns if is_blob_column(col, blob_domains))
     # When tables contain BLOB columns, stream row-by-row (fetch_size=1) to prevent the
     # Firebird driver and Python runtime from buffering dozens/hundreds of large binary objects
     # into memory before serialization.
     fetch_size = 1 if blob_count > 0 else 10000
     if blob_count > 0:
-        logger.debug(f"Found {blob_count} BLOB column(s) in '{table.name}'. Adjusted fetch slice to row-by-row streaming with {max_buffer_bytes // (1024 * 1024)}MB serialized byte buffer budget.")
+        logger.debug(
+            f"Found {blob_count} BLOB column(s) in '{table.name}'. "
+            f"Adjusted fetch slice to row-by-row streaming with "
+            f"{max_buffer_bytes // (1024 * 1024)}MB serialized buffer budget "
+            f"and {max_blob_bytes // (1024 * 1024)}MB max BLOB limit."
+        )
 
     # Explicitly list columns to ensure it perfectly matches the postgres insert order.
     # Exclude computed (GENERATED ALWAYS) columns, as PostgreSQL forbids inserting into them directly.
-    # Firebird-side keeps the original casing (quoted identifiers are case-sensitive there);
-    # PostgreSQL-side uses the lowercase identifier.
     cols_to_import = [col for col in table.columns if not col.computed_source]
     col_names = [col.name for col in cols_to_import]
     fb_column_names = [pg_quote_ident(col.name) for col in cols_to_import]
@@ -105,52 +211,63 @@ def _import_single_table(table: Table, fb_cur, pg_cur, pg_con, max_buffer_bytes:
             break
 
         for row in rows:
-            line = []
-            for col_idx, val in enumerate(row):
-                if val is None:
-                    line.append(r'\N')
-                else:
-                    if hasattr(val, 'read') and callable(val.read):
-                        val = val.read()
-                    col_obj = cols_to_import[col_idx]
-                    col_type = (col_obj.column_type or '').upper()
-                    is_binary = (
-                        col_type == 'BYTEA'
-                        or 'BYTEA' in col_type
-                        or 'BLOB' in col_type
-                        or 'OCTETS' in col_type
-                        or (col_obj.domain_name and 'OCTETS' in col_obj.domain_name.upper())
-                    )
-                    if is_binary and isinstance(val, str):
-                        val = val.encode('latin1')
-
-                    if isinstance(val, (bytes, bytearray, memoryview)):
-                        line.append(r'\\x' + bytes(val).hex())
-                    elif isinstance(val, str):
-                        if '\x00' in val:
-                            col_name = col_names[col_idx]
-                            nul_stats[col_name] = nul_stats.get(col_name, 0) + val.count('\x00')
-                            val = val.replace('\x00', '')
-                        line.append(val.replace('\\', '\\\\')
-                                       .replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t'))
-                    elif isinstance(val, bool):
-                        line.append('t' if val else 'f')
-                    else:
-                        line.append(str(val))
-
-            row_str = '\t'.join(line) + '\n'
-            row_bytes = len(row_str.encode('utf-8'))
-
-            # If existing buffer has data and adding this row would exceed max_buffer_bytes,
-            # flush existing buffer first so we don't accumulate beyond budget
-            if buf.byte_count > 0 and (buf.byte_count + row_bytes > max_buffer_bytes):
+            row_est = _estimate_row_bytes(row)
+            if buf.byte_count > 0 and (buf.byte_count + row_est > max_buffer_bytes):
                 buf.seek(0)
                 pg_cur.copy_expert(copy_sql, buf)
                 buf = SerializedByteBuffer()
 
-            buf.write(row_str)
+            try:
+                for col_idx, val in enumerate(row):
+                    if col_idx > 0:
+                        buf.write('\t')
 
-            # Flush buffer incrementally via COPY as soon as accumulated text volume exceeds memory budget
+                    col_obj = cols_to_import[col_idx]
+                    col_name = col_names[col_idx]
+                    is_binary = is_blob_column(col_obj, blob_domains)
+
+                    if val is None:
+                        buf.write(r'\N')
+                        continue
+
+                    if is_binary:
+                        buf.write(r'\\x')
+                        _write_binary_value_chunked(
+                            buf, val, col_name,
+                            max_blob_bytes=max_blob_bytes
+                        )
+                    else:
+                        if hasattr(val, 'read') and callable(val.read):
+                            val = val.read()
+
+                        if isinstance(val, (bytes, bytearray, memoryview)):
+                            buf.write(r'\\x')
+                            _write_binary_value_chunked(
+                                buf, val, col_name,
+                                max_blob_bytes=max_blob_bytes
+                            )
+                        elif isinstance(val, str):
+                            if '\x00' in val:
+                                nul_stats[col_name] = nul_stats.get(col_name, 0) + val.count('\x00')
+                                val = val.replace('\x00', '')
+                            buf.write(
+                                val.replace('\\', '\\\\')
+                                   .replace('\n', '\\n')
+                                   .replace('\r', '\\r')
+                                   .replace('\t', '\\t')
+                            )
+                        elif isinstance(val, bool):
+                            buf.write('t' if val else 'f')
+                        else:
+                            buf.write(str(val))
+
+                buf.write('\n')
+
+            except Exception:
+                buf = SerializedByteBuffer()
+                raise
+
+            # Flush buffer incrementally via COPY as soon as accumulated text volume reaches memory budget
             if buf.byte_count >= max_buffer_bytes:
                 buf.seek(0)
                 pg_cur.copy_expert(copy_sql, buf)
@@ -170,7 +287,12 @@ def _import_single_table(table: Table, fb_cur, pg_cur, pg_con, max_buffer_bytes:
     return total_rows, nul_stats
 
 
-def _migrate_table_worker(table: Table) -> tuple[str, int, str | None, dict[str, int]]:
+def _migrate_table_worker(
+    table: Table,
+    max_buffer_bytes: int = DEFAULT_MAX_BUFFER_BYTES_PER_WORKER,
+    max_blob_bytes: int = DEFAULT_MAX_BLOB_BYTES,
+    blob_domains: set[str] = None
+) -> tuple[str, int, str | None, dict[str, int]]:
     """
     Top-level worker function for ProcessPoolExecutor: establishes isolated database
     connections in the worker process, sets session performance tuning, and imports the table.
@@ -183,7 +305,12 @@ def _migrate_table_worker(table: Table) -> tuple[str, int, str | None, dict[str,
         pg_cur.execute("SET synchronous_commit = OFF;")
         fb_cur = fb_con.cursor()
 
-        rows_imported, nul_stats = _import_single_table(table, fb_cur, pg_cur, pg_con)
+        rows_imported, nul_stats = _import_single_table(
+            table, fb_cur, pg_cur, pg_con,
+            max_buffer_bytes=max_buffer_bytes,
+            max_blob_bytes=max_blob_bytes,
+            blob_domains=blob_domains
+        )
         return table.name, rows_imported, None, nul_stats
     except (psycopg2.Error, firebirdsql.Error, OSError, ValueError, TypeError) as e:
         try:
@@ -214,6 +341,36 @@ class DataMigrator:
         self.fb_con = fb_con
         self.pg_con = pg_con
         self.last_nul_stats: dict[str, dict[str, int]] = {}
+
+    @staticmethod
+    def calculate_memory_budget(
+        max_workers: int = 4,
+        total_budget: int = None,
+        per_worker_budget: int = None,
+        max_blob_bytes: int = None
+    ) -> tuple[int, int, int]:
+        """
+        Calculates memory budget distinguishing total memory from per-worker memory.
+        Returns (total_budget_bytes, per_worker_buffer_bytes, max_blob_bytes).
+        """
+        workers = max(1, max_workers)
+
+        if per_worker_budget is not None and per_worker_budget > 0:
+            worker_bytes = per_worker_budget
+            total_bytes = total_budget if total_budget is not None else worker_bytes * workers
+        elif total_budget is not None and total_budget > 0:
+            total_bytes = total_budget
+            worker_bytes = max(1024 * 1024, total_budget // workers)
+        else:
+            worker_bytes = DEFAULT_MAX_BUFFER_BYTES_PER_WORKER
+            total_bytes = worker_bytes * workers
+
+        if max_blob_bytes is not None and max_blob_bytes > 0:
+            blob_limit = max_blob_bytes
+        else:
+            blob_limit = max(1024 * 1024, (worker_bytes - 1024) // 2)
+
+        return total_bytes, worker_bytes, blob_limit
 
     def _re_enable_triggers(self, table_objs: list[Table]):
         """
@@ -368,7 +525,11 @@ class DataMigrator:
         max_workers: int = 4,
         executor: Executor = None,
         require_frozen_source: bool = True,
-        allow_live_source: bool = False
+        allow_live_source: bool = False,
+        total_memory_budget: int = None,
+        per_worker_budget: int = None,
+        max_blob_bytes: int = None,
+        blob_domains: set[str] = None
     ) -> bool:
         """
         Reads data from Firebird and bulk inserts into PostgreSQL using a multi-process worker pool.
@@ -381,7 +542,20 @@ class DataMigrator:
 
         self.check_source_consistency(require_frozen=require_frozen_source, allow_live_source=allow_live)
         self.last_nul_stats = {}
-        logger.info(f"Starting data migration for {len(table_objs)} tables (workers={max_workers})...")
+
+        total_bytes, worker_bytes, blob_limit = self.calculate_memory_budget(
+            max_workers=max_workers,
+            total_budget=total_memory_budget,
+            per_worker_budget=per_worker_budget,
+            max_blob_bytes=max_blob_bytes
+        )
+
+        logger.info(
+            f"Starting data migration for {len(table_objs)} tables (workers={max_workers}). "
+            f"Memory budget: {total_bytes // (1024 * 1024)}MB total, "
+            f"{worker_bytes // (1024 * 1024)}MB per worker, "
+            f"max BLOB limit: {blob_limit // (1024 * 1024)}MB."
+        )
         pg_cur = self.pg_con.cursor()
 
         logger.info("Disabling triggers in PostgreSQL for a clean import...")
@@ -393,10 +567,10 @@ class DataMigrator:
         # re-enabled, even when an unexpected exception escapes the import
         try:
             # Sort tables by estimated workload (LPT: Longest Processing Time first)
-            # Tables with BLOBs and higher column count are scheduled first
+            # Tables with BLOBs (including domain BLOBs) and higher column count are scheduled first
             sorted_tables = sorted(
                 table_objs,
-                key=lambda t: (sum(1 for c in t.columns if 'BLOB' in c.column_type), len(t.columns)),
+                key=lambda t: (sum(1 for c in t.columns if is_blob_column(c, blob_domains)), len(t.columns)),
                 reverse=True
             )
 
@@ -410,7 +584,12 @@ class DataMigrator:
                 try:
                     for table in sorted_tables:
                         try:
-                            rows_imported, nul_stats = _import_single_table(table, fb_cur, pg_cur, self.pg_con)
+                            rows_imported, nul_stats = _import_single_table(
+                                table, fb_cur, pg_cur, self.pg_con,
+                                max_buffer_bytes=worker_bytes,
+                                max_blob_bytes=blob_limit,
+                                blob_domains=blob_domains
+                            )
                             results.append((table.name, rows_imported, None, nul_stats))
                         except (psycopg2.Error, firebirdsql.Error, OSError, ValueError, TypeError) as e:
                             self.pg_con.rollback()
@@ -430,7 +609,15 @@ class DataMigrator:
                     executor = ProcessPoolExecutor(max_workers=max_workers)
 
                 try:
-                    futures = {executor.submit(_migrate_table_worker, table): table for table in sorted_tables}
+                    futures = {
+                        executor.submit(
+                            _migrate_table_worker,
+                            table,
+                            worker_bytes,
+                            blob_limit,
+                            blob_domains
+                        ): table for table in sorted_tables
+                    }
                     for future in as_completed(futures):
                         tbl_name, rows_imported, err, nul_stats = future.result()
                         results.append((tbl_name, rows_imported, err, nul_stats))
