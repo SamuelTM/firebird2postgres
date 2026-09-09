@@ -116,8 +116,9 @@ class TestTypeMetadataRegression(unittest.TestCase):
         # Delimited domain reference: "INT128" -> should resolve to int128_dom
         self.assertEqual(convert_firebird_type_declaration('"INT128"', domain_map=dm), 'int128_dom')
 
-        # Unquoted domain reference: INT128 -> should also resolve to int128_dom
-        self.assertEqual(convert_firebird_type_declaration('INT128', domain_map=dm), 'int128_dom')
+        # Unquoted INT128 is the reserved native type, NOT the domain,
+        # even in a database owning domain "INT128" -> NUMERIC(39)
+        self.assertEqual(convert_firebird_type_declaration('INT128', domain_map=dm), 'NUMERIC(39)')
 
         # Without domain_map, INT128 is a native type -> NUMERIC(39)
         self.assertEqual(convert_firebird_type_declaration('INT128'), 'NUMERIC(39)')
@@ -125,7 +126,8 @@ class TestTypeMetadataRegression(unittest.TestCase):
         # Domain "BLOB" mapped to blob_dom
         dm2 = {'BLOB': 'blob_dom'}
         self.assertEqual(convert_firebird_type_declaration('"BLOB"', domain_map=dm2), 'blob_dom')
-        self.assertEqual(convert_firebird_type_declaration('BLOB', domain_map=dm2), 'blob_dom')
+        # Unquoted BLOB is the native type -> BYTEA, never the domain
+        self.assertEqual(convert_firebird_type_declaration('BLOB', domain_map=dm2), 'BYTEA')
 
         # Without domain_map, BLOB is a native type -> BYTEA
         self.assertEqual(convert_firebird_type_declaration('BLOB'), 'BYTEA')
@@ -155,6 +157,43 @@ class TestTypeMetadataRegression(unittest.TestCase):
         self.assertIn('OUT Y int128_dom', transpiled)
         self.assertIn('Z int128_dom;', transpiled)
         self.assertNotIn('NUMERIC(39)', transpiled)
+
+    def test_native_int128_beside_domain_in_same_database(self):
+        """
+        P1 acceptance: in one database owning domain "INT128", delimited
+        "INT128" uses the domain while bare INT128 stays native NUMERIC(39).
+        Covers parameters, variables and casts.
+        """
+        fb_proc = """
+        CREATE OR ALTER PROCEDURE SP_MIXED (
+            P_DOM "INT128",
+            P_NUM INT128
+        ) RETURNS (
+            O_DOM "INT128",
+            O_NUM INT128
+        ) AS
+        DECLARE VARIABLE V_DOM "INT128";
+        DECLARE VARIABLE V_NUM INT128;
+        BEGIN
+            V_DOM = P_DOM;
+            V_NUM = P_NUM;
+            O_DOM = V_DOM;
+            O_NUM = CAST(V_NUM AS INT128) + CAST(V_DOM AS "INT128");
+            SUSPEND;
+        END;
+        """
+        dm = {'INT128': 'int128_dom'}
+        transpiled = FirebirdToPostgresVisitor.transpile(fb_proc, domain_map=dm)
+        # Delimited usages resolve to the domain...
+        self.assertIn('P_DOM int128_dom', transpiled)
+        self.assertIn('OUT O_DOM int128_dom', transpiled)
+        self.assertIn('V_DOM int128_dom;', transpiled)
+        self.assertIn('CAST(V_DOM AS int128_dom)', transpiled)
+        # ...while bare INT128 stays the native numeric type.
+        self.assertIn('P_NUM NUMERIC(39)', transpiled)
+        self.assertIn('OUT O_NUM NUMERIC(39)', transpiled)
+        self.assertIn('V_NUM NUMERIC(39);', transpiled)
+        self.assertIn('CAST(V_NUM AS NUMERIC(39))', transpiled)
 
 
     def test_octets_domain_and_column_metadata(self):

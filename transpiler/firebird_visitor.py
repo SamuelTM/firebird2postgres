@@ -763,18 +763,31 @@ def _normalize_type_of(sql: str, domain_types: dict[str, str] = None) -> str:
     return pat.sub(repl, sql)
 
 
+# Single-word native type names that a BARE (unquoted) reference always
+# denotes, even when a domain of the same name exists. Firebird resolves
+# unquoted identifiers case-insensitively, and reserved type names such as
+# INT128 (reserved in Firebird 4) can never address a delimited domain:
+# only "NAME" (delimited) may resolve through the domain map.
+_RESERVED_NATIVE_TYPE_WORDS = frozenset({'BLOB', 'INT128', 'DECFLOAT'})
+
+
 def convert_firebird_type_declaration(raw_type: str, domain_map: dict[str, str] = None) -> str:
     if not raw_type:
         return ""
     # Check domain_map FIRST, before type substitutions, so delimited domains
     # whose names collide with native types (e.g. "INT128") resolve correctly.
+    # But a bare word that IS a native type name never consults the map:
+    # INT128 means NUMERIC(39) even in a database owning domain "INT128".
     if domain_map:
-        u = raw_type.strip().upper()
-        if u in domain_map:
-            return domain_map[u]
-        u_clean = u.strip('"')
-        if u_clean in domain_map:
-            return domain_map[u_clean]
+        stripped = raw_type.strip()
+        if len(stripped) >= 2 and stripped.startswith('"') and stripped.endswith('"'):
+            inner = stripped[1:-1].upper()
+            if inner in domain_map:
+                return domain_map[inner]
+        else:
+            u = stripped.upper()
+            if u not in _RESERVED_NATIVE_TYPE_WORDS and u in domain_map:
+                return domain_map[u]
     cleaned = re.sub(r'(?i)\bBLOB\s+SUBTYPE\s+(?:1|TEXT)\b', 'TEXT', raw_type)
     cleaned = re.sub(r'(?i)\bBLOB\s+SUBTYPE\s+(?:0|BINARY)\b', 'BYTEA', cleaned)
     cleaned = re.sub(r'(?i)\bBLOB\b', 'BYTEA', cleaned)
