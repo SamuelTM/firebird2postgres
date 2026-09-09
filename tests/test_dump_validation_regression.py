@@ -190,6 +190,106 @@ class TestDumpValidationRegression(unittest.TestCase):
             self.assertTrue(verified[DumpFiles.VIEWS_PG])
             self.assertTrue(verified[DumpFiles.TRIGGERS_PG])
 
+    def test_textual_mention_inside_function_is_not_a_definition(self):
+        """
+        P1 regression: a dump defining P1 whose body only MENTIONS P2 in a
+        RAISE NOTICE string must identify {P1}, and validation expecting
+        {P1, P2} must fail reporting P2 as missing.
+        """
+        dump = (
+            'CREATE FUNCTION "p1"() RETURNS void AS $$\n'
+            'BEGIN\n'
+            "    RAISE NOTICE 'CREATE FUNCTION p2()';\n"
+            'END;\n'
+            '$$ LANGUAGE plpgsql;\n'
+        )
+        self.assertEqual(extract_defined_objects(dump, 'PROCEDURE'), {'P1'})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            proc_file = os.path.join(tmpdir, DumpFiles.PROCEDURES_PG)
+            with open(proc_file, "w", encoding="utf-8") as f:
+                f.write(dump)
+            for cat in [DumpFiles.DOMAINS_PG, DumpFiles.VIEWS_PG, DumpFiles.TRIGGERS_PG]:
+                with open(os.path.join(tmpdir, cat), "w", encoding="utf-8") as f:
+                    f.write("/* EMPTY */\n")
+
+            self.migrator.ddl_exporter.get_source_objects = MagicMock(return_value={
+                DumpFiles.DOMAINS_PG: [],
+                DumpFiles.PROCEDURES_PG: ["P1", "P2"],
+                DumpFiles.VIEWS_PG: [],
+                DumpFiles.TRIGGERS_PG: [],
+            })
+
+            drop_called = []
+            self.migrator.drop_schema = lambda: drop_called.append(True)
+
+            with self.assertRaises(ValueError) as ctx:
+                self.migrator.validate_artifacts(output_dir=tmpdir)
+
+            self.assertIn("missing 1 expected PROCEDURE(s): P2", str(ctx.exception))
+            self.assertEqual(drop_called, [])
+
+    def test_escaped_quotes_in_identifiers(self):
+        """
+        P1 regression: "a""b" is a single identifier (a"b), not A.
+        Applies to definitions and to EXECUTE literals in DO blocks.
+        """
+        dump = (
+            'CREATE FUNCTION "a""b"() RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;\n'
+            'CREATE VIEW "v""x" AS SELECT 1;\n'
+        )
+        self.assertEqual(extract_defined_objects(dump, 'PROCEDURE'), {'A"B'})
+        self.assertEqual(extract_defined_objects(dump, 'VIEW'), {'V"X'})
+
+    def test_comments_inside_strings_neither_hide_nor_create_objects(self):
+        """
+        P1 regression: -- and /* */ markers inside string literals are text,
+        not comments: they must not fabricate objects, and stripping them must
+        not corrupt the surrounding definition. Real comments stay ignored.
+        """
+        dump = (
+            '-- CREATE FUNCTION ghost_in_line_comment() RETURNS void;\n'
+            '/* CREATE FUNCTION ghost_in_block_comment() RETURNS void; */\n'
+            'CREATE FUNCTION "p1"() RETURNS void AS $$\n'
+            'BEGIN\n'
+            "    RAISE NOTICE '-- CREATE FUNCTION px() /* CREATE FUNCTION py() */';\n"
+            'END;\n'
+            '$$ LANGUAGE plpgsql;\n'
+        )
+        defined = extract_defined_objects(dump, 'PROCEDURE')
+        self.assertEqual(defined, {'P1'})
+
+    def test_exporter_do_blocks_count_as_definitions(self):
+        """
+        P1 regression: DO blocks effectively emitted by DdlExporter
+        (EXECUTE 'CREATE DOMAIN ...' with ''-escaped quotes) define their
+        domain; validation expecting it must pass.
+        """
+        do_block = DdlExporter._format_domain_postgres_ddl(
+            'status_dom', 'VARCHAR(10)', None, False, None
+        )
+        self.assertIn('EXECUTE', do_block)
+        defined = extract_defined_objects(do_block, 'DOMAIN')
+        self.assertIn('STATUS_DOM', defined)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dom_file = os.path.join(tmpdir, DumpFiles.DOMAINS_PG)
+            with open(dom_file, "w", encoding="utf-8") as f:
+                f.write(do_block)
+            for cat in [DumpFiles.PROCEDURES_PG, DumpFiles.VIEWS_PG, DumpFiles.TRIGGERS_PG]:
+                with open(os.path.join(tmpdir, cat), "w", encoding="utf-8") as f:
+                    f.write("/* EMPTY */\n")
+
+            self.migrator.ddl_exporter.get_source_objects = MagicMock(return_value={
+                DumpFiles.DOMAINS_PG: ["STATUS_DOM"],
+                DumpFiles.PROCEDURES_PG: [],
+                DumpFiles.VIEWS_PG: [],
+                DumpFiles.TRIGGERS_PG: [],
+            })
+
+            verified = self.migrator.validate_artifacts(output_dir=tmpdir)
+            self.assertFalse(verified[DumpFiles.DOMAINS_PG])
+
 
 if __name__ == "__main__":
     unittest.main()

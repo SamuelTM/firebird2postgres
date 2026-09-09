@@ -6,57 +6,170 @@ from .sql_splitter import split_sql_statements
 logger = logging.getLogger(__name__)
 
 
-def extract_defined_objects(content: str, object_type: str = None) -> set[str]:
+_DOLLAR_TAG_RE = re.compile(r'\$[a-zA-Z0-9_]*\$')
+_DO_OPEN_RE = re.compile(r'\bDO\s*$', re.IGNORECASE)
+_EXECUTE_BEFORE_STRING_RE = re.compile(r'\bEXECUTE\s*$', re.IGNORECASE)
+_CREATE_LEAD_RE = re.compile(r'^\s*CREATE\b', re.IGNORECASE)
+
+# Quoted identifier aware of "" escapes: "a""b" is one identifier (a"b).
+_QUOTED_IDENT = r'"((?:[^"]|"")+)"'
+_BARE_IDENT = r'([\w$]+)'
+_QUALIFIER = r'(?:(?:"(?:[^"]|"")+"|[\w$]+)\.)?'
+
+
+def _lex_sql(content: str) -> list[tuple]:
     """
-    Extracts defined object names from PostgreSQL DDL content, normalized to uppercase.
-    Handles schema-qualified names, quoted identifiers, and DO EXECUTE blocks.
+    Lexes SQL into segments without executing anything.
+
+    Returns a list of segments:
+    - ('code', text): executable code (comments removed, quoted identifiers kept verbatim).
+    - ('string', raw, value): single-quoted literal with '' unescaped to '.
+    - ('dollar', raw, (tag, body)): dollar-quoted body with its opening tag.
+    String contents, comment contents and dollar bodies never leak into 'code'.
     """
-    clean = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
-    clean = re.sub(r'--[^\n]*', '', clean)
+    segs: list[tuple] = []
+    buf: list[str] = []
+    i, n = 0, len(content)
 
-    ot = (object_type or '').upper()
-    patterns = []
+    def flush_code() -> None:
+        if buf:
+            segs.append(('code', ''.join(buf)))
+            del buf[:]
 
-    if not ot or ot in ('PROCEDURE', 'PROCEDURES', 'FUNCTION', 'FUNCTIONS'):
-        patterns.append(
-            ('PROCEDURE', re.compile(
-                r'\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:FUNCTION|PROCEDURE)\s+(?:(?:"[^"]+"|[\w$]+)\.)?(?:"([^"]+)"|([\w$]+))',
-                re.IGNORECASE
-            ))
-        )
-    if not ot or ot in ('VIEW', 'VIEWS'):
-        patterns.append(
-            ('VIEW', re.compile(
-                r'\bCREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+(?:(?:"[^"]+"|[\w$]+)\.)?(?:"([^"]+)"|([\w$]+))',
-                re.IGNORECASE
-            ))
-        )
-    if not ot or ot in ('TRIGGER', 'TRIGGERS'):
-        patterns.append(
-            ('TRIGGER', re.compile(
-                r'\bCREATE\s+TRIGGER\s+(?:(?:"[^"]+"|[\w$]+)\.)?(?:"([^"]+)"|([\w$]+))',
-                re.IGNORECASE
-            ))
-        )
-    if not ot or ot in ('DOMAIN', 'DOMAINS'):
-        patterns.append(
-            ('DOMAIN', re.compile(
-                r'\bCREATE\s+DOMAIN\s+(?:(?:"[^"]+"|[\w$]+)\.)?(?:"([^"]+)"|([\w$]+))',
-                re.IGNORECASE
-            ))
-        )
-    if not ot or ot in ('SEQUENCE', 'SEQUENCES', 'GENERATOR', 'GENERATORS'):
-        patterns.append(
-            ('SEQUENCE', re.compile(
-                r'\bCREATE\s+SEQUENCE\s+(?:(?:"[^"]+"|[\w$]+)\.)?(?:"([^"]+)"|([\w$]+))',
-                re.IGNORECASE
-            ))
-        )
+    while i < n:
+        ch = content[i]
+        nxt = content[i + 1] if i + 1 < n else ''
 
+        if ch == '-' and nxt == '-':
+            flush_code()
+            j = content.find('\n', i)
+            j = n if j == -1 else j
+            i = j
+            continue
+
+        if ch == '/' and nxt == '*':
+            flush_code()
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if content[j] == '/' and j + 1 < n and content[j + 1] == '*':
+                    depth += 1
+                    j += 2
+                elif content[j] == '*' and j + 1 < n and content[j + 1] == '/':
+                    depth -= 1
+                    j += 2
+                else:
+                    j += 1
+            i = j
+            continue
+
+        if ch == "'":
+            flush_code()
+            j, val = i + 1, []
+            while j < n:
+                if content[j] == "'":
+                    if j + 1 < n and content[j + 1] == "'":
+                        val.append("'")
+                        j += 2
+                    else:
+                        j += 1
+                        break
+                else:
+                    val.append(content[j])
+                    j += 1
+            segs.append(('string', content[i:j], ''.join(val)))
+            i = j
+            continue
+
+        if ch == '"':
+            # Quoted identifier: kept verbatim inside code so qualified
+            # names stay matchable; "" escapes are resolved at capture time.
+            # Consumed whole so ' and $ inside never open strings/bodies.
+            j = i + 1
+            while j < n:
+                if content[j] == '"':
+                    if j + 1 < n and content[j + 1] == '"':
+                        j += 2
+                    else:
+                        j += 1
+                        break
+                else:
+                    j += 1
+            buf.append(content[i:j])
+            i = j
+            continue
+
+        if ch == '$':
+            m = _DOLLAR_TAG_RE.match(content, i)
+            if m:
+                tag = m.group(0)
+                end = content.find(tag, i + len(tag))
+                if end != -1:
+                    flush_code()
+                    segs.append(('dollar', content[i:end + len(tag)],
+                                 (tag, content[i + len(tag):end])))
+                    i = end + len(tag)
+                    continue
+            buf.append(ch)
+            i += 1
+            continue
+
+        buf.append(ch)
+        i += 1
+
+    flush_code()
+    return segs
+
+
+def _scan_ddl_text(text: str, _depth: int = 0) -> tuple[str, list[str]]:
+    """
+    Splits DDL text into top-level code plus dynamic DDL literals.
+
+    Returns (code_text, executed_ddls) where code_text contains no comments,
+    no string contents and no dollar-quoted bodies, and executed_ddls holds
+    the decoded value of every string literal immediately following EXECUTE
+    (the exporter's DO-block idiom: EXECUTE 'CREATE DOMAIN ...'), plus the
+    same for DO bodies scanned recursively. Dollar bodies that do not belong
+    to DO are function/procedure implementations and are discarded.
+    """
+    if _depth > 5:
+        return '', []
+    code_parts: list[str] = []
+    executed: list[str] = []
+    segs = _lex_sql(text)
+    for idx, seg in enumerate(segs):
+        kind = seg[0]
+        if kind == 'code':
+            code_parts.append(seg[1])
+        elif kind == 'string':
+            prev_code = None
+            for back in range(idx - 1, -1, -1):
+                if segs[back][0] == 'code':
+                    prev_code = segs[back][1]
+                    break
+            if prev_code is not None and _EXECUTE_BEFORE_STRING_RE.search(prev_code):
+                value = seg[2]
+                if _CREATE_LEAD_RE.match(value):
+                    executed.append(value)
+        elif kind == 'dollar':
+            prev_code = None
+            for back in range(idx - 1, -1, -1):
+                if segs[back][0] == 'code':
+                    prev_code = segs[back][1]
+                    break
+            if prev_code is not None and _DO_OPEN_RE.search(prev_code):
+                _, nested_exec = _scan_ddl_text(seg[2][1], _depth + 1)
+                executed.extend(nested_exec)
+    return ' '.join(code_parts), executed
+
+
+def _match_creates(code_text: str, patterns: list[tuple]) -> set[str]:
+    """Runs CREATE-object patterns over code-only text, unescaping "" quotes."""
     defined = set()
     for cat, pat in patterns:
-        for m in pat.finditer(clean):
+        for m in pat.finditer(code_text):
             raw_name = (m.group(1) or m.group(2)).strip()
+            if m.group(1):
+                raw_name = raw_name.replace('""', '"')
             upper_name = raw_name.upper()
             defined.add(upper_name)
             if cat == 'TRIGGER':
@@ -67,7 +180,76 @@ def extract_defined_objects(content: str, object_type: str = None) -> set[str]:
                 # Strip _dom suffix if present due to collision resolution
                 stripped = re.sub(r'(_dom)+$', '', raw_name, flags=re.IGNORECASE).upper()
                 defined.add(stripped)
+    return defined
 
+
+def _build_patterns(object_type: str = None) -> list[tuple]:
+    ot = (object_type or '').upper()
+    patterns = []
+
+    if not ot or ot in ('PROCEDURE', 'PROCEDURES', 'FUNCTION', 'FUNCTIONS'):
+        patterns.append(
+            ('PROCEDURE', re.compile(
+                r'\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:FUNCTION|PROCEDURE)\s+'
+                + _QUALIFIER + r'(?:' + _QUOTED_IDENT + r'|' + _BARE_IDENT + r')',
+                re.IGNORECASE
+            ))
+        )
+    if not ot or ot in ('VIEW', 'VIEWS'):
+        patterns.append(
+            ('VIEW', re.compile(
+                r'\bCREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+'
+                + _QUALIFIER + r'(?:' + _QUOTED_IDENT + r'|' + _BARE_IDENT + r')',
+                re.IGNORECASE
+            ))
+        )
+    if not ot or ot in ('TRIGGER', 'TRIGGERS'):
+        patterns.append(
+            ('TRIGGER', re.compile(
+                r'\bCREATE\s+TRIGGER\s+'
+                + _QUALIFIER + r'(?:' + _QUOTED_IDENT + r'|' + _BARE_IDENT + r')',
+                re.IGNORECASE
+            ))
+        )
+    if not ot or ot in ('DOMAIN', 'DOMAINS'):
+        patterns.append(
+            ('DOMAIN', re.compile(
+                r'\bCREATE\s+DOMAIN\s+'
+                + _QUALIFIER + r'(?:' + _QUOTED_IDENT + r'|' + _BARE_IDENT + r')',
+                re.IGNORECASE
+            ))
+        )
+    if not ot or ot in ('SEQUENCE', 'SEQUENCES', 'GENERATOR', 'GENERATORS'):
+        patterns.append(
+            ('SEQUENCE', re.compile(
+                r'\bCREATE\s+SEQUENCE\s+'
+                + _QUALIFIER + r'(?:' + _QUOTED_IDENT + r'|' + _BARE_IDENT + r')',
+                re.IGNORECASE
+            ))
+        )
+    return patterns
+
+
+def extract_defined_objects(content: str, object_type: str = None) -> set[str]:
+    """
+    Extracts defined object names from PostgreSQL DDL content, normalized to uppercase.
+
+    Only real definitions count: string literals, comments and dollar-quoted
+    function/procedure bodies are invisible to the matcher, so text such as
+    RAISE NOTICE 'CREATE FUNCTION p2()' never fabricates an object. The one
+    exception is the exporter's DO-block idiom EXECUTE 'CREATE ...', whose
+    literal is real DDL executed when the file is applied. Handles
+    schema-qualified names and "" escaped quotes inside identifiers.
+    """
+    patterns = _build_patterns(object_type)
+    code_text, executed_ddls = _scan_ddl_text(content)
+    defined = _match_creates(code_text, patterns)
+    for ddl in executed_ddls:
+        sub_code, nested = _scan_ddl_text(ddl)
+        defined |= _match_creates(sub_code, patterns)
+        for sub in nested:
+            sub_code2, _ = _scan_ddl_text(sub)
+            defined |= _match_creates(sub_code2, patterns)
     return defined
 
 
