@@ -260,9 +260,27 @@ def _write_text_value_chunked(
     return total_bytes
 
 
+def _estimate_text_bytes(val: str) -> int:
+    """
+    Guaranteed upper bound of the COPY-serialized size of a text value:
+    UTF-8 bytes plus one extra byte per escapable character (\\, \\n, \\r,
+    \\t). Pure ASCII is measured exactly (C-fast); anything else budgets
+    4 bytes per character (UTF-8 maximum), since multibyte characters are
+    never escapable. NUL stripping only shrinks the output.
+    """
+    if val.isascii():
+        return (len(val) + val.count('\\') + val.count('\n')
+                + val.count('\r') + val.count('\t'))
+    return len(val) * 4
+
+
 def _estimate_row_bytes(row, max_blob_bytes: int = None) -> int:
     """
-    Lightweight estimation of serialized row bytes for buffer management.
+    Guaranteed upper bound of the serialized row size for buffer management.
+    Combined with the pre-flush check and the per-row cap, COPY buffers
+    handed to the driver never exceed max_buffer_bytes: a row starts on an
+    empty buffer whenever buf + estimate would overflow, and a single row
+    larger than the budget is rejected instead of delivered.
     For seekable streams (BytesIO/StringIO) measures exact length without
     consuming; for opaque driver streams uses length/size hints when present,
     otherwise assumes the worst case (max_blob serialized) so a multi-BLOB
@@ -275,15 +293,19 @@ def _estimate_row_bytes(row, max_blob_bytes: int = None) -> int:
         elif isinstance(val, (bytes, bytearray, memoryview)):
             est += len(val) * 2 + 3  # \\x prefix + hex chars
         elif isinstance(val, str):
-            est += len(val) * 3      # upper bound for UTF-8 without re-encoding
+            est += _estimate_text_bytes(val)
         elif hasattr(val, 'read'):
             hint = getattr(val, 'length', 0) or getattr(val, 'size', 0) or 0
+            hint_is_bytes = False
             if not hint:
                 try:
                     if hasattr(val, 'getvalue'):
-                        hint = len(val.getvalue())
+                        content = val.getvalue()
+                        hint = len(content)
+                        hint_is_bytes = isinstance(content, (bytes, bytearray, memoryview))
                     elif hasattr(val, 'getbuffer'):
                         hint = val.getbuffer().nbytes
+                        hint_is_bytes = True
                 except Exception:
                     hint = 0
             if not hint and hasattr(val, 'seek') and hasattr(val, 'tell'):
@@ -295,8 +317,9 @@ def _estimate_row_bytes(row, max_blob_bytes: int = None) -> int:
                 except Exception:
                     hint = 0
             if hint:
-                # Serialized upper bound (hex doubles binary, escapes expand text)
-                est += hint * 2 + 16
+                # Bytes serialize at most 2x (binary hex); text of unknown
+                # encoding budgets 4x (UTF-8 maximum per character).
+                est += hint * (2 if hint_is_bytes else 4) + 16
             elif max_blob_bytes:
                 est += max_blob_bytes * 2 + 16
             else:
@@ -306,6 +329,46 @@ def _estimate_row_bytes(row, max_blob_bytes: int = None) -> int:
         else:
             est += 32
     return est
+
+
+def _reject_oversized_blobs(fb_cur, table: Table, cols_to_import: list,
+                            max_blob_bytes: int,
+                            blob_domains: set[str] = None) -> None:
+    """
+    Server-side guardrail: rejects the table when any stored BLOB exceeds
+    max_blob_bytes, BEFORE the driver materializes a single BLOB.
+
+    The installed Firebird driver fully materializes every BLOB column as
+    soon as fetchmany() returns, so the chunked per-BLOB checks during
+    serialization come too late to bound driver-side allocation. A single
+    aggregate query (MAX over OCTET_LENGTH per BLOB column, computed
+    server-side without transferring blob bytes) proves all values fit.
+    Values that are not plain ints (e.g. unconfigured test doubles) are
+    ignored here; the streaming checks remain the backstop for them.
+    """
+    if max_blob_bytes is None or max_blob_bytes <= 0:
+        return
+    blob_cols = [c for c in cols_to_import if is_blob_column(c, blob_domains)]
+    if not blob_cols:
+        return
+    max_exprs = ", ".join(
+        f'MAX(OCTET_LENGTH({pg_quote_ident(c.name)}))' for c in blob_cols
+    )
+    fb_cur.execute(
+        f'SELECT {max_exprs} FROM {pg_quote_ident(table.name)}'
+    )
+    row = fb_cur.fetchone()
+    if not row:
+        return
+    for col, max_len in zip(blob_cols, row):
+        if isinstance(max_len, bool) or not isinstance(max_len, int):
+            continue
+        if max_len > max_blob_bytes:
+            raise ValueError(
+                f"BLOB in column '{col.name}' exceeds maximum allowed size of "
+                f"{max_blob_bytes} bytes (stored maximum is {max_len} bytes, "
+                f"table '{table.name}'). Rejected before driver materialization."
+            )
 
 
 def _import_single_table(
@@ -347,6 +410,19 @@ def _import_single_table(
         )
     logger.info(f"Importing data for '{table.name}'...")
 
+    # Explicitly list columns to ensure it perfectly matches the postgres insert order.
+    # Exclude computed (GENERATED ALWAYS) columns, as PostgreSQL forbids inserting into them directly.
+    cols_to_import = [col for col in table.columns if not col.computed_source]
+    col_names = [col.name for col in cols_to_import]
+    fb_column_names = [pg_quote_ident(col.name) for col in cols_to_import]
+    fb_columns_str = ", ".join(fb_column_names)
+
+    pg_column_names = [pg_quote_ident(col.pg_name) for col in cols_to_import]
+    pg_columns_str = ", ".join(pg_column_names)
+
+    # Fail before any target write and before the driver materializes blobs.
+    _reject_oversized_blobs(fb_cur, table, cols_to_import, max_blob_bytes, blob_domains)
+
     # Clean existing table data (no CASCADE: constraints don't exist at this pipeline stage,
     # and CASCADE would be dangerous with concurrent workers if they did)
     pg_cur.execute(f'TRUNCATE TABLE {pg_quote_ident(table.pg_name)};')
@@ -363,16 +439,6 @@ def _import_single_table(
             f"{max_buffer_bytes // (1024 * 1024)}MB serialized buffer budget "
             f"and {max_blob_bytes // (1024 * 1024)}MB max BLOB limit."
         )
-
-    # Explicitly list columns to ensure it perfectly matches the postgres insert order.
-    # Exclude computed (GENERATED ALWAYS) columns, as PostgreSQL forbids inserting into them directly.
-    cols_to_import = [col for col in table.columns if not col.computed_source]
-    col_names = [col.name for col in cols_to_import]
-    fb_column_names = [pg_quote_ident(col.name) for col in cols_to_import]
-    fb_columns_str = ", ".join(fb_column_names)
-
-    pg_column_names = [pg_quote_ident(col.pg_name) for col in cols_to_import]
-    pg_columns_str = ", ".join(pg_column_names)
 
     fb_cur.execute(f'SELECT {fb_columns_str} FROM {pg_quote_ident(table.name)}')
     copy_sql = f'COPY {pg_quote_ident(table.pg_name)} ({pg_columns_str}) FROM STDIN WITH (FORMAT text, NULL \'\\N\')'

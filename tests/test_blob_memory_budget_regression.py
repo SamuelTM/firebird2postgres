@@ -9,12 +9,19 @@ from config import MigrationConfig
 from engine.data_migrator import (
     DataMigrator,
     SerializedByteBuffer,
+    _estimate_row_bytes,
     _import_single_table,
     is_blob_column,
     is_binary_column,
 )
 from engine.database_migrator import DatabaseMigrator
 from models import Column, Table
+from tests.db_isolation import (
+    get_test_firebird_connection,
+    require_live_firebird,
+    requires_firebird,
+    unique_name,
+)
 
 
 def _worker_measure_peak_memory(queue, blob_size, max_buffer_bytes, max_blob_bytes):
@@ -697,6 +704,296 @@ class TestBlobMemoryBudgetRegression(unittest.TestCase):
             agg_peak, total,
             f"Aggregated peak ({agg_peak / (1024*1024):.2f}MB) exceeds total budget "
             f"({total / (1024*1024):.2f}MB)!",
+        )
+
+    def test_estimate_is_upper_bound_for_unicode_text(self):
+        """
+        P2: 3 bytes/char underestimates 4-byte emoji. The estimator must be
+        a guaranteed upper bound of the serialized bytes on every branch.
+        """
+        cases = [
+            'plain ascii',
+            'back\\slash\ttab\nnewline\rcarriage',
+            'Ação e Atenção à兄弟',  # 2- and 3-byte chars
+            '🚀🔥🐘' * 50,  # 4-byte emoji
+            'mix 🚀 text\nwith\tescapes e acentuação çãõ',
+            'NUL\x00inside\x00text',
+            'x"quoted" \'sq\' \\ end',
+        ]
+        for col_type in ('VARCHAR(5000)', 'BLOB SUBTYPE 1'):
+            for text in cases:
+                table = Table('TAB_EST')
+                table.columns.append(Column('ID', 'INTEGER', nullable=False))
+                table.columns.append(Column('TXT', col_type, nullable=True))
+                mock_fb_cur = MagicMock()
+                mock_pg_cur = MagicMock()
+                mock_pg_con = MagicMock()
+                mock_fb_cur.fetchmany.side_effect = [[(1, text)], []]
+                estimate = _estimate_row_bytes((1, text), 32 * 1024 * 1024)
+                rows, _ = _import_single_table(
+                    table, mock_fb_cur, mock_pg_cur, mock_pg_con,
+                    max_buffer_bytes=64 * 1024 * 1024,
+                    max_blob_bytes=32 * 1024 * 1024,
+                )
+                self.assertEqual(rows, 1)
+                buf = mock_pg_cur.copy_expert.call_args[0][1]
+                self.assertLessEqual(
+                    buf.byte_count, estimate,
+                    f"Estimate {estimate} below actual {buf.byte_count} for {col_type} {text[:20]!r}",
+                )
+
+    def test_copy_buffers_never_exceed_budget_unicode_and_multi_blob(self):
+        """
+        P2: the 1203-bytes-delivered-on-1150-limit hole. Across several
+        flushes mixing emoji text and multiple binary BLOBs per row, every
+        buffer handed to COPY must stay within the worker budget.
+        """
+        table = Table('TAB_CAP')
+        table.columns.append(Column('ID', 'INTEGER', nullable=False))
+        table.columns.append(Column('TXT', 'BLOB SUBTYPE 1', nullable=True))
+        table.columns.append(Column('A', 'BLOB SUBTYPE 0', nullable=True))
+        table.columns.append(Column('B', 'BLOB SUBTYPE 0', nullable=True))
+
+        max_buffer = 1150
+        # ~300B text (emoji-heavy) + 2x150B blobs serialize to ~920B/row.
+        rows = [
+            (1, 'Olá 🚀 mundo ' * 20, b'A' * 150, b'B' * 150),
+            (2, 'Linha 🔥 dois ' * 20, b'C' * 150, b'D' * 150),
+            (3, 'Linha 🐘 três ' * 20, b'E' * 150, b'F' * 150),
+        ]
+        mock_fb_cur = MagicMock()
+        mock_pg_cur = MagicMock()
+        mock_pg_con = MagicMock()
+        mock_fb_cur.fetchmany.side_effect = [rows, []]
+
+        total, _ = _import_single_table(
+            table, mock_fb_cur, mock_pg_cur, mock_pg_con,
+            max_buffer_bytes=max_buffer, max_blob_bytes=500,
+        )
+        self.assertEqual(total, 3)
+        # Several incremental flushes happened...
+        self.assertGreaterEqual(mock_pg_cur.copy_expert.call_count, 2)
+        # ...and none delivered a buffer above the limit.
+        for call in mock_pg_cur.copy_expert.call_args_list:
+            buf = call[0][1]
+            self.assertLessEqual(
+                buf.byte_count, max_buffer,
+                f"COPY buffer of {buf.byte_count} bytes exceeds {max_buffer} budget",
+            )
+        # Exact content survived the chunked path (emoji roundtrip).
+        combined = ''.join(c[0][1].getvalue() for c in mock_pg_cur.copy_expert.call_args_list)
+        self.assertIn('Olá 🚀 mundo', combined.replace('\\n', '\n'))
+
+
+class _FakePgCur:
+    """Minimal COPY-capturing cursor (spawn-picklable, no PG server needed)."""
+
+    def __init__(self):
+        self.copies = []
+        self.executed = []
+
+    def execute(self, sql, params=None):
+        self.executed.append(sql)
+
+    def copy_expert(self, sql, buf):
+        buf.seek(0)
+        self.copies.append(buf.getvalue())
+
+
+class _FakePgConn:
+    """Minimal connection stub around _FakePgCur."""
+
+    def __init__(self):
+        self.cur = _FakePgCur()
+        self.commits = 0
+
+    def cursor(self):
+        return self.cur
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        pass
+
+
+class _CountingFbCur:
+    """Wraps a real Firebird cursor counting fetchmany calls (built in-child)."""
+
+    def __init__(self, real_cur):
+        self._cur = real_cur
+        self.fetchmany_calls = 0
+
+    def execute(self, *args, **kwargs):
+        return self._cur.execute(*args, **kwargs)
+
+    def fetchmany(self, size):
+        self.fetchmany_calls += 1
+        return self._cur.fetchmany(size)
+
+    def fetchone(self):
+        return self._cur.fetchone()
+
+    def fetchall(self):
+        return self._cur.fetchall()
+
+
+def _rss_peak_bytes():
+    """Peak RSS of this process in bytes (ru_maxrss units differ per OS)."""
+    import resource
+    import sys
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak if sys.platform == 'darwin' else peak * 1024
+
+
+def _child_real_driver_import(queue, table_name, max_buffer_bytes, max_blob_bytes):
+    """
+    Spawn target: runs _import_single_table with the REAL Firebird driver
+    (which materializes BLOBs inside fetchmany) and a fake PG side, so the
+    measured peak covers driver read + serialization + COPY buffering.
+    Reports RSS peak delta, fetchmany count and copied content.
+    """
+    from engine.data_migrator import _import_single_table
+    from models import Column, Table
+    from tests.db_isolation import get_test_firebird_connection
+
+    table = Table(table_name)
+    table.columns.append(Column('ID', 'INTEGER', nullable=False))
+    table.columns.append(Column('PAYLOAD', 'BLOB SUBTYPE 0', nullable=True))
+
+    fb_con = get_test_firebird_connection()
+    fb_cur = _CountingFbCur(fb_con.cursor())
+    pg_con = _FakePgConn()
+    baseline = _rss_peak_bytes()
+    try:
+        rows, _ = _import_single_table(
+            table, fb_cur, pg_con.cur, pg_con,
+            max_buffer_bytes=max_buffer_bytes,
+            max_blob_bytes=max_blob_bytes,
+        )
+        copies = list(pg_con.cur.copies)
+        queue.put({
+            'success': True,
+            'rows': rows,
+            'peak_delta': _rss_peak_bytes() - baseline,
+            'fetchmany_calls': fb_cur.fetchmany_calls,
+            'copy_sizes': [len(c.encode('utf-8')) for c in copies],
+            'copy_count': len(copies),
+            'head_hex': copies[0][:256] if copies else '',
+        })
+    except Exception as exc:
+        queue.put({
+            'success': False,
+            'error': f"{type(exc).__name__}: {exc}",
+            'peak_delta': _rss_peak_bytes() - baseline,
+            'fetchmany_calls': fb_cur.fetchmany_calls,
+        })
+    finally:
+        try:
+            fb_con.close()
+        except Exception:
+            pass
+
+
+class TestRealDriverMemoryBudget(unittest.TestCase):
+    """
+    P2: BytesIO/tracemalloc cannot prove the real-driver path, whose C
+    allocations tracemalloc never sees and which materializes whole BLOBs
+    in fetchmany. These spawn a fresh process, drive the REAL Firebird
+    driver through read + serialization + COPY buffering, and bound the
+    RSS peak delta.
+    """
+
+    def _make_blob_table(self, payload_bytes):
+        from tests.db_isolation import get_test_firebird_connection as _connect
+        fb_con = _connect()
+        try:
+            table_name = unique_name('MEM_BLOB').upper()
+            cur = fb_con.cursor()
+            cur.execute(f"CREATE TABLE {table_name} (ID INTEGER, PAYLOAD BLOB SUB_TYPE 0)")
+            fb_con.commit()
+            cur.execute(f"INSERT INTO {table_name} VALUES (?, ?)", (1, payload_bytes))
+            fb_con.commit()
+        finally:
+            try:
+                fb_con.close()
+            except Exception:
+                pass
+        return table_name
+
+    def _drop_blob_table(self, table_name):
+        from tests.db_isolation import get_test_firebird_connection as _connect
+        # Fresh connection: the loader connection caches prepared statements
+        # keeping an "interest" that would block DROP TABLE as "in use".
+        fb_con = _connect()
+        try:
+            cur = fb_con.cursor()
+            cur.execute(f"DROP TABLE {table_name}")
+            fb_con.commit()
+        finally:
+            try:
+                fb_con.close()
+            except Exception:
+                pass
+
+    def _run_child(self, table_name, max_buffer_bytes, max_blob_bytes):
+        ctx = multiprocessing.get_context('spawn')
+        queue = ctx.Queue()
+        proc = ctx.Process(
+            target=_child_real_driver_import,
+            args=(queue, table_name, max_buffer_bytes, max_blob_bytes),
+        )
+        proc.start()
+        try:
+            return queue.get(timeout=180)
+        finally:
+            proc.join(timeout=60)
+
+    @requires_firebird
+    def test_real_driver_import_bounds_rss_peak(self):
+        """
+        2 MiB BLOB through the real driver: read + hex serialization + COPY
+        buffering peak stays bounded (bytes + hex + buffer + driver copy).
+        """
+        blob = os.urandom(2 * 1024 * 1024)
+        table_name = self._make_blob_table(blob)
+        try:
+            res = self._run_child(table_name, 8 * 1024 * 1024, 4 * 1024 * 1024)
+        finally:
+            self._drop_blob_table(table_name)
+        self.assertTrue(res.get('success'), f"Child failed: {res.get('error')}")
+        self.assertEqual(res.get('rows'), 1)
+        self.assertLess(
+            res.get('peak_delta'), 48 * 1024 * 1024,
+            f"RSS peak delta ({res['peak_delta'] / (1024 * 1024):.1f}MiB) exceeds bound "
+            f"for a 2MiB BLOB under an 8MiB worker budget",
+        )
+        self.assertLessEqual(max(res.get('copy_sizes')), 8 * 1024 * 1024)
+        self.assertIn(blob.hex()[:64], res.get('head_hex'))
+
+    @requires_firebird
+    def test_real_driver_rejects_oversized_blob_before_materialization(self):
+        """
+        3 MiB stored BLOB with a 1 MiB limit: the server-side MAX pre-check
+        rejects before fetchmany ever runs, so the driver never allocates
+        the blob and the RSS peak stays flat.
+        """
+        blob = os.urandom(3 * 1024 * 1024)
+        table_name = self._make_blob_table(blob)
+        try:
+            res = self._run_child(table_name, 8 * 1024 * 1024, 1 * 1024 * 1024)
+        finally:
+            self._drop_blob_table(table_name)
+        self.assertFalse(res.get('success'))
+        self.assertIn('exceeds maximum allowed size', res.get('error'))
+        self.assertEqual(
+            res.get('fetchmany_calls'), 0,
+            "Oversized BLOB must be rejected before any fetchmany materializes it",
+        )
+        self.assertLess(
+            res.get('peak_delta'), 2 * 1024 * 1024,
+            f"RSS peak delta ({res['peak_delta'] / (1024 * 1024):.2f}MiB) shows "
+            f"the 3MiB BLOB was materialized despite the limit",
         )
 
 

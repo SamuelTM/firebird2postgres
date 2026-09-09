@@ -26,8 +26,19 @@ class TestDataMigrator(unittest.TestCase):
         self.migrator = DataMigrator(self.mock_fb_con, self.mock_pg_con)
 
     def _prove_frozen_source(self):
-        """Configures an explicit read-only source: MON$READ_ONLY=1, 0 attachments."""
-        self.mock_fb_cur.fetchone.side_effect = [(1, 0), (0,)]
+        """
+        Configures an explicit read-only source: MON$READ_ONLY=1, 0 attachments.
+        Later fetchone calls (e.g. the BLOB pre-check aggregate) yield None,
+        meaning "no rows / no maximum", never StopIteration on the shared mock.
+        """
+        frozen_rows = [(1, 0), (0,)]
+
+        def _fetchone_next():
+            if frozen_rows:
+                return frozen_rows.pop(0)
+            return None
+
+        self.mock_fb_cur.fetchone.side_effect = _fetchone_next
 
     def test_data_migration_sanitizes_nul_bytes_only_when_present(self):
         table = Table('CLIENTES')

@@ -331,7 +331,11 @@ class TestTypeMetadataRegression(unittest.TestCase):
         mock_fb_cur = MagicMock()
         mock_fb_con.cursor.return_value = mock_fb_cur
         # Explicit frozen-source proof (production rejects bare mocks).
-        mock_fb_cur.fetchone.side_effect = [(1, 0), (0,)]
+        # Later fetchone calls (BLOB pre-check aggregate) yield None.
+        _frozen_rows = [(1, 0), (0,)]
+        mock_fb_cur.fetchone.side_effect = (
+            lambda: _frozen_rows.pop(0) if _frozen_rows else None
+        )
         mock_fb_cur.fetchmany.side_effect = [
             [
                 (1, payload_1, payload_1),
