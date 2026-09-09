@@ -22,15 +22,31 @@ class MockFirebirdError(firebirdsql.Error):
 
 class TestSequenceIncrementFallbackRegression(unittest.TestCase):
     def test_is_column_not_found_error_distinguishes_column_from_other_errors(self):
-        # Column unknown by sql_code (-206) or gds_code (isc_dsql_field_err: 335544569)
-        err_sql_code = MockFirebirdError("Dynamic SQL Error", sql_code=-206)
+        # Specific evidence only: -206 naming the column as unknown, or the
+        # specific facility code 335544578 (dsql_field_err) with the name.
+        err_sql_code = MockFirebirdError(
+            "Dynamic SQL Error SQL error code = -206 Column unknown -RDB$GENERATOR_INCREMENT",
+            sql_code=-206,
+        )
         self.assertTrue(is_column_not_found_error(err_sql_code, "RDB$GENERATOR_INCREMENT"))
 
-        err_gds_code = MockFirebirdError("Dynamic SQL Error", gds_codes=[335544569])
+        err_gds_code = MockFirebirdError(
+            "Dynamic SQL Error Column unknown RDB$GENERATOR_INCREMENT",
+            sql_code=-206,
+            gds_codes=[335544569, 335544578],
+        )
         self.assertTrue(is_column_not_found_error(err_gds_code, "RDB$GENERATOR_INCREMENT"))
 
         err_msg = MockFirebirdError("Dynamic SQL Error: Column unknown RDB$GENERATOR_INCREMENT")
         self.assertTrue(is_column_not_found_error(err_msg, "RDB$GENERATOR_INCREMENT"))
+
+        # The generic wrapper 335544569 alone proves nothing.
+        err_generic_gds = MockFirebirdError("Dynamic SQL Error", gds_codes=[335544569])
+        self.assertFalse(is_column_not_found_error(err_generic_gds, "RDB$GENERATOR_INCREMENT"))
+
+        # -206 alone, without naming the column, is not specific evidence.
+        err_bare_code = MockFirebirdError("Dynamic SQL Error", sql_code=-206)
+        self.assertFalse(is_column_not_found_error(err_bare_code, "RDB$GENERATOR_INCREMENT"))
 
         # Permission errors must never allow fallback
         err_perm = MockFirebirdError("no permission for read access to COLUMN RDB$GENERATOR_INCREMENT", sql_code=-551)
@@ -45,6 +61,61 @@ class TestSequenceIncrementFallbackRegression(unittest.TestCase):
 
         # Non-firebirdsql error must never allow fallback
         self.assertFalse(is_column_not_found_error(RuntimeError("Unknown column"), "RDB$GENERATOR_INCREMENT"))
+
+    def test_syntax_error_with_generic_wrapper_aborts_instead_of_fallback(self):
+        """
+        P1 regression: a -104 syntax error carries the generic 335544569
+        wrapper. It must abort extraction, never fall back to increment 1.
+        """
+        syntax_err = MockFirebirdError(
+            "Dynamic SQL Error SQL error code = -104 Token unknown",
+            sql_code=-104,
+            gds_codes=[335544569, 335544436],
+        )
+        self.assertFalse(
+            is_column_not_found_error(syntax_err, "RDB$GENERATOR_INCREMENT"))
+
+        mock_cursor = MagicMock()
+        mock_cursor.execute.side_effect = syntax_err
+        with self.assertRaises(RuntimeError) as cm:
+            fetch_all_sequence_increments(mock_cursor)
+        self.assertIn("Failed to fetch sequence increments from Firebird", str(cm.exception))
+        # The fallback query must never run: only the failing statement.
+        self.assertEqual(mock_cursor.execute.call_count, 1)
+
+    def test_other_missing_column_aborts_instead_of_fallback(self):
+        """
+        P1 regression: -206 naming a DIFFERENT column is not evidence that
+        RDB$GENERATOR_INCREMENT is absent. Extraction must abort.
+        """
+        other_col_err = MockFirebirdError(
+            "Dynamic SQL Error SQL error code = -206 Column unknown -RDB$SOMETHING_ELSE",
+            sql_code=-206,
+            gds_codes=[335544569, 335544578],
+        )
+        self.assertFalse(
+            is_column_not_found_error(other_col_err, "RDB$GENERATOR_INCREMENT"))
+
+        mock_cursor = MagicMock()
+        mock_cursor.execute.side_effect = other_col_err
+        with self.assertRaises(RuntimeError) as cm:
+            fetch_all_sequence_increments(mock_cursor)
+        self.assertIn("Failed to fetch sequence increments from Firebird", str(cm.exception))
+
+    def test_catalog_failure_aborts_instead_of_fallback(self):
+        """
+        P1 regression: a catalog failure with no column-unknown evidence
+        (e.g. corrupt database) must halt extraction/export, not default.
+        """
+        catalog_err = MockFirebirdError("I/O error during read operation on database file")
+        self.assertFalse(
+            is_column_not_found_error(catalog_err, "RDB$GENERATOR_INCREMENT"))
+
+        mock_cursor = MagicMock()
+        mock_cursor.execute.side_effect = catalog_err
+        with self.assertRaises(RuntimeError) as cm:
+            fetch_all_sequence_increments(mock_cursor)
+        self.assertIn("Failed to fetch sequence increments from Firebird", str(cm.exception))
 
     def test_fetch_all_sequence_increments_permits_fallback_only_on_column_not_found(self):
         mock_cursor = MagicMock()

@@ -8,11 +8,23 @@ from models import (
 from transpiler import FirebirdToPostgresVisitor, validate_immutable_expression
 
 
+# Official Firebird SQLCODE/GDSCODE table (fblangref appendix B.2):
+_GDS_NO_PERMISSION = 335544352
+_GDS_DYNAMIC_SQL_ERROR = 335544569  # isc_dsql_error: generic wrapper, NEVER sufficient alone
+_GDS_COLUMN_UNKNOWN = 335544578     # isc_dsql_field_err: "Column unknown"
+_SQLCODE_COLUMN_UNKNOWN = -206
+_SQLCODE_NO_PERMISSION = -551
+
+
 def is_column_not_found_error(e: Exception, column_name: str = "RDB$GENERATOR_INCREMENT") -> bool:
     """
-    Returns True only if the error proves that the column does not exist in the Firebird catalog
-    (e.g., older Firebird versions where RDB$GENERATOR_INCREMENT was not present).
-    Any other error (permissions, connection loss, syntax, etc.) returns False.
+    Returns True only with specific evidence that the named column does not
+    exist in the Firebird catalog (e.g., older Firebird versions where
+    RDB$GENERATOR_INCREMENT was not present).
+    335544569 alone proves nothing: it is the generic "Dynamic SQL Error"
+    wrapper also carried by syntax errors (-104), which must abort instead
+    of silently falling back to increment 1. Likewise, an unknown DIFFERENT
+    column, permission, connection or catalog failure returns False.
     """
     if not isinstance(e, firebirdsql.Error):
         return False
@@ -21,23 +33,27 @@ def is_column_not_found_error(e: Exception, column_name: str = "RDB$GENERATOR_IN
     gds_codes = getattr(e, "gds_codes", set()) or set()
 
     # Permission errors must never be treated as column unknown
-    if sql_code == -551 or 335544352 in gds_codes or "permission" in msg or "privilege" in msg:
+    if sql_code == _SQLCODE_NO_PERMISSION or _GDS_NO_PERMISSION in gds_codes \
+            or "permission" in msg or "privilege" in msg:
         return False
 
     # Connection errors must never be treated as column unknown
     if "connection" in msg or "socket" in msg or "network" in msg or "broken pipe" in msg:
         return False
 
-    # Check for Column unknown indicators
-    col_lower = column_name.lower()
-    if sql_code == -206 or 335544569 in gds_codes:
-        return True
-    if "column unknown" in msg:
-        return True
-    if "unknown column" in msg or (col_lower in msg and "unknown" in msg):
-        return True
+    # A known SQLCODE other than column-unknown disproves the fallback.
+    if sql_code is not None and sql_code != _SQLCODE_COLUMN_UNKNOWN:
+        return False
 
-    return False
+    # The evidence must name THIS column as unknown: either an unknown
+    # indicator next to its name, or the specific facility code.
+    col_lower = column_name.lower()
+    if col_lower not in msg:
+        return False
+    if "unknown" not in msg and _GDS_COLUMN_UNKNOWN not in gds_codes:
+        return False
+
+    return True
 
 
 def fetch_all_sequence_increments(cursor) -> dict[str, int]:
