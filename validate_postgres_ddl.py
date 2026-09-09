@@ -12,6 +12,7 @@ import psycopg2
 
 from config import get_postgres_connection, PostgresConfig, get_dump_path, DumpFiles
 from utils import split_sql_statements as split_sql_content
+from utils import scan_ddl_text
 
 DEFAULT_TARGET_FILES = [
     get_dump_path(DumpFiles.DOMAINS_PG),
@@ -68,45 +69,67 @@ def split_sql_statements(file_path: str, allow_missing: bool = False) -> List[SQ
     return statements
 
 
-def identify_object(sql_text: str) -> Tuple[str, str]:
+def _identify_in_code(code_text: str) -> Tuple[str, str]:
     """
-    Identifies the SQL object type and name from statement text.
-    Handles quoted identifiers with hyphens, spaces, and schema qualification.
+    Runs the CREATE-object patterns over code-only text (no string literals,
+    no comments, no function bodies). Kept separate so both top-level code
+    and EXECUTE'd DDL literals share the exact same identification rules.
     """
-    clean_sql = re.sub(r'/\*.*?\*/', '', sql_text, flags=re.DOTALL)
-    clean_sql = re.sub(r'--[^\n]*', '', clean_sql).strip()
-
     _ident = r'(?:(?:"(?:[^"]|"")+"|[\w$]+)\s*\.\s*)?(?:"((?:[^"]|"")+)"|([\w$]+))'
 
     # Domain: schema-qualified quoted form, plain quoted form, or bare unquoted form
-    m = re.search(r'\bCREATE\s+DOMAIN\s+' + _ident, clean_sql, re.IGNORECASE)
+    m = re.search(r'\bCREATE\s+DOMAIN\s+' + _ident, code_text, re.IGNORECASE)
     if m:
         raw = m.group(1) or m.group(2)
         return 'DOMAIN', raw.replace('""', '"')
 
     # View
-    m = re.search(r'\bCREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+' + _ident, clean_sql, re.IGNORECASE)
+    m = re.search(r'\bCREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+' + _ident, code_text, re.IGNORECASE)
     if m:
         raw = m.group(1) or m.group(2)
         return 'VIEW', raw.replace('""', '"')
 
     # Function
-    m = re.search(r'\bCREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+' + _ident + r'\s*\(', clean_sql, re.IGNORECASE)
+    m = re.search(r'\bCREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+' + _ident + r'\s*\(', code_text, re.IGNORECASE)
     if m:
         raw = m.group(1) or m.group(2)
         return 'FUNCTION', raw.replace('""', '"')
 
     # Procedure
-    m = re.search(r'\bCREATE\s+(?:OR\s+REPLACE\s+)?PROCEDURE\s+' + _ident + r'(?:\s*\(|\s+AS\b|\s+LANGUAGE\b)', clean_sql, re.IGNORECASE)
+    m = re.search(r'\bCREATE\s+(?:OR\s+REPLACE\s+)?PROCEDURE\s+' + _ident + r'(?:\s*\(|\s+AS\b|\s+LANGUAGE\b)', code_text, re.IGNORECASE)
     if m:
         raw = m.group(1) or m.group(2)
         return 'PROCEDURE', raw.replace('""', '"')
 
     # Trigger
-    m = re.search(r'\bCREATE\s+TRIGGER\s+' + _ident + r'\s+', clean_sql, re.IGNORECASE)
+    m = re.search(r'\bCREATE\s+TRIGGER\s+' + _ident + r'\s+', code_text, re.IGNORECASE)
     if m:
         raw = m.group(1) or m.group(2)
         return 'TRIGGER', raw.replace('""', '"')
+
+    return 'OTHER', 'UNKNOWN'
+
+
+def identify_object(sql_text: str) -> Tuple[str, str]:
+    """
+    Identifies the effectively executed SQL object type and name from
+    statement text, respecting string literals, comments and dollar-quoted
+    bodies: text such as RAISE NOTICE 'CREATE DOMAIN fake ...' inside a
+    function never fabricates an object. Handles quoted identifiers with
+    hyphens, spaces, and schema qualification. The exporter's DO-block idiom
+    EXECUTE 'CREATE ...' resolves to the executed definition.
+    """
+    code_text, executed_ddls = scan_ddl_text(sql_text)
+
+    obj_type, obj_name = _identify_in_code(code_text)
+    if obj_type != 'OTHER':
+        return obj_type, obj_name
+
+    for ddl in executed_ddls:
+        sub_code, _ = scan_ddl_text(ddl)
+        obj_type, obj_name = _identify_in_code(sub_code)
+        if obj_type != 'OTHER':
+            return obj_type, obj_name
 
     return 'OTHER', 'UNKNOWN'
 

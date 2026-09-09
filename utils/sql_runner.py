@@ -162,6 +162,17 @@ def _scan_ddl_text(text: str, _depth: int = 0) -> tuple[str, list[str]]:
     return ' '.join(code_parts), executed
 
 
+def scan_ddl_text(text: str) -> tuple[str, list[str]]:
+    """
+    Public entry point to the SQL lexical scan: splits DDL text into
+    top-level code (no comments, no string contents, no dollar-quoted
+    bodies except DO) plus dynamic DDL literals following EXECUTE.
+    Shared by dump validation and DDL object identification so both agree
+    on which command a statement effectively executes.
+    """
+    return _scan_ddl_text(text)
+
+
 def _match_creates(code_text: str, patterns: list[tuple]) -> set[str]:
     """Runs CREATE-object patterns over code-only text, unescaping "" quotes."""
     defined = set()

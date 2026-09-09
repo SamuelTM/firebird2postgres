@@ -87,6 +87,44 @@ class TestIdentifyObject(unittest.TestCase):
     def test_other_statement(self):
         self.assertEqual(identify_object('SELECT 1;'), ('OTHER', 'UNKNOWN'))
 
+    def test_function_containing_create_domain_message_is_function(self):
+        """
+        P1 regression: RAISE NOTICE 'CREATE DOMAIN fake ...' inside a function
+        body is text, not a definition. The effectively executed command is
+        CREATE FUNCTION, so the statement must identify as FUNCTION (never
+        DOMAIN fake), keeping it a plpgsql_check target.
+        """
+        sql = (
+            'CREATE FUNCTION "f_msg"() RETURNS void AS $$\n'
+            'BEGIN\n'
+            "    RAISE NOTICE 'CREATE DOMAIN fake AS integer';\n"
+            '    PERFORM * FROM nonexistent_table;\n'
+            'END;\n'
+            '$$ LANGUAGE plpgsql;'
+        )
+        self.assertEqual(identify_object(sql), ('FUNCTION', 'f_msg'))
+
+    def test_function_message_with_escaped_quotes_and_comments(self):
+        """
+        P1 regression: escaped quotes and comment markers inside the message
+        literal must not fabricate objects nor corrupt the real identity.
+        """
+        sql = (
+            'CREATE FUNCTION "f""x"() RETURNS void AS $$\n'
+            'BEGIN\n'
+            "    RAISE NOTICE 'say \"hi\" -- CREATE VIEW ghost_v AS SELECT 1 /* CREATE TRIGGER ghost_t */';\n"
+            'END;\n'
+            '$$ LANGUAGE plpgsql;'
+        )
+        self.assertEqual(identify_object(sql), ('FUNCTION', 'f"x'))
+
+    def test_commented_create_is_not_identified(self):
+        """A CREATE mentioned only in a real comment identifies as OTHER."""
+        self.assertEqual(
+            identify_object('-- CREATE FUNCTION ghost() RETURNS void;\nSELECT 1;'),
+            ('OTHER', 'UNKNOWN')
+        )
+
 
 class TestRunDdlValidation(unittest.TestCase):
     def test_apply_changes_rolls_back_when_any_statement_fails(self):
@@ -192,6 +230,63 @@ class TestRunDdlValidation(unittest.TestCase):
     def test_print_diagnostic_report_empty_returns_false(self):
         from validate_postgres_ddl import print_diagnostic_report
         self.assertFalse(print_diagnostic_report([]))
+
+    def test_mandatory_checker_verifies_messaged_function_and_fails(self):
+        """
+        P1 regression end-to-end: a function whose body mentions
+        'CREATE DOMAIN fake ...' plus an invalid call must be checked by the
+        mandatory checker and fail — never conclude success without a target.
+        (Before the identify fix, the statement classified as DOMAIN fake,
+        the function never became a check target, and the run PASSED.)
+        """
+        import tempfile
+        from unittest.mock import MagicMock
+        from validate_postgres_ddl import run_ddl_validation
+
+        ddl = (
+            'CREATE FUNCTION "f_msg"() RETURNS void AS $$\n'
+            'BEGIN\n'
+            "    RAISE NOTICE 'CREATE DOMAIN fake AS integer';\n"
+            '    PERFORM * FROM nonexistent_table;\n'
+            'END;\n'
+            '$$ LANGUAGE plpgsql;\n'
+        )
+        with tempfile.NamedTemporaryFile('w', suffix='.sql', delete=False) as f:
+            f.write(ddl)
+            fpath = f.name
+
+        try:
+            mock_conn = MagicMock()
+            mock_cursor = MagicMock()
+            mock_conn.cursor.return_value = mock_cursor
+            mock_conn.autocommit = False
+
+            # Extension present; catalog discovers f_msg; checker flags the
+            # invalid call inside it.
+            mock_cursor.fetchone.return_value = (1,)
+            mock_cursor.fetchall.side_effect = [
+                [(4242, 'f_msg', 'public', '')],  # pg_proc
+                [],                               # pg_trigger
+                [("column 'bad_col' does not exist", 'error', '42703', 10,
+                  'PERFORM * FROM nonexistent_table;')],
+            ]
+
+            from validate_postgres_ddl import CHECK_ISSUES_FOUND
+            results, runtime_issues, checker_status = run_ddl_validation(
+                mock_conn, [fpath], apply_changes=False, require_checker=True
+            )
+
+            # The function was identified (not DOMAIN fake) and checked...
+            self.assertTrue(
+                any(r.statement.object_name == 'f_msg' and not r.success for r in results),
+                f"Expected a failing check result for f_msg, got: {[(r.statement.object_name, r.success) for r in results]}"
+            )
+            self.assertTrue(any(name == 'f_msg' for name, _ in runtime_issues))
+            # ...and the mandatory run reports issues, never success.
+            self.assertEqual(checker_status, CHECK_ISSUES_FOUND)
+        finally:
+            import os
+            os.remove(fpath)
 
     def test_run_ddl_validation_missing_target_file_fails(self):
         from unittest.mock import MagicMock
