@@ -176,10 +176,6 @@ def _match_creates(code_text: str, patterns: list[tuple]) -> set[str]:
                 # Strip sequence prefix if present (e.g. trg_00000_bi_ped -> BI_PED)
                 stripped = re.sub(r'^trg_\d+_', '', raw_name, flags=re.IGNORECASE).upper()
                 defined.add(stripped)
-            elif cat == 'DOMAIN':
-                # Strip _dom suffix if present due to collision resolution
-                stripped = re.sub(r'(_dom)+$', '', raw_name, flags=re.IGNORECASE).upper()
-                defined.add(stripped)
     return defined
 
 
@@ -277,10 +273,17 @@ class SqlRunner:
         return len([sql for sql, _ in split_sql_statements(content)])
 
     def validate_file(self, file_path: str, expected_count: int = None, allow_empty: bool = False,
-                      expected_objects: list[str] | set[str] = None, object_type: str = None) -> int:
+                      expected_objects: list[str] | set[str] = None, object_type: str = None,
+                      name_mapping: dict[str, str] = None) -> int:
         """
         Validates that a SQL artifact file exists, contains executable statements,
         and includes all expected objects by identity/type without executing them.
+
+        name_mapping optionally translates expected names to defined names
+        (both uppercase) for categories whose dump names differ from source
+        names by an exact mapping (e.g. renamed domains). Without it, expected
+        names must appear verbatim; no fuzzy aliasing is applied, so one
+        defined object can never satisfy two expected identities.
         """
         if not os.path.exists(file_path):
             is_empty_allowed = allow_empty and (
@@ -320,7 +323,13 @@ class SqlRunner:
                         ot = 'SEQUENCE'
 
                 defined = extract_defined_objects(content, object_type=ot)
-                missing = sorted(list(expected_set - defined))
+                if name_mapping:
+                    missing = sorted(
+                        src for src in expected_set
+                        if name_mapping.get(src, src) not in defined
+                    )
+                else:
+                    missing = sorted(list(expected_set - defined))
                 if missing:
                     raise ValueError(
                         f"SQL file '{file_path}' is incomplete: missing {len(missing)} expected {ot or 'object'}(s): "

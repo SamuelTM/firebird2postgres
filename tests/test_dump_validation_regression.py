@@ -1,11 +1,12 @@
 import os
 import tempfile
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from config import DumpFiles
 from engine.database_migrator import DatabaseMigrator
 from engine.ddl_exporter import DdlExporter
+from models.firebird_types import build_domain_mapping
 from utils.sql_runner import SqlRunner, extract_defined_objects
 
 
@@ -66,8 +67,9 @@ class TestDumpValidationRegression(unittest.TestCase):
         """
         dom_objs = extract_defined_objects(dom_sql, 'DOMAIN')
         self.assertIn('STATUS_DOM', dom_objs)
-        self.assertIn('STATUS', dom_objs)  # _dom stripped
         self.assertIn('INT_CODE', dom_objs)
+        # No fuzzy _dom alias: one defined domain satisfies exactly one identity.
+        self.assertNotIn('STATUS', dom_objs)
 
     def test_two_procedures_one_removed_leaving_drop_and_create_fails_before_drop(self):
         """
@@ -289,6 +291,83 @@ class TestDumpValidationRegression(unittest.TestCase):
 
             verified = self.migrator.validate_artifacts(output_dir=tmpdir)
             self.assertFalse(verified[DumpFiles.DOMAINS_PG])
+
+    def _mock_foo_domain_catalog(self):
+        """
+        Table FOO with domains FOO and FOO_DOM. The exact computed mapping is
+        FOO -> foo_dom_dom and FOO_DOM -> foo_dom. Mocks the source catalog
+        for both expected objects and the domain map.
+        """
+        mapping = build_domain_mapping(['FOO', 'FOO_DOM'], {'FOO'})
+        self.assertEqual(mapping, {'FOO': 'foo_dom_dom', 'FOO_DOM': 'foo_dom'})
+        self.migrator.ddl_exporter.get_source_objects = MagicMock(return_value={
+            DumpFiles.DOMAINS_PG: ["FOO", "FOO_DOM"],
+            DumpFiles.PROCEDURES_PG: [],
+            DumpFiles.VIEWS_PG: [],
+            DumpFiles.TRIGGERS_PG: [],
+        })
+        patcher = patch.object(DdlExporter, '_fetch_domain_map', return_value=mapping)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return mapping
+
+    @staticmethod
+    def _write_dump_files(tmpdir, domains_sql):
+        with open(os.path.join(tmpdir, DumpFiles.DOMAINS_PG), "w", encoding="utf-8") as f:
+            f.write(domains_sql)
+        for cat in [DumpFiles.PROCEDURES_PG, DumpFiles.VIEWS_PG, DumpFiles.TRIGGERS_PG]:
+            with open(os.path.join(tmpdir, cat), "w", encoding="utf-8") as f:
+                f.write("/* EMPTY */\n")
+
+    def test_complete_renamed_domains_pass_validation(self):
+        """Both mapped domains present: exact mapping approves the dump."""
+        self._mock_foo_domain_catalog()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_dump_files(
+                tmpdir,
+                'CREATE DOMAIN "foo_dom_dom" AS INTEGER;\n'
+                'CREATE DOMAIN "foo_dom" AS VARCHAR(10);\n'
+            )
+            verified = self.migrator.validate_artifacts(output_dir=tmpdir)
+            self.assertFalse(verified[DumpFiles.DOMAINS_PG])
+
+    def test_removing_renamed_domain_fails_validation(self):
+        """
+        P1 acceptance: removing foo_dom_dom (the PG name of source FOO)
+        from an otherwise complete dump MUST fail, reporting source FOO.
+        """
+        self._mock_foo_domain_catalog()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_dump_files(
+                tmpdir,
+                'CREATE DOMAIN "foo_dom" AS VARCHAR(10);\n'
+            )
+
+            drop_called = []
+            self.migrator.drop_schema = lambda: drop_called.append(True)
+
+            with self.assertRaises(ValueError) as ctx:
+                self.migrator.validate_artifacts(output_dir=tmpdir)
+
+            self.assertIn("missing 1 expected DOMAIN(s): FOO", str(ctx.exception))
+            self.assertEqual(drop_called, [])
+
+    def test_single_domain_cannot_satisfy_two_identities(self):
+        """
+        P1 regression: a dump with only foo_dom_dom must NOT satisfy both
+        FOO and FOO_DOM (the old _dom-stripping alias approved this).
+        """
+        self._mock_foo_domain_catalog()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_dump_files(
+                tmpdir,
+                'CREATE DOMAIN "foo_dom_dom" AS INTEGER;\n'
+            )
+
+            with self.assertRaises(ValueError) as ctx:
+                self.migrator.validate_artifacts(output_dir=tmpdir)
+
+            self.assertIn("missing 1 expected DOMAIN(s): FOO_DOM", str(ctx.exception))
 
 
 if __name__ == "__main__":
