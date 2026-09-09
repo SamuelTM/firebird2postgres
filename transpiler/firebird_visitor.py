@@ -1711,30 +1711,107 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                             tables.append(src)
         return tables
 
-    def _infer_subquery_projections(self, select_stmt, symbols: dict[str, str]) -> dict[str, str]:
+    @staticmethod
+    def _extract_cte_definitions(select_only) -> dict[str, tuple]:
+        """
+        Maps lowercase CTE name -> (subquery_ctx, column_aliases) for the WITH
+        clause of a select_only_statement. Column aliases come from the
+        optional paren column list: WITH X(a, b) AS (...).
+        """
+        cte_defs: dict[str, tuple] = {}
+        try:
+            if not select_only or not hasattr(select_only, 'with_clause'):
+                return cte_defs
+            with_clause = select_only.with_clause()
+            if not with_clause:
+                return cte_defs
+            for factoring in with_clause.with_factoring_clause() or []:
+                sub_factoring = factoring.subquery_factoring_clause()
+                if not sub_factoring:
+                    continue
+                qname = sub_factoring.query_name()
+                if not qname:
+                    continue
+                cte_name = qname.getText().strip('":').lower()
+                sub_ctx = sub_factoring.subquery() if hasattr(sub_factoring, 'subquery') else None
+                aliases: list[str] = []
+                try:
+                    pcl = sub_factoring.paren_column_list()
+                    if pcl and pcl.column_list():
+                        for col in pcl.column_list().column_name():
+                            raw = col.getText().strip('":').lower()
+                            if raw:
+                                aliases.append(raw)
+                except Exception:
+                    pass
+                if cte_name and sub_ctx is not None:
+                    cte_defs[cte_name] = (sub_ctx, aliases)
+        except Exception:
+            pass
+        return cte_defs
+
+    def _infer_subquery_projections(self, select_stmt, symbols: dict[str, str],
+                                    cte_defs: dict[str, tuple] = None,
+                                    _resolving: frozenset = frozenset()) -> dict[str, str]:
         projections = {}
         if not select_stmt:
             return projections
         try:
-            sub_only = select_stmt.select_only_statement()
-            if not sub_only or not sub_only.subquery():
+            # Accepts Select_statementContext (derived tables, has
+            # select_only_statement) and bare SubqueryContext (CTE bodies,
+            # which wrap subquery_basic_elements directly in parentheses).
+            sub_only = None
+            if hasattr(select_stmt, 'select_only_statement'):
+                try:
+                    sub_only = select_stmt.select_only_statement()
+                except Exception:
+                    sub_only = None
+            if sub_only is not None and sub_only.subquery() is not None:
+                sub = sub_only.subquery()
+            elif hasattr(select_stmt, 'subquery_basic_elements'):
+                sub = select_stmt
+            else:
                 return projections
-            basic = sub_only.subquery().subquery_basic_elements()
+            basic = sub.subquery_basic_elements()
             if not basic or not basic.query_block():
                 return projections
             qb = basic.query_block()
             if not qb.selected_list():
                 return projections
 
+            # CTEs defined by this statement shadow outer ones of the same name.
+            merged_ctes = dict(cte_defs) if cte_defs else {}
+            if sub_only is not None:
+                merged_ctes.update(self._extract_cte_definitions(sub_only))
+
             sub_tables = self._extract_tables_from_query_block(qb)
             sub_symbols = symbols.copy()
             for st in sub_tables:
                 if st.subquery_ctx:
-                    inner_proj = self._infer_subquery_projections(st.subquery_ctx, symbols)
+                    inner_proj = self._infer_subquery_projections(
+                        st.subquery_ctx, symbols, merged_ctes, _resolving)
                     alias_use = st.alias_clean or st.table_name_clean
                     for c_name, c_type in inner_proj.items():
                         if c_type:
                             sub_symbols[f"{alias_use}.{c_name}"] = c_type
+                elif st.table_name_clean in merged_ctes and st.table_name_clean not in _resolving:
+                    sub_ctx, col_aliases = merged_ctes[st.table_name_clean]
+                    inner_proj = self._infer_subquery_projections(
+                        sub_ctx, symbols, merged_ctes,
+                        _resolving | {st.table_name_clean})
+                    if col_aliases:
+                        aliased = {}
+                        for alias_name, (_, c_type) in zip(col_aliases, inner_proj.items()):
+                            if c_type:
+                                aliased[alias_name] = c_type
+                        inner_proj = aliased
+                    quals = {st.table_name_clean}
+                    if st.alias_clean:
+                        quals.add(st.alias_clean)
+                    for c_name, c_type in inner_proj.items():
+                        if c_type:
+                            for q in quals:
+                                sub_symbols[f"{q}.{c_name}"] = c_type
                 elif st.alias_clean and st.table_name_clean:
                     prefix = f"{st.table_name_clean}."
                     for k, v in list(symbols.items()):
@@ -1755,11 +1832,21 @@ class ASTDialectRewriter(FirebirdParserVisitor):
 
             sl = qb.selected_list()
             if sl.getText() == '*':
+                # SELECT * projects only columns of tables that actually
+                # participate in this subquery: symbols of unrelated outer
+                # tables (e.g. Z.D) must never leak into the projection.
+                allowed = set()
+                for st in sub_tables:
+                    if st.table_name_clean:
+                        allowed.add(st.table_name_clean.lower())
+                    if st.alias_clean:
+                        allowed.add(st.alias_clean.lower())
                 for k, v in sub_symbols.items():
-                    if '.' in k:
-                        projections[k.split('.')[-1]] = v
-                    else:
-                        projections[k] = v
+                    if '.' not in k:
+                        continue
+                    qualifier, _, col = k.partition('.')
+                    if qualifier.lower() in allowed:
+                        projections[col] = v
                 return projections
 
             if hasattr(sl, 'select_list_elements') and sl.select_list_elements():
@@ -1836,13 +1923,47 @@ class ASTDialectRewriter(FirebirdParserVisitor):
         old_symbols = self.symbols.copy()
         try:
             if tables:
+                # CTEs visible in this scope: nearest enclosing WITH clause.
+                scope_ctes: dict[str, tuple] = {}
+                probe = ctx.parentCtx
+                while probe is not None:
+                    if isinstance(probe, FirebirdParser.Select_only_statementContext):
+                        scope_ctes = self._extract_cte_definitions(probe)
+                        if scope_ctes:
+                            break
+                    probe = probe.parentCtx
                 for tbl in tables:
                     if tbl.subquery_ctx:
-                        proj = self._infer_subquery_projections(tbl.subquery_ctx, old_symbols)
+                        proj = self._infer_subquery_projections(
+                            tbl.subquery_ctx, old_symbols, scope_ctes)
                         alias = tbl.alias_clean or tbl.table_name_clean
                         for col_name, col_type in proj.items():
                             if col_type:
                                 self.symbols[f"{alias}.{col_name}"] = col_type
+                        if hasattr(self, 'table_columns'):
+                            cols = set(self.table_columns.get(tbl.table_name_clean, []))
+                            cols.update(proj.keys())
+                            self.table_columns[tbl.table_name_clean] = cols
+                            if tbl.alias_clean:
+                                self.table_columns[tbl.alias_clean] = cols
+                    elif tbl.table_name_clean in scope_ctes:
+                        sub_ctx, col_aliases = scope_ctes[tbl.table_name_clean]
+                        proj = self._infer_subquery_projections(
+                            sub_ctx, old_symbols, scope_ctes,
+                            frozenset({tbl.table_name_clean}))
+                        if col_aliases:
+                            aliased = {}
+                            for alias_name, (_, c_type) in zip(col_aliases, proj.items()):
+                                if c_type:
+                                    aliased[alias_name] = c_type
+                            proj = aliased
+                        quals = {tbl.table_name_clean}
+                        if tbl.alias_clean:
+                            quals.add(tbl.alias_clean)
+                        for col_name, col_type in proj.items():
+                            if col_type:
+                                for q in quals:
+                                    self.symbols[f"{q}.{col_name}"] = col_type
                         if hasattr(self, 'table_columns'):
                             cols = set(self.table_columns.get(tbl.table_name_clean, []))
                             cols.update(proj.keys())

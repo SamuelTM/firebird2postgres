@@ -1,3 +1,4 @@
+import datetime
 import unittest
 import psycopg2
 import firebirdsql
@@ -70,6 +71,66 @@ class TestDateInferenceUnitRegression(unittest.TestCase):
         out = FirebirdToPostgresVisitor.transpile(sql, symbols=symbols)
         self.assertIn("((Y.D + (1) * INTERVAL '1 day')::date) - Y.D", out)
 
+    def test_star_projection_restricted_to_real_scope(self):
+        """
+        P1 regression: SELECT * over (T JOIN U) must not import Z.D DATE
+        from outside the subquery. T.D TIMESTAMP keeps timestamp arithmetic
+        (no ::date cast discarding the time).
+        """
+        sql = "SELECT DATEADD(HOUR, 1, X.D) FROM (SELECT * FROM T JOIN U ON 1 = 1) X;"
+        symbols = {"t.d": "TIMESTAMP", "u.k": "INTEGER", "z.d": "DATE"}
+        out = FirebirdToPostgresVisitor.transpile(sql, symbols=symbols)
+        self.assertNotIn("::date", out)
+        self.assertIn("(X.D + (1) * INTERVAL '1 hour')", out)
+
+    def test_star_projection_still_sees_participating_date_column(self):
+        """
+        P1 regression counterpart: SELECT * DOES propagate DATE from tables
+        that really participate in the subquery.
+        """
+        sql = "SELECT DATEADD(DAY, 1, X.D) - X.D FROM (SELECT * FROM T JOIN U ON 1 = 1) X;"
+        symbols = {"t.d": "DATE", "u.k": "INTEGER", "z.d": "TIMESTAMP"}
+        out = FirebirdToPostgresVisitor.transpile(sql, symbols=symbols)
+        self.assertIn("((X.D + (1) * INTERVAL '1 day')::date) - X.D", out)
+
+    def test_cte_propagates_date_type(self):
+        """
+        P1 regression: WITH X AS (SELECT D FROM T) propagates D DATE, so
+        DATEADD casts to ::date and date subtraction stays integer.
+        """
+        sql = "WITH X AS (SELECT D FROM T) SELECT DATEADD(DAY, 1, X.D) - X.D FROM X;"
+        out = FirebirdToPostgresVisitor.transpile(sql, symbols={"t.d": "DATE"})
+        self.assertIn("((X.D + (1) * INTERVAL '1 day')::date) - X.D", out)
+
+    def test_cte_with_column_alias_propagates(self):
+        """
+        P1 regression: WITH X(dt) AS ... maps the inner projection positionally
+        to the CTE column alias.
+        """
+        sql = "WITH X(dt) AS (SELECT D FROM T) SELECT DATEADD(DAY, 1, X.dt) - X.dt FROM X;"
+        out = FirebirdToPostgresVisitor.transpile(sql, symbols={"t.d": "DATE"})
+        self.assertIn("((X.dt + (1) * INTERVAL '1 day')::date) - X.dt", out)
+
+    def test_nested_cte_propagates(self):
+        """
+        P1 regression: a CTE selecting from another CTE inherits its types.
+        """
+        sql = (
+            "WITH A AS (SELECT D FROM T), "
+            "B AS (SELECT D FROM A) "
+            "SELECT DATEADD(DAY, 1, B.D) - B.D FROM B;"
+        )
+        out = FirebirdToPostgresVisitor.transpile(sql, symbols={"t.d": "DATE"})
+        self.assertIn("((B.D + (1) * INTERVAL '1 day')::date) - B.D", out)
+
+    def test_self_referencing_cte_terminates(self):
+        """
+        P1 regression guard: a self-referencing CTE must not hang inference.
+        """
+        sql = "WITH X AS (SELECT n FROM X) SELECT n FROM X;"
+        out = FirebirdToPostgresVisitor.transpile(sql, symbols={})
+        self.assertIn("X", out)
+
 
 @requires_postgres_class
 class TestDateInferenceLivePostgresRegression(unittest.TestCase):
@@ -133,6 +194,68 @@ class TestDateInferenceLivePostgresRegression(unittest.TestCase):
         self.assertIsNotNone(row)
         self.assertEqual(row[0], 1)
         self.assertEqual(row[1], "integer")
+
+    def test_live_pg_timestamp_preserved_through_star_join_subquery(self):
+        """
+        P1 regression (value AND type): T.D TIMESTAMP with non-null time must
+        survive DATEADD over (SELECT * FROM T JOIN U); a DATE-typed Z outside
+        the subquery scope must not truncate it via ::date.
+        """
+        try:
+            self.cur.execute("DROP TABLE IF EXISTS reg_ts_t CASCADE;")
+            self.cur.execute("DROP TABLE IF EXISTS reg_ts_u CASCADE;")
+            self.cur.execute("DROP TABLE IF EXISTS reg_ts_z CASCADE;")
+            self.cur.execute("CREATE TABLE reg_ts_t (d TIMESTAMP, k INTEGER);")
+            self.cur.execute("CREATE TABLE reg_ts_u (k INTEGER);")
+            self.cur.execute("CREATE TABLE reg_ts_z (d DATE);")
+            self.cur.execute("INSERT INTO reg_ts_t VALUES ('2026-09-08 15:30:45', 1);")
+            self.cur.execute("INSERT INTO reg_ts_u VALUES (1);")
+            self.cur.execute("INSERT INTO reg_ts_z VALUES ('2026-01-01');")
+
+            fb_sql = ("SELECT DATEADD(HOUR, 1, X.D) FROM "
+                      "(SELECT * FROM REG_TS_T JOIN REG_TS_U ON 1 = 1) X;")
+            symbols = {"reg_ts_t.d": "TIMESTAMP", "reg_ts_u.k": "INTEGER",
+                       "reg_ts_z.d": "DATE"}
+            pg_sel = FirebirdToPostgresVisitor.transpile(fb_sql, symbols=symbols)
+            self.assertNotIn("::date", pg_sel)
+
+            self.cur.execute(
+                f"SELECT v, pg_typeof(v)::text FROM ({pg_sel.rstrip().rstrip(';')}) s(v);"
+            )
+            row = self.cur.fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row[0], datetime.datetime(2026, 9, 8, 16, 30, 45))
+            self.assertEqual(row[1], "timestamp without time zone")
+        finally:
+            self.cur.execute("DROP TABLE IF EXISTS reg_ts_t CASCADE;")
+            self.cur.execute("DROP TABLE IF EXISTS reg_ts_u CASCADE;")
+            self.cur.execute("DROP TABLE IF EXISTS reg_ts_z CASCADE;")
+
+    def test_live_pg_cte_date_subtraction_yields_integer(self):
+        """
+        P1 regression (value AND type): a CTE projecting D DATE propagates
+        the type, so DATEADD casts to ::date and date subtraction is integer.
+        """
+        try:
+            self.cur.execute("DROP TABLE IF EXISTS reg_cte_t CASCADE;")
+            self.cur.execute("CREATE TABLE reg_cte_t (d DATE);")
+            self.cur.execute("INSERT INTO reg_cte_t VALUES ('2026-09-08');")
+
+            fb_sql = ("WITH X AS (SELECT D FROM REG_CTE_T) "
+                      "SELECT DATEADD(DAY, 1, X.D) - X.D FROM X;")
+            pg_sel = FirebirdToPostgresVisitor.transpile(
+                fb_sql, symbols={"reg_cte_t.d": "DATE"})
+            self.assertIn("::date", pg_sel)
+
+            self.cur.execute(
+                f"SELECT v, pg_typeof(v)::text FROM ({pg_sel.rstrip().rstrip(';')}) s(v);"
+            )
+            row = self.cur.fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row[0], 1)
+            self.assertEqual(row[1], "integer")
+        finally:
+            self.cur.execute("DROP TABLE IF EXISTS reg_cte_t CASCADE;")
 
 
 @requires_firebird_class
