@@ -69,43 +69,46 @@ def split_sql_statements(file_path: str, allow_missing: bool = False) -> List[SQ
     return statements
 
 
-def _identify_in_code(code_text: str) -> Tuple[str, str]:
+def _identify_in_code(code_text: str, idents: list) -> Tuple[str, str]:
     """
     Runs the CREATE-object patterns over code-only text (no string literals,
-    no comments, no function bodies). Kept separate so both top-level code
-    and EXECUTE'd DDL literals share the exact same identification rules.
+    no comments, no identifier contents, no function bodies) with quoted
+    identifiers resolved from the identifier table. Kept separate so both
+    top-level code and EXECUTE'd DDL literals share the exact same
+    identification rules.
     """
-    _ident = r'(?:(?:"(?:[^"]|"")+"|[\w$]+)\s*\.\s*)?(?:"((?:[^"]|"")+)"|([\w$]+))'
+    _ident = (r'(?:(?:\ue000\d+\ue001|[\w$]+)\s*\.\s*)?'
+              r'(?:\ue000(\d+)\ue001|([\w$]+))')
 
     # Domain: schema-qualified quoted form, plain quoted form, or bare unquoted form
     m = re.search(r'\bCREATE\s+DOMAIN\s+' + _ident, code_text, re.IGNORECASE)
     if m:
-        raw = m.group(1) or m.group(2)
-        return 'DOMAIN', raw.replace('""', '"')
+        raw = idents[int(m.group(1))].strip() if m.group(1) is not None else m.group(2).strip()
+        return 'DOMAIN', raw
 
     # View
     m = re.search(r'\bCREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+' + _ident, code_text, re.IGNORECASE)
     if m:
-        raw = m.group(1) or m.group(2)
-        return 'VIEW', raw.replace('""', '"')
+        raw = idents[int(m.group(1))].strip() if m.group(1) is not None else m.group(2).strip()
+        return 'VIEW', raw
 
     # Function
     m = re.search(r'\bCREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+' + _ident + r'\s*\(', code_text, re.IGNORECASE)
     if m:
-        raw = m.group(1) or m.group(2)
-        return 'FUNCTION', raw.replace('""', '"')
+        raw = idents[int(m.group(1))].strip() if m.group(1) is not None else m.group(2).strip()
+        return 'FUNCTION', raw
 
     # Procedure
     m = re.search(r'\bCREATE\s+(?:OR\s+REPLACE\s+)?PROCEDURE\s+' + _ident + r'(?:\s*\(|\s+AS\b|\s+LANGUAGE\b)', code_text, re.IGNORECASE)
     if m:
-        raw = m.group(1) or m.group(2)
-        return 'PROCEDURE', raw.replace('""', '"')
+        raw = idents[int(m.group(1))].strip() if m.group(1) is not None else m.group(2).strip()
+        return 'PROCEDURE', raw
 
     # Trigger
     m = re.search(r'\bCREATE\s+TRIGGER\s+' + _ident + r'\s+', code_text, re.IGNORECASE)
     if m:
-        raw = m.group(1) or m.group(2)
-        return 'TRIGGER', raw.replace('""', '"')
+        raw = idents[int(m.group(1))].strip() if m.group(1) is not None else m.group(2).strip()
+        return 'TRIGGER', raw
 
     return 'OTHER', 'UNKNOWN'
 
@@ -113,21 +116,22 @@ def _identify_in_code(code_text: str) -> Tuple[str, str]:
 def identify_object(sql_text: str) -> Tuple[str, str]:
     """
     Identifies the effectively executed SQL object type and name from
-    statement text, respecting string literals, comments and dollar-quoted
-    bodies: text such as RAISE NOTICE 'CREATE DOMAIN fake ...' inside a
-    function never fabricates an object. Handles quoted identifiers with
-    hyphens, spaces, and schema qualification. The exporter's DO-block idiom
-    EXECUTE 'CREATE ...' resolves to the executed definition.
+    statement text, respecting string literals, comments, quoted-identifier
+    contents and dollar-quoted bodies: a function named "CREATE DOMAIN fake"
+    identifies as that FUNCTION (single identifier), never as DOMAIN fake.
+    The exporter's DO-block idiom EXECUTE 'CREATE ...' resolves to the
+    executed definition. Handles quoted identifiers with hyphens, spaces,
+    and schema qualification.
     """
-    code_text, executed_ddls = scan_ddl_text(sql_text)
+    code_text, executed_ddls, idents = scan_ddl_text(sql_text)
 
-    obj_type, obj_name = _identify_in_code(code_text)
+    obj_type, obj_name = _identify_in_code(code_text, idents)
     if obj_type != 'OTHER':
         return obj_type, obj_name
 
     for ddl in executed_ddls:
-        sub_code, _ = scan_ddl_text(ddl)
-        obj_type, obj_name = _identify_in_code(sub_code)
+        sub_code, _, sub_idents = scan_ddl_text(ddl)
+        obj_type, obj_name = _identify_in_code(sub_code, sub_idents)
         if obj_type != 'OTHER':
             return obj_type, obj_name
 

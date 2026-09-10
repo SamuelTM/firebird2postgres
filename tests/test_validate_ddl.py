@@ -125,6 +125,40 @@ class TestIdentifyObject(unittest.TestCase):
             ('OTHER', 'UNKNOWN')
         )
 
+    def test_hostile_function_name_identifies_as_single_function(self):
+        """
+        P1 regression: a function NAMED "CREATE DOMAIN fake" is one FUNCTION
+        identity (its header), never DOMAIN fake. The name is a single
+        identifier even though its content looks like a command.
+        """
+        sql = (
+            'CREATE FUNCTION "CREATE DOMAIN fake"() RETURNS void AS $$\n'
+            'BEGIN\n'
+            "    RAISE NOTICE 'hi';\n"
+            '    PERFORM * FROM nonexistent_table;\n'
+            'END;\n'
+            '$$ LANGUAGE plpgsql;'
+        )
+        self.assertEqual(identify_object(sql), ('FUNCTION', 'CREATE DOMAIN fake'))
+
+    def test_hostile_names_with_comments_and_escaped_quotes(self):
+        """
+        P1 regression: names containing apparent comments or escaped quotes
+        stay single identifiers and fabricate no extra identities.
+        """
+        self.assertEqual(
+            identify_object('CREATE VIEW "my -- view" AS SELECT 1;'),
+            ('VIEW', 'my -- view')
+        )
+        self.assertEqual(
+            identify_object('CREATE VIEW "x /* y */ z" AS SELECT 1;'),
+            ('VIEW', 'x /* y */ z')
+        )
+        self.assertEqual(
+            identify_object('CREATE FUNCTION "CREATE FUNCTION ghost"() RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;'),
+            ('FUNCTION', 'CREATE FUNCTION ghost')
+        )
+
 
 class TestRunDdlValidation(unittest.TestCase):
     def test_apply_changes_rolls_back_when_any_statement_fails(self):
@@ -283,6 +317,59 @@ class TestRunDdlValidation(unittest.TestCase):
             )
             self.assertTrue(any(name == 'f_msg' for name, _ in runtime_issues))
             # ...and the mandatory run reports issues, never success.
+            self.assertEqual(checker_status, CHECK_ISSUES_FOUND)
+        finally:
+            import os
+            os.remove(fpath)
+
+    def test_mandatory_checker_verifies_hostile_named_function_and_fails(self):
+        """
+        P1 regression end-to-end: a function NAMED "CREATE DOMAIN fake" with
+        an invalid call must be checked by the mandatory checker and fail —
+        never misclassified as DOMAIN fake and skipped to success.
+        """
+        import tempfile
+        from unittest.mock import MagicMock
+        from validate_postgres_ddl import run_ddl_validation
+
+        ddl = (
+            'CREATE FUNCTION "CREATE DOMAIN fake"() RETURNS void AS $$\n'
+            'BEGIN\n'
+            "    RAISE NOTICE 'hi';\n"
+            '    PERFORM * FROM nonexistent_table;\n'
+            'END;\n'
+            '$$ LANGUAGE plpgsql;\n'
+        )
+        with tempfile.NamedTemporaryFile('w', suffix='.sql', delete=False) as f:
+            f.write(ddl)
+            fpath = f.name
+
+        try:
+            mock_conn = MagicMock()
+            mock_cursor = MagicMock()
+            mock_conn.cursor.return_value = mock_cursor
+            mock_conn.autocommit = False
+
+            mock_cursor.fetchone.return_value = (1,)
+            mock_cursor.fetchall.side_effect = [
+                [(4242, 'CREATE DOMAIN fake', 'public', '')],  # pg_proc
+                [],                                            # pg_trigger
+                [("relation 'nonexistent_table' does not exist", 'error', '42P01', 10,
+                  'PERFORM * FROM nonexistent_table;')],
+            ]
+
+            from validate_postgres_ddl import CHECK_ISSUES_FOUND
+            results, runtime_issues, checker_status = run_ddl_validation(
+                mock_conn, [fpath], apply_changes=False, require_checker=True
+            )
+
+            self.assertTrue(
+                any(r.statement.object_name == 'CREATE DOMAIN fake' and not r.success
+                    for r in results),
+                f"Expected a failing check result for the hostile-named function, got: "
+                f"{[(r.statement.object_name, r.success) for r in results]}"
+            )
+            self.assertTrue(any(name == 'CREATE DOMAIN fake' for name, _ in runtime_issues))
             self.assertEqual(checker_status, CHECK_ISSUES_FOUND)
         finally:
             import os

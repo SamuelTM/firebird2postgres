@@ -243,6 +243,35 @@ class TestDumpValidationRegression(unittest.TestCase):
         self.assertEqual(extract_defined_objects(dump, 'PROCEDURE'), {'A"B'})
         self.assertEqual(extract_defined_objects(dump, 'VIEW'), {'V"X'})
 
+    def test_hostile_identifier_contents_create_no_extra_identities(self):
+        """
+        P1 regression: identifier CONTENT that looks like commands, comments
+        or escaped quotes is one single name. Nothing inside quotes may
+        fabricate a second identity of any category.
+        """
+        dump = (
+            'CREATE FUNCTION "CREATE DOMAIN fake"() RETURNS void AS $$\n'
+            'BEGIN\n'
+            "    RAISE NOTICE 'CREATE FUNCTION ghost_fn()';\n"
+            'END;\n'
+            '$$ LANGUAGE plpgsql;\n'
+            'CREATE VIEW "my -- view" AS SELECT 1;\n'
+            'CREATE VIEW "x /* y */ z" AS SELECT 1;\n'
+            'CREATE TRIGGER "CREATE FUNCTION ghost_trg" BEFORE INSERT ON "t" '
+            'FOR EACH ROW EXECUTE FUNCTION "f"();\n'
+        )
+        self.assertEqual(
+            extract_defined_objects(dump, 'PROCEDURE'), {'CREATE DOMAIN FAKE'})
+        self.assertEqual(
+            extract_defined_objects(dump, 'DOMAIN'), set())
+        self.assertEqual(
+            extract_defined_objects(dump, 'VIEW'), {'MY -- VIEW', 'X /* Y */ Z'})
+        self.assertEqual(
+            extract_defined_objects(dump, 'TRIGGER'),
+            {'CREATE FUNCTION GHOST_TRG'})
+        self.assertNotIn('GHOST_FN', extract_defined_objects(dump))
+        self.assertNotIn('FAKE', extract_defined_objects(dump))
+
     def test_comments_inside_strings_neither_hide_nor_create_objects(self):
         """
         P1 regression: -- and /* */ markers inside string literals are text,

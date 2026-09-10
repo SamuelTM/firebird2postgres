@@ -11,10 +11,20 @@ _DO_OPEN_RE = re.compile(r'\bDO\s*$', re.IGNORECASE)
 _EXECUTE_BEFORE_STRING_RE = re.compile(r'\bEXECUTE\s*$', re.IGNORECASE)
 _CREATE_LEAD_RE = re.compile(r'^\s*CREATE\b', re.IGNORECASE)
 
-# Quoted identifier aware of "" escapes: "a""b" is one identifier (a"b).
-_QUOTED_IDENT = r'"((?:[^"]|"")+)"'
+# Opaque placeholder for quoted identifiers in code-only text: U+E000/U+E001
+# (Unicode private-use, never word characters) wrap the identifier index.
+# Identifier CONTENT (which may itself look like commands, e.g. a function
+# named "CREATE DOMAIN fake") therefore can never match CREATE patterns;
+# names are resolved back from the identifier table at capture time.
+_IDENT_OPEN = '\ue000'
+_IDENT_CLOSE = '\ue001'
+
+# Quoted names match only the opaque placeholder emitted by the lexer;
+# the decoded identifier is resolved from the identifier table.
+_IDENT_REF = _IDENT_OPEN + r'(\d+)' + _IDENT_CLOSE
+_IDENT_REF_NC = _IDENT_OPEN + r'\d+' + _IDENT_CLOSE
 _BARE_IDENT = r'([\w$]+)'
-_QUALIFIER = r'(?:(?:"(?:[^"]|"")+"|[\w$]+)\.)?'
+_QUALIFIER = r'(?:(?:' + _IDENT_REF_NC + r'|[\w$]+)\.)?'
 
 
 def _lex_sql(content: str) -> list[tuple]:
@@ -22,10 +32,12 @@ def _lex_sql(content: str) -> list[tuple]:
     Lexes SQL into segments without executing anything.
 
     Returns a list of segments:
-    - ('code', text): executable code (comments removed, quoted identifiers kept verbatim).
+    - ('code', text): executable code (comments removed).
     - ('string', raw, value): single-quoted literal with '' unescaped to '.
+    - ('ident', raw, value): double-quoted identifier with "" unescaped to ".
     - ('dollar', raw, (tag, body)): dollar-quoted body with its opening tag.
-    String contents, comment contents and dollar bodies never leak into 'code'.
+    String contents, comment contents, identifier contents and dollar bodies
+    never leak into 'code'.
     """
     segs: list[tuple] = []
     buf: list[str] = []
@@ -81,20 +93,25 @@ def _lex_sql(content: str) -> list[tuple]:
             continue
 
         if ch == '"':
-            # Quoted identifier: kept verbatim inside code so qualified
-            # names stay matchable; "" escapes are resolved at capture time.
-            # Consumed whole so ' and $ inside never open strings/bodies.
+            # Quoted identifier: emitted as an opaque placeholder segment so
+            # its CONTENT never matches command patterns; "" escapes are
+            # resolved into the decoded value. Consumed whole so ' and $
+            # inside never open strings/bodies.
+            flush_code()
             j = i + 1
+            val = []
             while j < n:
                 if content[j] == '"':
                     if j + 1 < n and content[j + 1] == '"':
+                        val.append('"')
                         j += 2
                     else:
                         j += 1
                         break
                 else:
+                    val.append(content[j])
                     j += 1
-            buf.append(content[i:j])
+            segs.append(('ident', content[i:j], ''.join(val)))
             i = j
             continue
 
@@ -120,26 +137,36 @@ def _lex_sql(content: str) -> list[tuple]:
     return segs
 
 
-def _scan_ddl_text(text: str, _depth: int = 0) -> tuple[str, list[str]]:
+def _ident_token(idx: int) -> str:
+    return f"{_IDENT_OPEN}{idx}{_IDENT_CLOSE}"
+
+
+def _scan_ddl_text(text: str, _depth: int = 0) -> tuple[str, list[str], list[str]]:
     """
     Splits DDL text into top-level code plus dynamic DDL literals.
 
-    Returns (code_text, executed_ddls) where code_text contains no comments,
-    no string contents and no dollar-quoted bodies, and executed_ddls holds
-    the decoded value of every string literal immediately following EXECUTE
-    (the exporter's DO-block idiom: EXECUTE 'CREATE DOMAIN ...'), plus the
-    same for DO bodies scanned recursively. Dollar bodies that do not belong
-    to DO are function/procedure implementations and are discarded.
+    Returns (code_text, executed_ddls, idents) where code_text contains no
+    comments, no string contents, no identifier contents and no
+    dollar-quoted bodies (quoted identifiers appear as opaque placeholders
+    resolved via idents), and executed_ddls holds the decoded value of every
+    string literal immediately following EXECUTE (the exporter's DO-block
+    idiom: EXECUTE 'CREATE DOMAIN ...'), plus the same for DO bodies scanned
+    recursively. Dollar bodies that do not belong to DO are
+    function/procedure implementations and are discarded.
     """
     if _depth > 5:
-        return '', []
-    code_parts: list[str] = []
+        return '', [], []
+    items: list[tuple[str, bool]] = []  # (text, is_ident_token)
     executed: list[str] = []
+    idents: list[str] = []
     segs = _lex_sql(text)
     for idx, seg in enumerate(segs):
         kind = seg[0]
         if kind == 'code':
-            code_parts.append(seg[1])
+            items.append((seg[1], False))
+        elif kind == 'ident':
+            idents.append(seg[2])
+            items.append((_ident_token(len(idents) - 1), True))
         elif kind == 'string':
             prev_code = None
             for back in range(idx - 1, -1, -1):
@@ -157,30 +184,44 @@ def _scan_ddl_text(text: str, _depth: int = 0) -> tuple[str, list[str]]:
                     prev_code = segs[back][1]
                     break
             if prev_code is not None and _DO_OPEN_RE.search(prev_code):
-                _, nested_exec = _scan_ddl_text(seg[2][1], _depth + 1)
+                _, nested_exec, _ = _scan_ddl_text(seg[2][1], _depth + 1)
                 executed.extend(nested_exec)
-    return ' '.join(code_parts), executed
+    # Reassemble: identifiers glue to their neighbors exactly as in source
+    # (public."x" must stay adjacent); anything removed (comments, strings,
+    # bodies) leaves a whitespace separator so keywords never fuse.
+    code_text = ''
+    prev_ident = False
+    first = True
+    for text, is_ident in items:
+        if not first and not prev_ident and not is_ident:
+            code_text += ' '
+        code_text += text
+        prev_ident = is_ident
+        first = False
+    return code_text, executed, idents
 
 
-def scan_ddl_text(text: str) -> tuple[str, list[str]]:
+def scan_ddl_text(text: str) -> tuple[str, list[str], list[str]]:
     """
     Public entry point to the SQL lexical scan: splits DDL text into
-    top-level code (no comments, no string contents, no dollar-quoted
-    bodies except DO) plus dynamic DDL literals following EXECUTE.
+    top-level code (no comments, no string/identifier contents, no
+    dollar-quoted bodies except DO), dynamic DDL literals following EXECUTE,
+    and the quoted-identifier table backing the opaque placeholders.
     Shared by dump validation and DDL object identification so both agree
     on which command a statement effectively executes.
     """
     return _scan_ddl_text(text)
 
 
-def _match_creates(code_text: str, patterns: list[tuple]) -> set[str]:
-    """Runs CREATE-object patterns over code-only text, unescaping "" quotes."""
+def _match_creates(code_text: str, patterns: list[tuple], idents: list[str]) -> set[str]:
+    """Runs CREATE-object patterns over code-only text with opaque identifiers."""
     defined = set()
     for cat, pat in patterns:
         for m in pat.finditer(code_text):
-            raw_name = (m.group(1) or m.group(2)).strip()
-            if m.group(1):
-                raw_name = raw_name.replace('""', '"')
+            if m.group(1) is not None:
+                raw_name = idents[int(m.group(1))].strip()
+            else:
+                raw_name = m.group(2).strip()
             upper_name = raw_name.upper()
             defined.add(upper_name)
             if cat == 'TRIGGER':
@@ -198,7 +239,7 @@ def _build_patterns(object_type: str = None) -> list[tuple]:
         patterns.append(
             ('PROCEDURE', re.compile(
                 r'\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:FUNCTION|PROCEDURE)\s+'
-                + _QUALIFIER + r'(?:' + _QUOTED_IDENT + r'|' + _BARE_IDENT + r')',
+                + _QUALIFIER + r'(?:' + _IDENT_REF + r'|' + _BARE_IDENT + r')',
                 re.IGNORECASE
             ))
         )
@@ -206,7 +247,7 @@ def _build_patterns(object_type: str = None) -> list[tuple]:
         patterns.append(
             ('VIEW', re.compile(
                 r'\bCREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+'
-                + _QUALIFIER + r'(?:' + _QUOTED_IDENT + r'|' + _BARE_IDENT + r')',
+                + _QUALIFIER + r'(?:' + _IDENT_REF + r'|' + _BARE_IDENT + r')',
                 re.IGNORECASE
             ))
         )
@@ -214,7 +255,7 @@ def _build_patterns(object_type: str = None) -> list[tuple]:
         patterns.append(
             ('TRIGGER', re.compile(
                 r'\bCREATE\s+TRIGGER\s+'
-                + _QUALIFIER + r'(?:' + _QUOTED_IDENT + r'|' + _BARE_IDENT + r')',
+                + _QUALIFIER + r'(?:' + _IDENT_REF + r'|' + _BARE_IDENT + r')',
                 re.IGNORECASE
             ))
         )
@@ -222,7 +263,7 @@ def _build_patterns(object_type: str = None) -> list[tuple]:
         patterns.append(
             ('DOMAIN', re.compile(
                 r'\bCREATE\s+DOMAIN\s+'
-                + _QUALIFIER + r'(?:' + _QUOTED_IDENT + r'|' + _BARE_IDENT + r')',
+                + _QUALIFIER + r'(?:' + _IDENT_REF + r'|' + _BARE_IDENT + r')',
                 re.IGNORECASE
             ))
         )
@@ -230,7 +271,7 @@ def _build_patterns(object_type: str = None) -> list[tuple]:
         patterns.append(
             ('SEQUENCE', re.compile(
                 r'\bCREATE\s+SEQUENCE\s+'
-                + _QUALIFIER + r'(?:' + _QUOTED_IDENT + r'|' + _BARE_IDENT + r')',
+                + _QUALIFIER + r'(?:' + _IDENT_REF + r'|' + _BARE_IDENT + r')',
                 re.IGNORECASE
             ))
         )
@@ -241,22 +282,24 @@ def extract_defined_objects(content: str, object_type: str = None) -> set[str]:
     """
     Extracts defined object names from PostgreSQL DDL content, normalized to uppercase.
 
-    Only real definitions count: string literals, comments and dollar-quoted
-    function/procedure bodies are invisible to the matcher, so text such as
-    RAISE NOTICE 'CREATE FUNCTION p2()' never fabricates an object. The one
-    exception is the exporter's DO-block idiom EXECUTE 'CREATE ...', whose
-    literal is real DDL executed when the file is applied. Handles
-    schema-qualified names and "" escaped quotes inside identifiers.
+    Only real definitions count: string literals, comments, quoted-identifier
+    contents and dollar-quoted function/procedure bodies are invisible to the
+    matcher, so text such as RAISE NOTICE 'CREATE FUNCTION p2()' never
+    fabricates an object — and neither does a hostile name like
+    "CREATE DOMAIN fake". The one exception is the exporter's DO-block idiom
+    EXECUTE 'CREATE ...', whose literal is real DDL executed when the file is
+    applied. Handles schema-qualified names and "" escaped quotes inside
+    identifiers.
     """
     patterns = _build_patterns(object_type)
-    code_text, executed_ddls = _scan_ddl_text(content)
-    defined = _match_creates(code_text, patterns)
+    code_text, executed_ddls, idents = _scan_ddl_text(content)
+    defined = _match_creates(code_text, patterns, idents)
     for ddl in executed_ddls:
-        sub_code, nested = _scan_ddl_text(ddl)
-        defined |= _match_creates(sub_code, patterns)
+        sub_code, nested, sub_idents = _scan_ddl_text(ddl)
+        defined |= _match_creates(sub_code, patterns, sub_idents)
         for sub in nested:
-            sub_code2, _ = _scan_ddl_text(sub)
-            defined |= _match_creates(sub_code2, patterns)
+            sub_code2, _, sub_idents2 = _scan_ddl_text(sub)
+            defined |= _match_creates(sub_code2, patterns, sub_idents2)
     return defined
 
 
