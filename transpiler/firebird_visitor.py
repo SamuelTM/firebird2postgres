@@ -1875,7 +1875,20 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                 # SELECT * projects only columns of tables that actually
                 # participate in this subquery (no out-of-scope leaks), one
                 # qualifier namespace per table (alias preferred), in FROM
-                # order. Duplicates across tables are kept in order.
+                # order. Duplicates across tables are kept in order, EXCEPT
+                # JOIN ... USING columns: per SQL/Firebird semantics the
+                # shared column is presented only once (first occurrence
+                # wins), so later tables skip already-projected USING cols.
+                # Qualified T.* keeps every explicitly requested column.
+                using_cols = set()
+                try:
+                    using_cols = {
+                        c.lower()
+                        for c in self._extract_using_columns_from_query_block(qb)
+                    }
+                except Exception:
+                    pass
+                emitted_using: set[str] = set()
                 for st in sub_tables:
                     qualifier = (st.alias_clean or st.table_name_clean or '').lower()
                     if not qualifier:
@@ -1883,7 +1896,12 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                     prefix = qualifier + '.'
                     for k, v in sub_symbols.items():
                         if k.lower().startswith(prefix):
-                            projections.append((k.split('.')[-1], v))
+                            col = k.split('.')[-1]
+                            if col.lower() in using_cols:
+                                if col.lower() in emitted_using:
+                                    continue
+                                emitted_using.add(col.lower())
+                            projections.append((col, v))
                 return projections
 
             if hasattr(sl, 'select_list_elements') and sl.select_list_elements():

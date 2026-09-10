@@ -183,6 +183,71 @@ class TestDateInferenceUnitRegression(unittest.TestCase):
             out = FirebirdToPostgresVisitor.transpile(sql, symbols=dict(symbols))
             self.assertIn("((X.D2 + (1) * INTERVAL '1 day')::date) - X.D2", out)
 
+    def test_star_join_using_merges_shared_column(self):
+        """
+        P1 regression: SELECT * over T JOIN U USING(K) presents K once, so
+        X(K,A,D) pairs D with U.D DATE (not the second K). INNER, LEFT and
+        FULL joins share the merged-column rule.
+        """
+        symbols = {"t.k": "INTEGER", "t.a": "INTEGER",
+                   "u.k": "INTEGER", "u.d": "DATE"}
+        for join in ("INNER", "LEFT", "FULL"):
+            sql = (f"WITH X(K,A,D) AS (SELECT * FROM T {join} JOIN U USING(K)) "
+                   "SELECT DATEADD(DAY, 1, X.D) - X.D FROM X;")
+            out = FirebirdToPostgresVisitor.transpile(sql, symbols=dict(symbols))
+            self.assertIn("((X.D + (1) * INTERVAL '1 day')::date) - X.D", out,
+                          f"{join} JOIN USING must merge K")
+
+    def test_star_join_using_multiple_columns(self):
+        """
+        P1 regression: USING(K,J) merges both shared columns; X(K,J,A,D)
+        keeps positions with D DATE.
+        """
+        symbols = {"t.k": "INTEGER", "t.j": "INTEGER", "t.a": "INTEGER",
+                   "u.k": "INTEGER", "u.j": "INTEGER", "u.d": "DATE"}
+        sql = ("WITH X(K,J,A,D) AS (SELECT * FROM T JOIN U USING(K, J)) "
+               "SELECT DATEADD(DAY, 1, X.D) - X.D FROM X;")
+        out = FirebirdToPostgresVisitor.transpile(sql, symbols=dict(symbols))
+        self.assertIn("((X.D + (1) * INTERVAL '1 day')::date) - X.D", out)
+
+    def test_star_join_using_chained(self):
+        """
+        P1 regression: chained USING merges each step; X(K,A,B,C) pairs C
+        with V.C DATE.
+        """
+        symbols = {"t.k": "INTEGER", "t.a": "INTEGER",
+                   "u.k": "INTEGER", "u.b": "INTEGER",
+                   "v.b": "INTEGER", "v.c": "DATE"}
+        sql = ("WITH X(K,A,B,C) AS (SELECT * FROM T JOIN U USING(K) "
+               "JOIN V USING(B)) "
+               "SELECT DATEADD(DAY, 1, X.C) - X.C FROM X;")
+        out = FirebirdToPostgresVisitor.transpile(sql, symbols=dict(symbols))
+        self.assertIn("((X.C + (1) * INTERVAL '1 day')::date) - X.C", out)
+
+    def test_star_join_using_with_outer_alias(self):
+        """
+        P1 regression: the merged projection also resolves through a CTE
+        table alias (FROM X x1).
+        """
+        symbols = {"t.k": "INTEGER", "t.a": "INTEGER",
+                   "u.k": "INTEGER", "u.d": "DATE"}
+        sql = ("WITH X(K,A,D) AS (SELECT * FROM T JOIN U USING(K)) "
+               "SELECT DATEADD(DAY, 1, x1.D) - x1.D FROM X x1;")
+        out = FirebirdToPostgresVisitor.transpile(sql, symbols=dict(symbols))
+        self.assertIn("((x1.D + (1) * INTERVAL '1 day')::date) - x1.D", out)
+
+    def test_qualified_stars_keep_both_shared_columns(self):
+        """
+        P1 counterpart: T.*, U.* explicitly requests every column, so both K
+        copies are projected (4 slots) and X.D still pairs with U.D DATE.
+        """
+        symbols = {"t.k": "INTEGER", "t.a": "INTEGER",
+                   "u.k": "INTEGER", "u.d": "DATE"}
+        sql = ("WITH X(K1,A,K2,D) AS (SELECT T.*, U.* FROM T JOIN U USING(K)) "
+               "SELECT DATEADD(DAY, 1, X.D) - X.D FROM X;")
+        out = FirebirdToPostgresVisitor.transpile(sql, symbols=dict(symbols))
+        self.assertIn("((X.D + (1) * INTERVAL '1 day')::date) - X.D", out)
+
 
 @requires_postgres_class
 class TestDateInferenceLivePostgresRegression(unittest.TestCase):
@@ -342,6 +407,14 @@ class TestDateInferenceCrossDatabaseRegression(unittest.TestCase):
         self.fb_con.commit()
         self.fb_cur.execute("INSERT INTO REG_DATEPOS_T2 VALUES ('2026-09-08');")
         self.fb_con.commit()
+        self.fb_cur.execute("CREATE TABLE REG_USING_T (K INTEGER, A INTEGER);")
+        self.fb_con.commit()
+        self.fb_cur.execute("INSERT INTO REG_USING_T VALUES (1, 10);")
+        self.fb_con.commit()
+        self.fb_cur.execute("CREATE TABLE REG_USING_U (K INTEGER, D DATE);")
+        self.fb_con.commit()
+        self.fb_cur.execute("INSERT INTO REG_USING_U VALUES (1, '2026-09-08');")
+        self.fb_con.commit()
         self.pg_cur.execute("DROP TABLE IF EXISTS reg_datepos_t CASCADE;")
         self.pg_cur.execute("DROP TABLE IF EXISTS reg_datepos_u CASCADE;")
         self.pg_cur.execute("DROP TABLE IF EXISTS reg_datepos_t1 CASCADE;")
@@ -354,10 +427,17 @@ class TestDateInferenceCrossDatabaseRegression(unittest.TestCase):
         self.pg_cur.execute("INSERT INTO reg_datepos_u VALUES ('2026-09-08');")
         self.pg_cur.execute("INSERT INTO reg_datepos_t1 VALUES ('2026-09-08 15:30:45');")
         self.pg_cur.execute("INSERT INTO reg_datepos_t2 VALUES ('2026-09-08');")
+        self.pg_cur.execute("DROP TABLE IF EXISTS reg_using_t CASCADE;")
+        self.pg_cur.execute("DROP TABLE IF EXISTS reg_using_u CASCADE;")
+        self.pg_cur.execute("CREATE TABLE reg_using_t (k INTEGER, a INTEGER);")
+        self.pg_cur.execute("CREATE TABLE reg_using_u (k INTEGER, d DATE);")
+        self.pg_cur.execute("INSERT INTO reg_using_t VALUES (1, 10);")
+        self.pg_cur.execute("INSERT INTO reg_using_u VALUES (1, '2026-09-08');")
 
     def _cleanup(self):
         for stmt in ("DROP TABLE REG_DATEPOS_T;", "DROP TABLE REG_DATEPOS_U;",
-                     "DROP TABLE REG_DATEPOS_T1;", "DROP TABLE REG_DATEPOS_T2;"):
+                     "DROP TABLE REG_DATEPOS_T1;", "DROP TABLE REG_DATEPOS_T2;",
+                     "DROP TABLE REG_USING_T;", "DROP TABLE REG_USING_U;"):
             try:
                 self.fb_cur.execute(stmt)
                 self.fb_con.commit()
@@ -366,7 +446,9 @@ class TestDateInferenceCrossDatabaseRegression(unittest.TestCase):
         for stmt in ("DROP TABLE IF EXISTS reg_datepos_t CASCADE;",
                      "DROP TABLE IF EXISTS reg_datepos_u CASCADE;",
                      "DROP TABLE IF EXISTS reg_datepos_t1 CASCADE;",
-                     "DROP TABLE IF EXISTS reg_datepos_t2 CASCADE;"):
+                     "DROP TABLE IF EXISTS reg_datepos_t2 CASCADE;",
+                     "DROP TABLE IF EXISTS reg_using_t CASCADE;",
+                     "DROP TABLE IF EXISTS reg_using_u CASCADE;"):
             try:
                 self.pg_cur.execute(stmt)
             except Exception:
@@ -448,6 +530,34 @@ class TestDateInferenceCrossDatabaseRegression(unittest.TestCase):
         self.assertEqual(pg_row[1], "timestamp without time zone")
         self.assertEqual(pg_row[2], fb_rows[0][1])
         self.assertEqual(pg_row[3], "integer")
+
+    def test_star_join_using_matches_in_both_databases(self):
+        """
+        P1 regression: WITH X(K,A,D) AS (SELECT * FROM T JOIN U USING(K))
+        merges K once, so the DATEADD over X.D is integer 1 in Firebird
+        and integer in PostgreSQL. INNER and FULL variants.
+        """
+        symbols = {"reg_using_t.k": "INTEGER", "reg_using_t.a": "INTEGER",
+                   "reg_using_u.k": "INTEGER", "reg_using_u.d": "DATE"}
+        for join in ("INNER", "FULL"):
+            fb_sql = (f"WITH X(K, A, D) AS (SELECT * FROM REG_USING_T {join} "
+                      f"JOIN REG_USING_U USING(K)) "
+                      f"SELECT DATEADD(DAY, 1, D) - D FROM X")
+            self.fb_cur.execute(fb_sql)
+            fb_rows = self.fb_cur.fetchall()
+            self.assertEqual([(1,)], [(r[0],) for r in fb_rows],
+                             f"{join} JOIN USING native result")
+            self.assertIsInstance(fb_rows[0][0], int)
+
+            pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql, symbols=dict(symbols))
+            self.assertIn("::date", pg_sql)
+            inner = pg_sql.rstrip().rstrip(';')
+            self.pg_cur.execute(
+                f"SELECT v, pg_typeof(v)::text FROM ({inner}) s(v);")
+            pg_row = self.pg_cur.fetchone()
+            self.assertIsNotNone(pg_row)
+            self.assertEqual(pg_row[0], fb_rows[0][0])
+            self.assertEqual(pg_row[1], "integer")
 
 
 @requires_firebird_class
