@@ -178,6 +178,57 @@ class TestFrozenSourceProtectionRegression(unittest.TestCase):
         self.assertLess(events.index('check_source_consistency'), events.index('export_all_firebird_ddl'))
         self.assertLess(events.index('check_source_consistency'), events.index('drop_schema'))
 
+    def test_validate_memory_budget_resolves_config_and_rejects_impossible(self):
+        """Direct unit cover for the pre-flight memory gate."""
+        migrator, _ = self._setup_migrator_with_mocked_lifecycle()
+        total, worker, blob = migrator.validate_memory_budget()
+        self.assertLessEqual(4 * worker, total)
+
+        bad_config = MigrationConfig(
+            total_memory_budget_bytes=64 * 1024 * 1024,
+            max_buffer_bytes_per_worker=32 * 1024 * 1024,
+            max_blob_bytes=8 * 1024 * 1024,
+        )
+        bad_migrator, _ = self._setup_migrator_with_mocked_lifecycle(config=bad_config)
+        with self.assertRaises(ValueError) as ctx:
+            bad_migrator.validate_memory_budget()
+        self.assertIn("exceeds total budget", str(ctx.exception))
+
+    def test_incompatible_memory_config_blocks_run_before_drop(self):
+        """
+        P1 regression: an impossible memory configuration (4 workers x 32MiB
+        per worker > 64MiB total) must fail the full run_migration() BEFORE
+        any export or destructive drop_schema(), never after wiping the target.
+        """
+        # Frozen source so the run reaches the memory gate.
+        self.mock_fb_cur.fetchone.side_effect = [(1, 0), (0,)]
+
+        bad_config = MigrationConfig(
+            total_memory_budget_bytes=64 * 1024 * 1024,
+            max_buffer_bytes_per_worker=32 * 1024 * 1024,
+            max_blob_bytes=8 * 1024 * 1024,
+        )
+        migrator, call_trace = self._setup_migrator_with_mocked_lifecycle(config=bad_config)
+
+        with self.assertRaises(ValueError) as ctx:
+            run_migration(migrator)
+
+        self.assertIn("exceeds total budget", str(ctx.exception))
+        self.assertEqual(call_trace, [], "No lifecycle step may run on impossible memory config")
+        self.assertNotIn('drop_schema', call_trace)
+
+    def test_compatible_memory_config_passes_preflight(self):
+        """A compatible configuration flows past the memory gate normally."""
+        self.mock_fb_cur.fetchone.side_effect = [(1, 0), (0,)]
+
+        migrator, call_trace = self._setup_migrator_with_mocked_lifecycle()
+        res = run_migration(migrator)
+
+        self.assertTrue(res)
+        self.assertIn('export_all_firebird_ddl', call_trace)
+        self.assertIn('drop_schema', call_trace)
+        self.assertIn('import_data', call_trace)
+
 
 if __name__ == '__main__':
     unittest.main()

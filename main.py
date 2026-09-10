@@ -22,6 +22,15 @@ def run_migration(migrator: DatabaseMigrator) -> bool:
     migrator.check_source_consistency()
 
     # -------------------------------------------------------------
+    # PRE-FLIGHT CHECK: Effective memory budget compatibility
+    # MUST run before DDL export and destructive DROP / TRUNCATE:
+    # an impossible configuration (workers x per-worker > total, ...)
+    # must fail here, never after drop_schema() wiped the destination.
+    # -------------------------------------------------------------
+    logger.info("Validating effective memory budget (workers vs total vs BLOB limit)...")
+    migrator.validate_memory_budget()
+
+    # -------------------------------------------------------------
     # STEP 1: Export and transpile all Firebird DDLs
     # -------------------------------------------------------------
     logger.info("[STEP 1/9] Exporting and transpiling DDLs (Domains, Procedures, Views, Triggers)...")

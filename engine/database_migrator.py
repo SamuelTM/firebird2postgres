@@ -157,6 +157,34 @@ class DatabaseMigrator:
             logger.warning(f"Could not retrieve binary domains from Firebird catalog: {e}")
         return binary_domains
 
+    def validate_memory_budget(
+        self,
+        max_workers: int = 4,
+        total_memory_budget: int = None,
+        per_worker_budget: int = None,
+        max_blob_bytes: int = None
+    ) -> tuple[int, int, int]:
+        """
+        Validates the effective memory configuration (workers vs total budget
+        vs per-worker buffer vs max BLOB) BEFORE any destructive operation.
+        Resolves None arguments from MigrationConfig, then enforces
+        compatibility via DataMigrator.calculate_memory_budget, which raises
+        ValueError on impossible combinations. Returns
+        (total, per_worker, blob_limit) bytes when compatible.
+        """
+        tot_budget = getattr(self.config, 'total_memory_budget_bytes', None) \
+            if total_memory_budget is None else total_memory_budget
+        worker_budget = getattr(self.config, 'max_buffer_bytes_per_worker', None) \
+            if per_worker_budget is None else per_worker_budget
+        blob_limit = getattr(self.config, 'max_blob_bytes', None) \
+            if max_blob_bytes is None else max_blob_bytes
+        return DataMigrator.calculate_memory_budget(
+            max_workers=max_workers,
+            total_budget=tot_budget,
+            per_worker_budget=worker_budget,
+            max_blob_bytes=blob_limit
+        )
+
     def import_data(
         self,
         max_workers: int = 4,
@@ -173,6 +201,14 @@ class DatabaseMigrator:
         Enforces memory budgets per worker and overall, and streaming BLOB constraints.
         Returns True if successful, False if any table failed.
         """
+        # Pure-computation fail-fast: reject impossible memory configs before
+        # touching the source catalog or the destination database.
+        self.validate_memory_budget(
+            max_workers=max_workers,
+            total_memory_budget=total_memory_budget,
+            per_worker_budget=per_worker_budget,
+            max_blob_bytes=max_blob_bytes
+        )
         self._ensure_schema()
         req_frozen = self.config.require_frozen_source if require_frozen_source is None else require_frozen_source
         allow_live = self.config.allow_live_source if allow_live_source is None else allow_live_source
