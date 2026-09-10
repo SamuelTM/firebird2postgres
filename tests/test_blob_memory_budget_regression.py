@@ -1403,6 +1403,43 @@ class TestRealDriverMemoryBudget(unittest.TestCase):
             except Exception:
                 pass
 
+    def _make_text_table(self, payload):
+        from tests.db_isolation import get_test_firebird_connection as _connect
+        table_name = unique_name('MEM_TXT').upper()
+        fb_con = _connect()
+        try:
+            cur = fb_con.cursor()
+            cur.execute(
+                f"CREATE TABLE {table_name} (ID INTEGER, T0 BLOB SUB_TYPE 1, "
+                f"T1 BLOB SUB_TYPE 1, T2 BLOB SUB_TYPE 1)")
+            fb_con.commit()
+            cur.execute(
+                f"INSERT INTO {table_name} VALUES (?, ?, ?, ?)",
+                (1, payload, payload, payload))
+            fb_con.commit()
+        except Exception:
+            # Partial preparation must not orphan the table: clean up what
+            # was created before re-raising for the caller to handle.
+            try:
+                drop_con = _connect()
+                try:
+                    drop_con.cursor().execute(f"DROP TABLE {table_name}")
+                    drop_con.commit()
+                finally:
+                    try:
+                        drop_con.close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            raise
+        finally:
+            try:
+                fb_con.close()
+            except Exception:
+                pass
+        return table_name
+
     def _read_pg_payload(self, table_name):
         from tests.db_isolation import get_test_postgres_connection as _connect
         pg_con = _connect()
@@ -1471,26 +1508,11 @@ class TestRealDriverMemoryBudget(unittest.TestCase):
         before any fetchmany(), exercising OCTET_LENGTH, CAST and COALESCE
         against the live server.
         """
-        from tests.db_isolation import get_test_firebird_connection as _connect
-        fb_con = _connect()
-        table_name = unique_name('MEM_TXT').upper()
+        payload = '\t'.join(['x' * 100] * 80)
+        created = []
         try:
-            cur = fb_con.cursor()
-            cur.execute(
-                f"CREATE TABLE {table_name} (ID INTEGER, T0 BLOB SUB_TYPE 1, "
-                f"T1 BLOB SUB_TYPE 1, T2 BLOB SUB_TYPE 1)")
-            fb_con.commit()
-            payload = '\t'.join(['x' * 100] * 80)
-            cur.execute(
-                f"INSERT INTO {table_name} VALUES (?, ?, ?, ?)",
-                (1, payload, payload, payload))
-            fb_con.commit()
-        finally:
-            try:
-                fb_con.close()
-            except Exception:
-                pass
-        try:
+            table_name = self._make_text_table(payload)
+            created.append(('fb', table_name))
             ctx = multiprocessing.get_context('spawn')
             queue = ctx.Queue()
             proc = ctx.Process(
@@ -1503,7 +1525,7 @@ class TestRealDriverMemoryBudget(unittest.TestCase):
             finally:
                 proc.join(timeout=60)
         finally:
-            self._drop_blob_table(table_name)
+            self._drop_all(created)
         self.assertFalse(res.get('success'))
         self.assertIn('exceeds per-worker buffer', res.get('error'))
         self.assertEqual(
@@ -1889,6 +1911,109 @@ class TestFixtureCleanup(unittest.TestCase):
              patch('multiprocessing.get_context', return_value=mock_ctx):
             with self.assertRaisesRegex(RuntimeError, 'spawn boom'):
                 case.test_simultaneous_workers_bound_aggregate_peak()
+        self.assertTrue(created, "Fixtures should have been created before the spawn failure")
+        for name in created:
+            self.assertFalse(self._fb_table_exists(name), f"Leaked Firebird table {name}")
+
+    def test_text_table_insert_failure_attempts_cleanup(self):
+        """
+        Unit companion (no live DB): CREATE ok, INSERT raises -> the helper
+        must attempt DROP TABLE and re-raise instead of orphaning.
+        """
+        mock_con = MagicMock()
+        mock_cur = MagicMock()
+        mock_con.cursor.return_value = mock_cur
+        calls = []
+
+        def execute(sql, *args, **kwargs):
+            calls.append(str(sql))
+            if str(sql).strip().upper().startswith('INSERT'):
+                raise Exception('INSERT boom')
+            return None
+
+        mock_cur.execute.side_effect = execute
+        case = TestRealDriverMemoryBudget('test_real_driver_rejects_tab_heavy_text_row_before_materialization')
+        with patch('tests.db_isolation.get_test_firebird_connection', return_value=mock_con):
+            with self.assertRaisesRegex(Exception, 'INSERT boom'):
+                case._make_text_table('x' * 10)
+        drops = [sql for sql in calls if 'DROP TABLE' in sql]
+        self.assertTrue(drops, "Partial preparation must attempt cleanup of the created table")
+
+    @requires_firebird
+    def test_text_preparation_insert_failure_leaves_no_table(self):
+        """
+        P2: CREATE committed, INSERT fails for real -> the table must be
+        absent from the catalog afterwards (DROP calls alone prove nothing).
+        """
+        real_con = get_test_firebird_connection()
+
+        class _FailInsertCur:
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, *args, **kwargs):
+                if str(sql).strip().upper().startswith('INSERT'):
+                    raise Exception('INSERT boom')
+                return self._real.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        mock_con = MagicMock()
+        mock_con.cursor.return_value = _FailInsertCur(real_con.cursor())
+        mock_con.commit.side_effect = lambda: real_con.commit()
+        mock_con.close.side_effect = lambda: None
+        try:
+            case = TestRealDriverMemoryBudget('test_real_driver_rejects_tab_heavy_text_row_before_materialization')
+            with patch('tests.db_isolation.get_test_firebird_connection', return_value=mock_con), \
+                 patch('tests.test_blob_memory_budget_regression.unique_name',
+                       return_value='mem_partial_x'):
+                with self.assertRaisesRegex(Exception, 'INSERT boom'):
+                    case._make_text_table('x' * 10)
+            self.assertFalse(self._fb_table_exists('MEM_PARTIAL_X'))
+        finally:
+            try:
+                real_con.close()
+            except Exception:
+                pass
+            safety = get_test_firebird_connection()
+            try:
+                cur = safety.cursor()
+                try:
+                    cur.execute('DROP TABLE MEM_PARTIAL_X')
+                    safety.commit()
+                except Exception:
+                    pass
+            finally:
+                try:
+                    safety.close()
+                except Exception:
+                    pass
+
+    @requires_firebird
+    def test_text_worker_spawn_failure_removes_fixtures(self):
+        """
+        P2: fixtures created, worker spawn fails -> the text table must be
+        absent from the catalog afterwards.
+        """
+        created = []
+        orig_make_text = TestRealDriverMemoryBudget._make_text_table
+
+        def recording_text(inst, payload):
+            name = orig_make_text(inst, payload)
+            created.append(name)
+            return name
+
+        real_ctx = multiprocessing.get_context('spawn')
+        mock_ctx = MagicMock()
+        mock_ctx.Queue.side_effect = lambda: real_ctx.Queue()
+        mock_ctx.Process.side_effect = RuntimeError('spawn boom')
+
+        case = TestRealDriverMemoryBudget('test_real_driver_rejects_tab_heavy_text_row_before_materialization')
+        with patch.object(TestRealDriverMemoryBudget, '_make_text_table', recording_text), \
+             patch('multiprocessing.get_context', return_value=mock_ctx):
+            with self.assertRaisesRegex(RuntimeError, 'spawn boom'):
+                case.test_real_driver_rejects_tab_heavy_text_row_before_materialization()
         self.assertTrue(created, "Fixtures should have been created before the spawn failure")
         for name in created:
             self.assertFalse(self._fb_table_exists(name), f"Leaked Firebird table {name}")
