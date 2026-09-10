@@ -848,8 +848,8 @@ class TestAggregateRowBudget(unittest.TestCase):
         mock_fb_cur = MagicMock()
         mock_pg_cur = MagicMock()
         mock_pg_con = MagicMock()
-        # 3 MiB binary (6 MiB weighted) + 1 MiB text (1 MiB) = 7 MiB <= 8 MiB.
-        mock_fb_cur.fetchone.return_value = (3 * 1024 * 1024, 1 * 1024 * 1024, 7 * 1024 * 1024)
+        # 2 MiB binary (4 MiB weighted) + 1 MiB text (3 MiB) = 7 MiB <= 8 MiB.
+        mock_fb_cur.fetchone.return_value = (2 * 1024 * 1024, 1 * 1024 * 1024, 7 * 1024 * 1024)
         mock_fb_cur.fetchmany.side_effect = [[(1, b'X' * 100, 'y' * 100)], []]
         total, _ = _import_single_table(
             table, mock_fb_cur, mock_pg_cur, mock_pg_con,
@@ -858,9 +858,9 @@ class TestAggregateRowBudget(unittest.TestCase):
         )
         self.assertEqual(total, 1)
 
-        # Same layout but 3 MiB + 3 MiB text-heavy row: 6 + 3 = 9 MiB > 8 MiB.
+        # Same layout but over budget: 2x3 MiB binary + 3x1 MiB text = 9 MiB > 8 MiB.
         mock_fb_cur2 = MagicMock()
-        mock_fb_cur2.fetchone.return_value = (3 * 1024 * 1024, 3 * 1024 * 1024, 9 * 1024 * 1024)
+        mock_fb_cur2.fetchone.return_value = (3 * 1024 * 1024, 1 * 1024 * 1024, 9 * 1024 * 1024)
         with self.assertRaises(ValueError) as ctx:
             _import_single_table(
                 table, mock_fb_cur2, MagicMock(), MagicMock(),
@@ -869,6 +869,96 @@ class TestAggregateRowBudget(unittest.TestCase):
             )
         self.assertIn('exceeds per-worker buffer', str(ctx.exception))
         mock_fb_cur2.fetchmany.assert_not_called()
+
+
+class TestTextualAggregateBudget(unittest.TestCase):
+    """
+    P2: the preventive check weighted text 1x, but COPY escapes (tab,
+    newline, backslash) and UTF-8 conversion grow it. Three BLOBs of 40
+    tabs (120 raw bytes) were accepted under a 128 buffer and only failed
+    after fetchmany() + TRUNCATE. Text now weighs 3x with separators and
+    other columns included, so provably excessive rows die first.
+    """
+
+    def _text_table(self):
+        table = Table('TAB_TXT')
+        table.columns.append(Column('ID', 'INTEGER', nullable=False))
+        for i in range(3):
+            table.columns.append(Column(f'T{i}', 'BLOB SUBTYPE 1', nullable=True))
+        return table
+
+    def test_tabs_row_rejected_before_fetchmany_and_truncate(self):
+        table = self._text_table()
+        mock_fb_cur = MagicMock()
+        mock_pg_cur = MagicMock()
+        mock_pg_con = MagicMock()
+        # 3x40B tabs + ID: 3*120 + 2*1 + 4 seps = 366 > 128.
+        mock_fb_cur.fetchone.return_value = (40, 40, 40, 366)
+        mock_fb_cur.fetchmany.side_effect = [[(1, '\t' * 40, '\t' * 40, '\t' * 40)], []]
+
+        with self.assertRaises(ValueError) as ctx:
+            _import_single_table(
+                table, mock_fb_cur, mock_pg_cur, mock_pg_con,
+                max_buffer_bytes=128, max_blob_bytes=64,
+            )
+        self.assertIn('exceeds per-worker buffer', str(ctx.exception))
+        mock_fb_cur.fetchmany.assert_not_called()
+        mock_pg_cur.execute.assert_not_called()
+        mock_pg_con.commit.assert_not_called()
+
+    def test_textual_varieties_accepted_with_exact_content_and_cap(self):
+        table = self._text_table()
+        max_buffer = 4096
+        rows = [
+            (1, 'tab\there\nnew\\back\rcarriage', 'ação RGB 🚀', 'plain'),
+            (2, '\t' * 30, 'line1\nline2\nline3', '\\"quoted\\" \\'),
+        ]
+        mock_fb_cur = MagicMock()
+        mock_pg_cur = MagicMock()
+        mock_pg_con = MagicMock()
+        # Generous aggregate: worst row ~200B raw -> ~600B weighted <= 4096.
+        mock_fb_cur.fetchone.return_value = (60, 60, 60, 600)
+        mock_fb_cur.fetchmany.side_effect = [rows, []]
+
+        total, _ = _import_single_table(
+            table, mock_fb_cur, mock_pg_cur, mock_pg_con,
+            max_buffer_bytes=max_buffer, max_blob_bytes=2048,
+        )
+        self.assertEqual(total, 2)
+        for call in mock_pg_cur.copy_expert.call_args_list:
+            self.assertLessEqual(call[0][1].byte_count, max_buffer)
+        combined = ''.join(c[0][1].getvalue() for c in mock_pg_cur.copy_expert.call_args_list)
+        self.assertIn('ação RGB 🚀', combined)
+        self.assertIn('tab\\there\\nnew\\\\back\\rcarriage', combined)
+
+    def test_text_binary_mix_and_boundary_values(self):
+        table = Table('TAB_MIX2')
+        table.columns.append(Column('ID', 'INTEGER', nullable=False))
+        table.columns.append(Column('TXT', 'BLOB SUBTYPE 1', nullable=True))
+        table.columns.append(Column('BIN', 'BLOB SUBTYPE 0', nullable=True))
+        max_buffer = 1024
+        # Boundary: 2x200 + 3x100 + 2x1 + 3 seps = 705 <= 1024 passes...
+        ok_fb, ok_pg, ok_con = MagicMock(), MagicMock(), MagicMock()
+        ok_fb.fetchone.return_value = (100, 200, 705)
+        ok_fb.fetchmany.side_effect = [[(1, 'é' * 50, b'Z' * 200)], []]
+        total, _ = _import_single_table(
+            table, ok_fb, ok_pg, ok_con,
+            max_buffer_bytes=max_buffer, max_blob_bytes=512,
+        )
+        self.assertEqual(total, 1)
+        buf = ok_pg.copy_expert.call_args[0][1]
+        self.assertLessEqual(buf.byte_count, max_buffer)
+        self.assertIn('é' * 50, buf.getvalue())
+
+        # ...while 705 < worst=1025 on the same budget rejects pre-read.
+        bad_fb = MagicMock()
+        bad_fb.fetchone.return_value = (100, 200, 1025)
+        with self.assertRaises(ValueError):
+            _import_single_table(
+                table, bad_fb, MagicMock(), MagicMock(),
+                max_buffer_bytes=max_buffer, max_blob_bytes=512,
+            )
+        bad_fb.fetchmany.assert_not_called()
 
 
 class _FakePgCur:
@@ -1024,6 +1114,51 @@ def _child_real_driver_import(queue, table_name, max_buffer_bytes, max_blob_byte
                 pass
 
 
+def _child_real_driver_text_import(queue, table_name, max_buffer_bytes, max_blob_bytes):
+    """
+    Spawn target like _child_real_driver_import but for a 3-text-BLOB
+    table, proving the weighted text aggregate (escapes + encoding) and
+    the CAST-based other-column terms against the live server.
+    """
+    from engine.data_migrator import _import_single_table
+    from models import Column, Table
+    from tests.db_isolation import get_test_firebird_connection
+
+    table = Table(table_name)
+    table.columns.append(Column('ID', 'INTEGER', nullable=False))
+    for i in range(3):
+        table.columns.append(Column(f'T{i}', 'BLOB SUBTYPE 1', nullable=True))
+
+    fb_con = get_test_firebird_connection()
+    fb_cur = _CountingFbCur(fb_con.cursor())
+    pg_con = _FakePgConn()
+    baseline = _rss_peak_bytes()
+    try:
+        rows, _ = _import_single_table(
+            table, fb_cur, pg_con.cur, pg_con,
+            max_buffer_bytes=max_buffer_bytes,
+            max_blob_bytes=max_blob_bytes,
+        )
+        queue.put({
+            'success': True,
+            'rows': rows,
+            'peak_delta': _rss_peak_bytes() - baseline,
+            'fetchmany_calls': fb_cur.fetchmany_calls,
+        })
+    except Exception as exc:
+        queue.put({
+            'success': False,
+            'error': f"{type(exc).__name__}: {exc}",
+            'peak_delta': _rss_peak_bytes() - baseline,
+            'fetchmany_calls': fb_cur.fetchmany_calls,
+        })
+    finally:
+        try:
+            fb_con.close()
+        except Exception:
+            pass
+
+
 class TestRealDriverMemoryBudget(unittest.TestCase):
     """
     P2: BytesIO/tracemalloc cannot prove the real-driver path, whose C
@@ -1171,6 +1306,63 @@ class TestRealDriverMemoryBudget(unittest.TestCase):
             f"RSS peak delta ({res['peak_delta'] / (1024 * 1024):.2f}MiB) shows "
             f"the 3MiB BLOB was materialized despite the limit",
         )
+
+    @requires_firebird
+    def test_real_driver_rejects_tab_heavy_text_row_before_materialization(self):
+        """
+        P2: three 8 KiB tab-heavy TEXT BLOBs (24 KiB raw, ~48 KiB escaped)
+        under a 64 KiB buffer: the 3x-weighted aggregate (~72 KiB) rejects
+        before any fetchmany(), exercising OCTET_LENGTH, CAST and COALESCE
+        against the live server.
+        """
+        from tests.db_isolation import get_test_firebird_connection as _connect
+        fb_con = _connect()
+        table_name = unique_name('MEM_TXT').upper()
+        try:
+            cur = fb_con.cursor()
+            cur.execute(
+                f"CREATE TABLE {table_name} (ID INTEGER, T0 BLOB SUB_TYPE 1, "
+                f"T1 BLOB SUB_TYPE 1, T2 BLOB SUB_TYPE 1)")
+            fb_con.commit()
+            payload = '\t'.join(['x' * 100] * 80)
+            cur.execute(
+                f"INSERT INTO {table_name} VALUES (?, ?, ?, ?)",
+                (1, payload, payload, payload))
+            fb_con.commit()
+        finally:
+            try:
+                fb_con.close()
+            except Exception:
+                pass
+        try:
+            ctx = multiprocessing.get_context('spawn')
+            queue = ctx.Queue()
+            proc = ctx.Process(
+                target=_child_real_driver_text_import,
+                args=(queue, table_name, 64 * 1024, 16 * 1024),
+            )
+            proc.start()
+            try:
+                res = queue.get(timeout=180)
+            finally:
+                proc.join(timeout=60)
+        finally:
+            drop_con = _connect()
+            try:
+                drop_con.cursor().execute(f"DROP TABLE {table_name}")
+                drop_con.commit()
+            finally:
+                try:
+                    drop_con.close()
+                except Exception:
+                    pass
+        self.assertFalse(res.get('success'))
+        self.assertIn('exceeds per-worker buffer', res.get('error'))
+        self.assertEqual(
+            res.get('fetchmany_calls'), 0,
+            "Tab-heavy text row must be rejected before any fetchmany materializes it",
+        )
+        self.assertLess(res.get('peak_delta'), self.REJECT_PEAK_BOUND)
 
     @requires_firebird
     def test_real_copy_import_bounds_peak_and_sizes(self):

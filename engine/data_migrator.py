@@ -342,24 +342,30 @@ def _reject_oversized_blobs(fb_cur, table: Table, cols_to_import: list,
 
     1. Individual limit: MAX(OCTET_LENGTH) per BLOB column must fit
        max_blob_bytes (names the offending column).
-    2. Aggregate row budget: the worst row's weighted BLOB payload must fit
-       max_buffer_bytes once serialized. Binary columns weigh 2x (hex
-       expansion: the 2x factor reserves equal space for driver-side raw
-       bytes and serialized output); text columns weigh 1x. This rejects
-       rows of individually-valid BLOBs that are collectively excessive
-       (e.g. eight 4 MiB BLOBs under an 8 MiB worker buffer).
+    2. Aggregate row budget: a conservative estimate of the ENTIRE worst
+       serialized row must fit max_buffer_bytes:
+         - binary BLOBs weigh 2x (hex expansion; the 2x factor reserves equal
+           space for driver-side raw bytes and serialized output);
+         - text BLOBs weigh 3x (UTF-8 conversion of connection-charset bytes
+           plus COPY escapes for backslash, newline, carriage return, tab);
+         - every other column weighs 2x its CAST AS VARCHAR length (escapes);
+         - one byte per column covers tab separators and the newline.
+       Rows provably excessive are rejected before any fetchmany().
 
     Conceptually max_buffer_bytes is the BUFFER limit (serialized COPY
     bytes), while worker MEMORY transiently holds raw driver data plus the
-    serialized buffer; the 2x weight keeps the aggregate within budget.
-    Values that are not plain ints (e.g. unconfigured test doubles) are
-    ignored here; the streaming checks remain the backstop for them.
+    serialized buffer. A probe query failure (e.g. an exotic type the CAST
+    cannot render) only logs a warning and proceeds: the exact per-row cap
+    during streaming remains the hard guarantee that no over-limit buffer
+    is ever delivered. Values that are not plain ints (e.g. unconfigured
+    test doubles) are likewise ignored here.
     """
     if max_blob_bytes is None or max_blob_bytes <= 0:
         return
     blob_cols = [c for c in cols_to_import if is_blob_column(c, blob_domains)]
     if not blob_cols:
         return
+    other_cols = [c for c in cols_to_import if c not in blob_cols]
     max_exprs = []
     for c in blob_cols:
         quoted = f'OCTET_LENGTH({pg_quote_ident(c.name)})'
@@ -370,12 +376,24 @@ def _reject_oversized_blobs(fb_cur, table: Table, cols_to_import: list,
         if is_binary_column(c, binary_domains):
             weighted_terms.append(f'2 * ({quoted})')
         else:
-            weighted_terms.append(f'({quoted})')
+            weighted_terms.append(f'3 * ({quoted})')
+    for c in other_cols:
+        quoted = (f'COALESCE(OCTET_LENGTH(CAST({pg_quote_ident(c.name)} '
+                  f'AS VARCHAR(32765))), 0)')
+        weighted_terms.append(f'2 * ({quoted})')
+    weighted_terms.append(str(len(cols_to_import)))
     max_exprs.append(f'MAX({" + ".join(weighted_terms)})')
-    fb_cur.execute(
-        f'SELECT {", ".join(max_exprs)} FROM {pg_quote_ident(table.name)}'
-    )
-    row = fb_cur.fetchone()
+    try:
+        fb_cur.execute(
+            f'SELECT {", ".join(max_exprs)} FROM {pg_quote_ident(table.name)}'
+        )
+        row = fb_cur.fetchone()
+    except firebirdsql.Error as e:
+        logger.warning(
+            f"Aggregate BLOB pre-check unavailable for '{table.name}': {e}. "
+            f"Proceeding; per-row streaming limits still apply."
+        )
+        return
     if not row:
         return
     for col, max_len in zip(blob_cols, row):
