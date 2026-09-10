@@ -1459,7 +1459,17 @@ class TestRealDriverMemoryBudget(unittest.TestCase):
         except Exception:
             # Partial preparation must not orphan the table: clean up what
             # was created before re-raising for the caller to handle.
+            # End the preparation transaction and release its resources
+            # BEFORE attempting removal: otherwise DROP can block on them.
             try:
+                try:
+                    fb_con.rollback()
+                except Exception:
+                    pass
+                try:
+                    fb_con.close()
+                except Exception:
+                    pass
                 drop_con = _connect()
                 try:
                     drop_con.cursor().execute(f"DROP TABLE {table_name}")
@@ -1530,7 +1540,17 @@ class TestRealDriverMemoryBudget(unittest.TestCase):
             cur.execute(f'DROP TABLE IF EXISTS "{table_name.lower()}";')
             cur.execute(f'CREATE TABLE "{table_name.lower()}" (id INTEGER, payload BYTEA);')
         except Exception:
+            # End preparation resources before removal, mirroring the
+            # Firebird makers: a pending transaction can otherwise block DROP.
             try:
+                try:
+                    pg_con.rollback()
+                except Exception:
+                    pass
+                try:
+                    pg_con.close()
+                except Exception:
+                    pass
                 drop_con = _connect()
                 try:
                     drop_con.autocommit = True
@@ -1599,7 +1619,17 @@ class TestRealDriverMemoryBudget(unittest.TestCase):
                     cur.execute(sql, params)
             fb_con.commit()
         except Exception:
+            # End the preparation transaction and release its resources
+            # BEFORE attempting removal: otherwise DROP can block on them.
             try:
+                try:
+                    fb_con.rollback()
+                except Exception:
+                    pass
+                try:
+                    fb_con.close()
+                except Exception:
+                    pass
                 drop_con = _connect()
                 try:
                     drop_con.cursor().execute(f"DROP TABLE {table_name}")
@@ -1636,7 +1666,17 @@ class TestRealDriverMemoryBudget(unittest.TestCase):
         except Exception:
             # Partial preparation must not orphan the table: clean up what
             # was created before re-raising for the caller to handle.
+            # End the preparation transaction and release its resources
+            # BEFORE attempting removal: otherwise DROP can block on them.
             try:
+                try:
+                    fb_con.rollback()
+                except Exception:
+                    pass
+                try:
+                    fb_con.close()
+                except Exception:
+                    pass
                 drop_con = _connect()
                 try:
                     drop_con.cursor().execute(f"DROP TABLE {table_name}")
@@ -2296,72 +2336,48 @@ class TestFixtureCleanup(unittest.TestCase):
         for name in created:
             self.assertFalse(self._fb_table_exists(name), f"Leaked Firebird table {name}")
 
-    def test_custom_insert_failure_attempts_cleanup(self):
-        """
-        Unit companion (no live DB): CREATE ok, INSERT raises -> the custom
-        fixture helper must attempt DROP TABLE and re-raise.
-        """
-        mock_con = MagicMock()
-        mock_cur = MagicMock()
-        mock_con.cursor.return_value = mock_cur
-        calls = []
-
-        def execute(sql, *args, **kwargs):
-            calls.append(str(sql))
-            if str(sql).strip().upper().startswith('INSERT'):
-                raise Exception('INSERT boom')
-            return None
-
-        mock_cur.execute.side_effect = execute
-        case = TestRealDriverMemoryBudget('test_real_driver_rejects_tab_heavy_text_row_before_materialization')
-        with patch('tests.db_isolation.get_test_firebird_connection', return_value=mock_con):
-            with self.assertRaisesRegex(Exception, 'INSERT boom'):
-                case._make_custom_fb_table(
-                    'MEM_PARTIAL_X',
-                    'CREATE TABLE MEM_PARTIAL_X (ID INTEGER)',
-                    [('INSERT INTO MEM_PARTIAL_X VALUES (?)', (1,))])
-        drops = [sql for sql in calls if 'DROP TABLE' in sql]
-        self.assertTrue(drops, "Partial preparation must attempt cleanup of the created table")
-
     @requires_firebird
     def test_custom_insert_failure_leaves_no_table(self):
         """
-        P2: CREATE committed, INSERT fails for real -> the table must be
-        absent from the catalog afterwards (DROP calls alone prove nothing).
+        P2: CREATE committed, INSERT fails server-side (unknown column) on a
+        DISTINCT preparation connection. Cleanup runs on ANOTHER real
+        connection, both run their real close cycle, the original error
+        propagates, and a third connection proves the table absent before
+        any safety-net cleanup.
         """
-        real_con = get_test_firebird_connection()
-
-        class _FailInsertCur:
-            def __init__(self, real):
-                self._real = real
-
-            def execute(self, sql, *args, **kwargs):
-                if str(sql).strip().upper().startswith('INSERT'):
-                    raise Exception('INSERT boom')
-                return self._real.execute(sql, *args, **kwargs)
-
-            def __getattr__(self, name):
-                return getattr(self._real, name)
-
-        mock_con = MagicMock()
-        mock_con.cursor.return_value = _FailInsertCur(real_con.cursor())
-        mock_con.commit.side_effect = lambda: real_con.commit()
-        mock_con.close.side_effect = lambda: None
         table_name = unique_name('MEM_PARTIAL').upper()
+        prep_con = get_test_firebird_connection()
+        drop_con = get_test_firebird_connection()
+        closed = []
+        for con in (prep_con, drop_con):
+            orig_close = con.close
+
+            def counting_close(orig=orig_close, _con=con):
+                closed.append(_con)
+                return orig()
+
+            con.close = counting_close
         case = TestRealDriverMemoryBudget('test_real_driver_rejects_tab_heavy_text_row_before_materialization')
         try:
-            with patch('tests.db_isolation.get_test_firebird_connection', return_value=mock_con):
-                with self.assertRaisesRegex(Exception, 'INSERT boom'):
+            with patch('tests.db_isolation.get_test_firebird_connection',
+                        side_effect=[prep_con, drop_con]):
+                with self.assertRaisesRegex(firebirdsql.OperationalError, 'NO_SUCH_COL'):
                     case._make_custom_fb_table(
                         table_name,
                         f"CREATE TABLE {table_name} (ID INTEGER)",
-                        [(f"INSERT INTO {table_name} VALUES (?)", (1,))])
+                        [(f"INSERT INTO {table_name} (ID, NO_SUCH_COL) VALUES (?, ?)",
+                          (1, 2))])
+            self.assertEqual(
+                {id(c) for c in closed},
+                {id(prep_con), id(drop_con)},
+                "Preparation and cleanup connections must both run their real close cycle")
             self.assertFalse(self._fb_table_exists(table_name))
         finally:
-            try:
-                real_con.close()
-            except Exception:
-                pass
+            for con in (prep_con, drop_con):
+                try:
+                    con.close()
+                except Exception:
+                    pass
             safety = get_test_firebird_connection()
             try:
                 cur = safety.cursor()
@@ -2379,37 +2395,54 @@ class TestFixtureCleanup(unittest.TestCase):
     @requires_firebird
     def test_custom_commit_failure_leaves_no_table(self):
         """
-        P2: CREATE and INSERT succeed but the subsequent commit fails ->
-        the table must be absent from the catalog afterwards.
+        P2: CREATE and INSERT succeed but the subsequent commit fails, on a
+        DISTINCT preparation connection. Cleanup runs on ANOTHER real
+        connection (after ending the preparation transaction/resources, so
+        DROP cannot block on them); both close for real, the original error
+        propagates, and a third connection proves absence first.
         """
-        real_con = get_test_firebird_connection()
-        mock_con = MagicMock()
-        mock_con.cursor.return_value = real_con.cursor()
-        commits = []
+        prep_con = get_test_firebird_connection()
+        drop_con = get_test_firebird_connection()
+        closed = []
+        for con in (prep_con, drop_con):
+            orig_close = con.close
 
-        def commit():
+            def counting_close(orig=orig_close, _con=con):
+                closed.append(_con)
+                return orig()
+
+            con.close = counting_close
+        commits = []
+        orig_commit = prep_con.commit
+
+        def flaky_commit():
             commits.append(1)
             if len(commits) == 2:
                 raise Exception('commit boom')
-            return real_con.commit()
+            return orig_commit()
 
-        mock_con.commit.side_effect = commit
-        mock_con.close.side_effect = lambda: None
+        prep_con.commit = flaky_commit
         table_name = unique_name('MEM_COMMIT').upper()
         case = TestRealDriverMemoryBudget('test_real_driver_rejects_tab_heavy_text_row_before_materialization')
         try:
-            with patch('tests.db_isolation.get_test_firebird_connection', return_value=mock_con):
+            with patch('tests.db_isolation.get_test_firebird_connection',
+                        side_effect=[prep_con, drop_con]):
                 with self.assertRaisesRegex(Exception, 'commit boom'):
                     case._make_custom_fb_table(
                         table_name,
                         f"CREATE TABLE {table_name} (ID INTEGER)",
                         [(f"INSERT INTO {table_name} VALUES (?)", (1,))])
+            self.assertEqual(
+                {id(c) for c in closed},
+                {id(prep_con), id(drop_con)},
+                "Preparation and cleanup connections must both run their real close cycle")
             self.assertFalse(self._fb_table_exists(table_name))
         finally:
-            try:
-                real_con.close()
-            except Exception:
-                pass
+            for con in (prep_con, drop_con):
+                try:
+                    con.close()
+                except Exception:
+                    pass
             safety = get_test_firebird_connection()
             try:
                 cur = safety.cursor()
