@@ -415,6 +415,69 @@ class TestDateInferenceUnitRegression(unittest.TestCase):
             self.assertIn("((X.D + (1) * INTERVAL '1 day')::date) - X.D", out)
 
 
+class TestMixedUsingProbeClassification(unittest.TestCase):
+    """
+    P2 regression: the source-acceptance probe accepts ONLY Firebird's
+    specific type-incompatibility diagnostic. Connection, permission,
+    same-class/different-code and same-code/different-message failures
+    must propagate instead of passing as a valid rejection. No live
+    server needed: stub cursors inject faithful driver exceptions.
+    """
+
+    @staticmethod
+    def _stub_cursor(effect):
+        class StubCursor:
+            def execute(self, _sql):
+                if isinstance(effect, BaseException):
+                    raise effect
+                return effect
+        return StubCursor()
+
+    def test_runtime_error_propagates(self):
+        with self.assertRaisesRegex(RuntimeError, "unrelated injected failure"):
+            _probe_mixed_using_acceptance(
+                self._stub_cursor(RuntimeError("unrelated injected failure")))
+
+    def test_connection_refused_propagates(self):
+        with self.assertRaises(ConnectionRefusedError):
+            _probe_mixed_using_acceptance(
+                self._stub_cursor(ConnectionRefusedError(61, "Connection refused")))
+
+    def test_permission_denial_propagates(self):
+        err = firebirdsql.OperationalError(
+            "no permission for SELECT access to TABLE REG_ACC_T", sql_code=-551)
+        with self.assertRaises(firebirdsql.OperationalError):
+            _probe_mixed_using_acceptance(self._stub_cursor(err))
+
+    def test_same_class_different_code_propagates(self):
+        err = firebirdsql.OperationalError(
+            "Dynamic SQL Error\nSQL error code = -204\nTable unknown\nREG_ACC_T\n",
+            sql_code=-204)
+        with self.assertRaises(firebirdsql.OperationalError):
+            _probe_mixed_using_acceptance(self._stub_cursor(err))
+
+    def test_same_code_different_message_propagates(self):
+        err = firebirdsql.OperationalError(
+            "Dynamic SQL Error\nSQL error code = -104\nToken unknown\n",
+            sql_code=-104)
+        with self.assertRaises(firebirdsql.OperationalError):
+            _probe_mixed_using_acceptance(self._stub_cursor(err))
+
+    def test_specific_type_rejection_is_recorded(self):
+        err = firebirdsql.OperationalError(
+            "SQL error code = -104\n"
+            "Datatypes are not comparable in expression COALESCE\n",
+            sql_code=-104)
+        status, evidence = _probe_mixed_using_acceptance(self._stub_cursor(err))
+        self.assertEqual(status, "rejected")
+        self.assertIn("not comparable", evidence.lower())
+
+    def test_success_is_accepted(self):
+        self.assertEqual(
+            _probe_mixed_using_acceptance(self._stub_cursor(None)),
+            ("accepted", ""))
+
+
 @requires_postgres_class
 class TestDateInferenceLivePostgresRegression(unittest.TestCase):
     """
@@ -1044,6 +1107,45 @@ class TestDateInferenceCrossDatabaseRegression(unittest.TestCase):
                     pass
 
 
+_MIXED_USING_PROBE_SQL = "SELECT D FROM REG_ACC_T FULL JOIN REG_ACC_U USING(D)"
+_MIXED_USING_TYPE_SQLCODE = -104
+_MIXED_USING_TYPE_MARKER = "not comparable"
+
+
+def _is_mixed_using_type_rejection(err):
+    """
+    True only for Firebird's specific type-incompatibility diagnostic on a
+    mixed USING: OperationalError with SQLCODE -104 whose message reports
+    non-comparable datatypes. Class alone proves nothing (unknown tables
+    raise the same class with -204), SQLCODE alone proves nothing either
+    (-104 also wraps syntax errors), and connection, permission or
+    programming failures must never count as a type rejection.
+    """
+    if not isinstance(err, firebirdsql.OperationalError):
+        return False
+    if getattr(err, "sql_code", None) != _MIXED_USING_TYPE_SQLCODE:
+        return False
+    return _MIXED_USING_TYPE_MARKER in str(err).lower()
+
+
+def _probe_mixed_using_acceptance(cur):
+    """
+    Probe whether the source accepts a mixed DATE+TIMESTAMP USING.
+
+    Returns ("accepted", "") or ("rejected", <server message>). Any failure
+    that is not the specific type-incompatibility diagnostic is re-raised:
+    a lost connection, a permission denial or a programming bug must fail
+    the caller, never pass as a valid rejection.
+    """
+    try:
+        cur.execute(_MIXED_USING_PROBE_SQL)
+    except Exception as err:
+        if _is_mixed_using_type_rejection(err):
+            return ("rejected", str(err))
+        raise
+    return ("accepted", "")
+
+
 @requires_firebird_class
 class TestDateInferenceLiveFirebirdRegression(unittest.TestCase):
     """
@@ -1136,6 +1238,53 @@ class TestDateInferenceLiveFirebirdRegression(unittest.TestCase):
         finally:
             for stmt in ("DROP TABLE REG_FB_D1;", "DROP TABLE REG_FB_D2;",
                          "DROP TABLE REG_FB_T1;", "DROP TABLE REG_FB_T2;"):
+                try:
+                    self.cur.execute(stmt)
+                    self.conn.commit()
+                except Exception:
+                    pass
+
+    def test_mixed_using_source_acceptance(self):
+        """
+        Caveat coverage: a mixed DATE+TIMESTAMP USING is only comparable
+        across databases when the SOURCE accepts it. This server (FB 3.0)
+        rejects it with the specific -104 "not comparable" diagnostic, so
+        the run records that rejection; on a server that promotes, the same
+        shape must yield TIMESTAMP values with fractions preserved. Either
+        branch passes deterministically for its server; any other failure
+        (connection, permission, programming) propagates and fails the
+        test. The transpiler models the accepting semantics for PostgreSQL
+        regardless.
+        """
+        try:
+            self.cur.execute("CREATE TABLE REG_ACC_T (D DATE);")
+            self.cur.execute("CREATE TABLE REG_ACC_U (D TIMESTAMP);")
+            self.conn.commit()
+            self.cur.execute("INSERT INTO REG_ACC_T VALUES ('2026-09-08');")
+            self.cur.execute("INSERT INTO REG_ACC_U VALUES ('2026-09-09 15:30:45.5');")
+            self.conn.commit()
+
+            status, evidence = _probe_mixed_using_acceptance(self.cur)
+
+            if status == "rejected":
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
+                self.assertIn(_MIXED_USING_TYPE_MARKER, evidence.lower())
+            else:
+                self.cur.execute(
+                    "SELECT DATEADD(DAY, 1, D) FROM REG_ACC_T FULL JOIN REG_ACC_U USING(D) "
+                    "ORDER BY 1")
+                rows = self.cur.fetchall()
+                self.assertEqual(
+                    [(r[0],) for r in rows],
+                    [(datetime.datetime(2026, 9, 9, 0, 0),),
+                     (datetime.datetime(2026, 9, 10, 15, 30, 45, 500000),)])
+                for row in rows:
+                    self.assertIs(type(row[0]), datetime.datetime)
+        finally:
+            for stmt in ("DROP TABLE REG_ACC_T;", "DROP TABLE REG_ACC_U;"):
                 try:
                     self.cur.execute(stmt)
                     self.conn.commit()
