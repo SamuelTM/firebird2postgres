@@ -12,7 +12,7 @@ import psycopg2
 
 from config import get_postgres_connection, PostgresConfig, get_dump_path, DumpFiles
 from utils import split_sql_statements as split_sql_content
-from utils import scan_ddl_text
+from utils import scan_ddl_text, QUALIFIED_NAME_PATTERN
 
 DEFAULT_TARGET_FILES = [
     get_dump_path(DumpFiles.DOMAINS_PG),
@@ -73,12 +73,12 @@ def _identify_in_code(code_text: str, idents: list) -> Tuple[str, str]:
     """
     Runs the CREATE-object patterns over code-only text (no string literals,
     no comments, no identifier contents, no function bodies) with quoted
-    identifiers resolved from the identifier table. Kept separate so both
-    top-level code and EXECUTE'd DDL literals share the exact same
+    identifiers resolved from the identifier table. The qualified-name rule
+    is shared with dump validation (QUALIFIED_NAME_PATTERN). Kept separate
+    so both top-level code and EXECUTE'd DDL literals share the exact same
     identification rules.
     """
-    _ident = (r'(?:(?:\ue000\d+\ue001|[\w$]+)\s*\.\s*)?'
-              r'(?:\ue000(\d+)\ue001|([\w$]+))')
+    _ident = QUALIFIED_NAME_PATTERN
 
     # Domain: schema-qualified quoted form, plain quoted form, or bare unquoted form
     m = re.search(r'\bCREATE\s+DOMAIN\s+' + _ident, code_text, re.IGNORECASE)

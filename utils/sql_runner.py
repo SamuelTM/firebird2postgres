@@ -24,7 +24,12 @@ _IDENT_CLOSE = '\ue001'
 _IDENT_REF = _IDENT_OPEN + r'(\d+)' + _IDENT_CLOSE
 _IDENT_REF_NC = _IDENT_OPEN + r'\d+' + _IDENT_CLOSE
 _BARE_IDENT = r'([\w$]+)'
-_QUALIFIER = r'(?:(?:' + _IDENT_REF_NC + r'|[\w$]+)\.)?'
+_QUALIFIER = r'(?:(?:' + _IDENT_REF_NC + r'|[\w$]+)\s*\.\s*)?'
+# Shared qualified-name rule: schema-qualified (with any spacing or comments
+# around the dot, comments already stripped upstream) or bare object name.
+# Group 1 is the identifier-table index, group 2 the bare name. Used by dump
+# validation AND the DDL checker so both agree on the same SQL.
+QUALIFIED_NAME_PATTERN = _QUALIFIER + r'(?:' + _IDENT_REF + r'|' + _BARE_IDENT + r')'
 
 
 def _lex_sql(content: str) -> list[tuple]:
@@ -234,7 +239,7 @@ def _build_patterns(object_type: str = None) -> list[tuple]:
         patterns.append(
             ('PROCEDURE', re.compile(
                 r'\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:FUNCTION|PROCEDURE)\s+'
-                + _QUALIFIER + r'(?:' + _IDENT_REF + r'|' + _BARE_IDENT + r')',
+                + QUALIFIED_NAME_PATTERN,
                 re.IGNORECASE
             ))
         )
@@ -242,7 +247,7 @@ def _build_patterns(object_type: str = None) -> list[tuple]:
         patterns.append(
             ('VIEW', re.compile(
                 r'\bCREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+'
-                + _QUALIFIER + r'(?:' + _IDENT_REF + r'|' + _BARE_IDENT + r')',
+                + QUALIFIED_NAME_PATTERN,
                 re.IGNORECASE
             ))
         )
@@ -250,7 +255,7 @@ def _build_patterns(object_type: str = None) -> list[tuple]:
         patterns.append(
             ('TRIGGER', re.compile(
                 r'\bCREATE\s+TRIGGER\s+'
-                + _QUALIFIER + r'(?:' + _IDENT_REF + r'|' + _BARE_IDENT + r')',
+                + QUALIFIED_NAME_PATTERN,
                 re.IGNORECASE
             ))
         )
@@ -258,7 +263,7 @@ def _build_patterns(object_type: str = None) -> list[tuple]:
         patterns.append(
             ('DOMAIN', re.compile(
                 r'\bCREATE\s+DOMAIN\s+'
-                + _QUALIFIER + r'(?:' + _IDENT_REF + r'|' + _BARE_IDENT + r')',
+                + QUALIFIED_NAME_PATTERN,
                 re.IGNORECASE
             ))
         )
@@ -266,7 +271,7 @@ def _build_patterns(object_type: str = None) -> list[tuple]:
         patterns.append(
             ('SEQUENCE', re.compile(
                 r'\bCREATE\s+SEQUENCE\s+'
-                + _QUALIFIER + r'(?:' + _IDENT_REF + r'|' + _BARE_IDENT + r')',
+                + QUALIFIED_NAME_PATTERN,
                 re.IGNORECASE
             ))
         )

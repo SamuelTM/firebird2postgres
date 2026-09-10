@@ -286,6 +286,37 @@ class TestDumpValidationRegression(unittest.TestCase):
         self.assertNotIn('GHOST_FN', extract_defined_objects(dump))
         self.assertNotIn('FAKE', extract_defined_objects(dump))
 
+    def test_schema_qualified_names_with_spaces_and_comments(self):
+        """
+        P2 regression: public.d, "public"."d", "public" . "d" and qualifiers
+        split by comments all recognize D (never the schema). A dump with
+        only such a domain must NOT satisfy an expected PUBLIC domain.
+        """
+        variants = [
+            'CREATE DOMAIN public.d AS integer;',
+            'CREATE DOMAIN "public"."d" AS integer;',
+            'CREATE DOMAIN "public" . "d" AS integer;',
+            'CREATE DOMAIN "public" /* schema comment */ . "d" AS integer;',
+            'CREATE DOMAIN public -- trailing comment\n. d AS integer;',
+        ]
+        for sql in variants:
+            with self.subTest(sql=sql):
+                self.assertEqual(extract_defined_objects(sql, 'DOMAIN'), {'D'})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dom_file = os.path.join(tmpdir, DumpFiles.DOMAINS_PG)
+            with open(dom_file, "w", encoding="utf-8") as f:
+                f.write('CREATE DOMAIN "public" . "d" AS integer;\n')
+            for cat in [DumpFiles.PROCEDURES_PG, DumpFiles.VIEWS_PG, DumpFiles.TRIGGERS_PG]:
+                with open(os.path.join(tmpdir, cat), "w", encoding="utf-8") as f:
+                    f.write("/* EMPTY */\n")
+
+            runner = SqlRunner(MagicMock())
+            with self.assertRaises(ValueError) as ctx:
+                runner.validate_file(
+                    dom_file, expected_objects=["PUBLIC"], object_type='DOMAIN')
+            self.assertIn("missing 1 expected DOMAIN(s): PUBLIC", str(ctx.exception))
+
     def test_comments_inside_strings_neither_hide_nor_create_objects(self):
         """
         P1 regression: -- and /* */ markers inside string literals are text,

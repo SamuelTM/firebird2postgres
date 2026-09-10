@@ -125,6 +125,23 @@ class TestIdentifyObject(unittest.TestCase):
             ('OTHER', 'UNKNOWN')
         )
 
+    def test_schema_qualified_names_agree_with_validation(self):
+        """
+        P2 regression: the checker shares the qualified-name rule with dump
+        validation — public.d, "public"."d", "public" . "d" and
+        comment-split qualifiers all identify DOMAIN d, never PUBLIC.
+        """
+        variants = [
+            'CREATE DOMAIN public.d AS integer;',
+            'CREATE DOMAIN "public"."d" AS integer;',
+            'CREATE DOMAIN "public" . "d" AS integer;',
+            'CREATE DOMAIN "public" /* schema comment */ . "d" AS integer;',
+            'CREATE DOMAIN public -- trailing comment\n. d AS integer;',
+        ]
+        for sql in variants:
+            with self.subTest(sql=sql):
+                self.assertEqual(identify_object(sql), ('DOMAIN', 'd'))
+
     def test_hostile_function_name_identifies_as_single_function(self):
         """
         P1 regression: a function NAMED "CREATE DOMAIN fake" is one FUNCTION
