@@ -943,9 +943,9 @@ class TestTextualAggregateBudget(unittest.TestCase):
         table.columns.append(Column('TXT', 'BLOB SUBTYPE 1', nullable=True))
         table.columns.append(Column('BIN', 'BLOB SUBTYPE 0', nullable=True))
         max_buffer = 1024
-        # Boundary: 2x200 + 3x100 + 2x1 + 3 seps = 705 <= 1024 passes...
+        # Boundary: 3x100 text + 2x200 binary + 3x1 ID + 3 seps = 706 <= 1024.
         ok_fb, ok_pg, ok_con = MagicMock(), MagicMock(), MagicMock()
-        ok_fb.fetchone.return_value = (100, 200, 705)
+        ok_fb.fetchone.return_value = (100, 200, 706)
         ok_fb.fetchmany.side_effect = [[(1, 'é' * 50, b'Z' * 200)], []]
         total, _ = _import_single_table(
             table, ok_fb, ok_pg, ok_con,
@@ -956,7 +956,7 @@ class TestTextualAggregateBudget(unittest.TestCase):
         self.assertLessEqual(buf.byte_count, max_buffer)
         self.assertIn('é' * 50, buf.getvalue())
 
-        # ...while 705 < worst=1025 on the same budget rejects pre-read.
+        # ...while worst=1025 on the same budget rejects pre-read.
         bad_fb = MagicMock()
         bad_fb.fetchone.return_value = (100, 200, 1025)
         with self.assertRaises(ValueError):
@@ -965,6 +965,64 @@ class TestTextualAggregateBudget(unittest.TestCase):
                 max_buffer_bytes=max_buffer, max_blob_bytes=512,
             )
         bad_fb.fetchmany.assert_not_called()
+
+    def test_win1252_varchar_with_euro_rejected_before_read(self):
+        """
+        P2 repro: 200 WIN1252 € (200 stored bytes, 600 UTF-8 bytes) beside a
+        1-byte binary BLOB. Old 2x weighting estimated ~404 bytes and only
+        failed after fetchmany()+TRUNCATE near 606 serialized bytes; the 3x
+        whole-row estimate (608 > 512) rejects first.
+        """
+        table = Table('TAB_EURO')
+        table.columns.append(Column('ID', 'INTEGER', nullable=False))
+        table.columns.append(Column('VC', 'VARCHAR(250)', nullable=True))
+        table.columns.append(Column('B', 'BLOB SUBTYPE 0', nullable=True))
+        mock_fb_cur = MagicMock()
+        mock_pg_cur = MagicMock()
+        mock_pg_con = MagicMock()
+        # Per-column MAX (BLOB B only) + aggregate: 3x200 (VC) + 2x1 (BIN)
+        # + 3x1 (ID) + 3 seps = 608 > 512.
+        mock_fb_cur.fetchone.return_value = (1, 608)
+        mock_fb_cur.fetchmany.side_effect = [[(7, '€' * 200, b'\x01')], []]
+
+        with self.assertRaises(ValueError) as ctx:
+            _import_single_table(
+                table, mock_fb_cur, mock_pg_cur, mock_pg_con,
+                max_buffer_bytes=512, max_blob_bytes=256,
+            )
+        self.assertIn('exceeds per-worker buffer', str(ctx.exception))
+        mock_fb_cur.fetchmany.assert_not_called()
+        mock_pg_cur.execute.assert_not_called()
+        mock_pg_con.commit.assert_not_called()
+
+    def test_win1252_and_utf8_text_accepted_with_exact_content(self):
+        table = Table('TAB_TXTOk')
+        table.columns.append(Column('ID', 'INTEGER', nullable=False))
+        table.columns.append(Column('VC', 'VARCHAR(250)', nullable=True))
+        table.columns.append(Column('TXT', 'BLOB SUBTYPE 1', nullable=True))
+        table.columns.append(Column('BIN', 'BLOB SUBTYPE 0', nullable=True))
+        max_buffer = 8192
+        rows = [
+            (1, 'preço €\\/ hoje\t', 'ação\ncom\r\nquebras', b'\x00\x01\x02'),
+            (2, 'SMALL', 'x', None),
+        ]
+        mock_fb_cur = MagicMock()
+        mock_pg_cur = MagicMock()
+        mock_pg_con = MagicMock()
+        # Worst row ~60B raw -> ~200B weighted, far under the budget.
+        mock_fb_cur.fetchone.return_value = (20, 30, 200)
+        mock_fb_cur.fetchmany.side_effect = [rows, []]
+
+        total, _ = _import_single_table(
+            table, mock_fb_cur, mock_pg_cur, mock_pg_con,
+            max_buffer_bytes=max_buffer, max_blob_bytes=2048,
+        )
+        self.assertEqual(total, 2)
+        for call in mock_pg_cur.copy_expert.call_args_list:
+            self.assertLessEqual(call[0][1].byte_count, max_buffer)
+        combined = ''.join(c[0][1].getvalue() for c in mock_pg_cur.copy_expert.call_args_list)
+        self.assertIn('preço €', combined)
+        self.assertIn('ação', combined)
 
 
     def test_probe_errors_propagate_without_reads_or_writes(self):
@@ -1542,6 +1600,55 @@ class TestRealDriverMemoryBudget(unittest.TestCase):
             probe_sql = ' '.join(executed)
             for token in ('OCTET_LENGTH', 'COALESCE', 'CAST', 'MAX('):
                 self.assertIn(token, probe_sql)
+        finally:
+            self._drop_blob_table(table_name)
+
+    @requires_firebird
+    def test_live_mixed_varchar_blob_row_rejected_before_read(self):
+        """
+        P2: the € repro against the live server — 200 WIN1252 € (200 stored
+        bytes, 600 UTF-8) beside a 1-byte binary BLOB under a 512 buffer.
+        The weighted aggregate rejects with zero fetchmany() calls.
+        """
+        from engine.data_migrator import _reject_oversized_blobs
+
+        table = Table('TAB_EURO_LIVE')
+        table.columns.append(Column('ID', 'INTEGER', nullable=False))
+        table.columns.append(Column('VC', 'VARCHAR(250)', nullable=True))
+        table.columns.append(Column('B', 'BLOB SUBTYPE 0', nullable=True))
+
+        table_name = unique_name('MEM_EURO').upper()
+        fb_con = get_test_firebird_connection()
+        try:
+            cur = fb_con.cursor()
+            cur.execute(
+                f"CREATE TABLE {table_name} (ID INTEGER, "
+                f"VC VARCHAR(250) CHARACTER SET WIN1252, B BLOB SUB_TYPE 0)")
+            fb_con.commit()
+            cur.execute(
+                f"INSERT INTO {table_name} VALUES (?, ?, ?)",
+                (7, '€' * 200, b'\x01'))
+            fb_con.commit()
+        finally:
+            try:
+                fb_con.close()
+            except Exception:
+                pass
+        try:
+            check_con = get_test_firebird_connection()
+            try:
+                counting = _CountingFbCur(check_con.cursor())
+                table.name = table_name
+                with self.assertRaises(ValueError) as ctx:
+                    _reject_oversized_blobs(
+                        counting, table, table.columns, 256, 512)
+                self.assertIn('exceeds per-worker buffer', str(ctx.exception))
+                self.assertEqual(counting.fetchmany_calls, 0)
+            finally:
+                try:
+                    check_con.close()
+                except Exception:
+                    pass
         finally:
             self._drop_blob_table(table_name)
 

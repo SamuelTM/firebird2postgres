@@ -348,7 +348,8 @@ def _reject_oversized_blobs(fb_cur, table: Table, cols_to_import: list,
            space for driver-side raw bytes and serialized output);
          - text BLOBs weigh 3x (UTF-8 conversion of connection-charset bytes
            plus COPY escapes for backslash, newline, carriage return, tab);
-         - every other column weighs 2x its CAST AS VARCHAR length (escapes);
+         - every other column weighs 3x its CAST AS VARCHAR length (same
+           UTF-8 conversion plus COPY escapes as text BLOBs);
          - one byte per column covers tab separators and the newline.
        Rows provably excessive are rejected before any fetchmany().
 
@@ -379,9 +380,12 @@ def _reject_oversized_blobs(fb_cur, table: Table, cols_to_import: list,
         else:
             weighted_terms.append(f'3 * ({quoted})')
     for c in other_cols:
+        # 3x as well: CHAR/VARCHAR values undergo the same UTF-8 conversion
+        # (up to 3 bytes per WIN1252 byte, e.g. €) plus COPY escapes as text
+        # BLOBs; numerics and dates only overcount by bytes, harmlessly.
         quoted = (f'COALESCE(OCTET_LENGTH(CAST({pg_quote_ident(c.name)} '
                   f'AS VARCHAR(32765))), 0)')
-        weighted_terms.append(f'2 * ({quoted})')
+        weighted_terms.append(f'3 * ({quoted})')
     weighted_terms.append(str(len(cols_to_import)))
     max_exprs.append(f'MAX({" + ".join(weighted_terms)})')
     fb_cur.execute(
