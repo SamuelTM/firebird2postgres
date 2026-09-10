@@ -1,4 +1,25 @@
 from typing import Optional
+import re
+
+
+# PostgreSQL accepts GENERATED AS IDENTITY only on these bare column types:
+# a domain reference (even over integer) or any other type is rejected with
+# InvalidParameterValue ("identity column type must be smallint, integer, or bigint").
+_IDENTITY_CAPABLE_TYPES = frozenset({'smallint', 'integer', 'bigint', 'int2', 'int4', 'int8'})
+
+
+def _identity_base_type(column_type: str) -> str | None:
+    """
+    Returns the declared type when it can carry GENERATED AS IDENTITY,
+    else None. Matches on the head token so parameterized forms resolve
+    by their base ('INTEGER' passes, 'NUMERIC(18, 0)' does not).
+    """
+    if not column_type:
+        return None
+    head = re.split(r'[\s(]', column_type.strip().lower(), maxsplit=1)[0]
+    if head in _IDENTITY_CAPABLE_TYPES:
+        return column_type
+    return None
 
 
 class Column:
@@ -156,6 +177,21 @@ class Table:
         for i, col in enumerate(self.columns):
             type_decl = f'public.{pg_quote_ident(col.domain_name)}' if col.domain_name else get_postgres_type(col.column_type)
             escaped_name = pg_quote_ident(col.pg_name)
+
+            if col.identity_type and not col.computed_source:
+                # GENERATED AS IDENTITY is rejected on domain references and on
+                # non-integer types, so identity columns resolve to their
+                # integer base type here (fail fast with table/column context
+                # instead of PostgreSQL's typeless InvalidParameterValue).
+                base_decl = _identity_base_type(get_postgres_type(col.column_type))
+                if base_decl is None:
+                    raise TypeError(
+                        f"Identity column '{col.name}' in table '{self.name}' has type "
+                        f"'{col.column_type}'"
+                        f"{f' (domain {col.domain_name})' if col.domain_name else ''}: "
+                        "PostgreSQL GENERATED AS IDENTITY requires smallint, integer or bigint."
+                    )
+                type_decl = base_decl
 
             if col.computed_source:
                 expr = col.computed_source.strip()
