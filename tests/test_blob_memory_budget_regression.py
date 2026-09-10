@@ -915,9 +915,9 @@ class TestBinaryPrefixBudget(unittest.TestCase):
         mock_fb_cur = MagicMock()
         mock_pg_cur = MagicMock()
         mock_pg_con = MagicMock()
-        # Empty serializes to the 3-byte prefix; NULL to \N (no prefix).
-        # Worst row: (2x0+3) + 0 + 2 seps + trailing newline... = 8.
-        mock_fb_cur.fetchone.return_value = (0, 0, 8)
+        # Empty serializes to the 3-byte prefix; NULL to 2-byte \N.
+        # Worst row: (2x0+3) + 2 + 2 seps = 7.
+        mock_fb_cur.fetchone.return_value = (0, 0, 7)
         mock_fb_cur.fetchmany.side_effect = [[(b'', None), (None, b'')], []]
 
         total, _ = _import_single_table(
@@ -950,6 +950,94 @@ class TestBinaryPrefixBudget(unittest.TestCase):
         buf = mock_pg_cur.copy_expert.call_args[0][1]
         self.assertEqual(buf.byte_count, 24)
         self.assertEqual(buf.getvalue(), '\\\\x' + payload.hex() + '\n')
+
+    def test_null_blob_pair_rejected_before_read(self):
+        """
+        P2 repro: two BLOBs (15 bytes, NULL) under a 36 buffer. The old
+        estimate (35, NULL counted as zero) admitted the row and failed at
+        37 serialized bytes after fetchmany()+TRUNCATE; counting 2 bytes
+        per NULL (37) rejects in the preventive query.
+        """
+        table = Table('TAB_NULL15')
+        table.columns.append(Column('A', 'BLOB SUBTYPE 0', nullable=True))
+        table.columns.append(Column('B', 'BLOB SUBTYPE 0', nullable=True))
+        mock_fb_cur = MagicMock()
+        mock_pg_cur = MagicMock()
+        mock_pg_con = MagicMock()
+        # Per-column MAX (NULL ignored) + aggregate with NULL as \N.
+        mock_fb_cur.fetchone.return_value = (15, None, 37)
+        mock_fb_cur.fetchmany.side_effect = [[(b'X' * 15, None)], []]
+
+        with self.assertRaises(ValueError) as ctx:
+            _import_single_table(
+                table, mock_fb_cur, mock_pg_cur, mock_pg_con,
+                max_buffer_bytes=36, max_blob_bytes=32,
+            )
+        self.assertIn('exceeds per-worker buffer', str(ctx.exception))
+        mock_fb_cur.fetchmany.assert_not_called()
+        mock_pg_cur.execute.assert_not_called()
+        mock_pg_cur.copy_expert.assert_not_called()
+        mock_pg_con.commit.assert_not_called()
+
+    def test_null_in_each_category_exact_content(self):
+        """
+        P2: NULL in binary, textual and plain columns serializes as 2-byte
+        \\N each; combined with empty values the content stays exact and
+        buffers stay within budget.
+        """
+        table = Table('TAB_NULLS')
+        table.columns.append(Column('ID', 'INTEGER', nullable=False))
+        table.columns.append(Column('BB', 'BLOB SUBTYPE 0', nullable=True))
+        table.columns.append(Column('BT', 'BLOB SUBTYPE 1', nullable=True))
+        table.columns.append(Column('VC', 'VARCHAR(10)', nullable=True))
+        max_buffer = 64
+        mock_fb_cur = MagicMock()
+        mock_pg_cur = MagicMock()
+        mock_pg_con = MagicMock()
+        # Worst row: 3x1 (ID) + 2 + 2 + 2 (three NULLs) + 4 seps = 13.
+        mock_fb_cur.fetchone.return_value = (None, None, 13)
+        mock_fb_cur.fetchmany.side_effect = [[(1, None, None, None)], []]
+
+        total, _ = _import_single_table(
+            table, mock_fb_cur, mock_pg_cur, mock_pg_con,
+            max_buffer_bytes=max_buffer, max_blob_bytes=32,
+        )
+        self.assertEqual(total, 1)
+        buf = mock_pg_cur.copy_expert.call_args[0][1]
+        self.assertLessEqual(buf.byte_count, max_buffer)
+        self.assertEqual(buf.getvalue(), '1\t\\N\t\\N\t\\N\n')
+
+    def test_single_null_boundary_below_equal_above(self):
+        """
+        P2: one NULL binary column serializes to 3 bytes (\\N + newline
+        separator framing): buffers 2/3/4 reject, accept, accept.
+        """
+        table = Table('TAB_NULL1')
+        table.columns.append(Column('B', 'BLOB SUBTYPE 0', nullable=True))
+        # max_blob=1 keeps the fail-fast config check quiet so the aggregate
+        # alone decides: 3-byte NULL row vs buffers 2/3/4.
+        for max_buffer, worst, accepted in ((2, 3, False), (3, 3, True), (4, 3, True)):
+            with self.subTest(max_buffer=max_buffer):
+                mock_fb_cur = MagicMock()
+                mock_pg_cur = MagicMock()
+                mock_pg_con = MagicMock()
+                mock_fb_cur.fetchone.return_value = (None, worst)
+                mock_fb_cur.fetchmany.side_effect = [[(None,)], []]
+                if not accepted:
+                    with self.assertRaises(ValueError):
+                        _import_single_table(
+                            table, mock_fb_cur, mock_pg_cur, mock_pg_con,
+                            max_buffer_bytes=max_buffer, max_blob_bytes=1,
+                        )
+                    mock_fb_cur.fetchmany.assert_not_called()
+                else:
+                    total, _ = _import_single_table(
+                        table, mock_fb_cur, mock_pg_cur, mock_pg_con,
+                        max_buffer_bytes=max_buffer, max_blob_bytes=1,
+                    )
+                    self.assertEqual(total, 1)
+                    buf = mock_pg_cur.copy_expert.call_args[0][1]
+                    self.assertEqual(buf.getvalue(), '\\N\n')
 
 
 class TestTextualAggregateBudget(unittest.TestCase):
@@ -1805,6 +1893,58 @@ class TestRealDriverMemoryBudget(unittest.TestCase):
                     pass
         finally:
             self._drop_all(created)
+
+    @requires_firebird
+    def test_live_null_row_boundary_below_equal_above(self):
+        """
+        P2: a real (15 bytes, NULL) row serializes to 37 bytes
+        (33 + 2 for \\N + 2 separators). Buffers below reject in the live
+        aggregate, equal and above pass — validating the estimate against
+        the Firebird server instead of a mock.
+        """
+        from engine.data_migrator import _reject_oversized_blobs
+
+        table = Table('TAB_NULLIVE')
+        table.columns.append(Column('A', 'BLOB SUBTYPE 0', nullable=True))
+        table.columns.append(Column('B', 'BLOB SUBTYPE 0', nullable=True))
+
+        table_name = unique_name('MEM_NULLB').upper()
+        fb_con = get_test_firebird_connection()
+        try:
+            cur = fb_con.cursor()
+            cur.execute(
+                f"CREATE TABLE {table_name} (A BLOB SUB_TYPE 0, B BLOB SUB_TYPE 0)")
+            fb_con.commit()
+            cur.execute(f"INSERT INTO {table_name} VALUES (?, ?)", (b'X' * 15, None))
+            fb_con.commit()
+        finally:
+            try:
+                fb_con.close()
+            except Exception:
+                pass
+        try:
+            table.name = table_name
+            for max_buffer, accepted in ((36, False), (37, True), (64, True)):
+                with self.subTest(max_buffer=max_buffer):
+                    check_con = get_test_firebird_connection()
+                    try:
+                        counting = _CountingFbCur(check_con.cursor())
+                        if not accepted:
+                            with self.assertRaises(ValueError) as ctx:
+                                _reject_oversized_blobs(
+                                    counting, table, table.columns, 32, max_buffer)
+                            self.assertIn('exceeds per-worker buffer', str(ctx.exception))
+                            self.assertEqual(counting.fetchmany_calls, 0)
+                        else:
+                            _reject_oversized_blobs(
+                                counting, table, table.columns, 32, max_buffer)
+                    finally:
+                        try:
+                            check_con.close()
+                        except Exception:
+                            pass
+        finally:
+            self._drop_blob_table(table_name)
 
     @requires_live_databases
     def test_real_copy_import_bounds_peak_and_sizes(self):

@@ -344,11 +344,13 @@ def _reject_oversized_blobs(fb_cur, table: Table, cols_to_import: list,
        max_blob_bytes (names the offending column).
     2. Aggregate row budget: a conservative estimate of the ENTIRE worst
        serialized row must fit max_buffer_bytes:
-         - binary BLOBs weigh 2x plus the 3-character \\x COPY prefix, both
-           skipped for NULL values (hex expansion reserves equal space for
-           driver-side raw bytes and serialized output);
+         - binary BLOBs weigh 2x plus the 3-character \\x COPY prefix, the
+           prefix skipped for NULL values which serialize as 2-byte \\N
+           (hex expansion reserves equal space for driver-side raw bytes
+           and serialized output);
          - text BLOBs weigh 3x (UTF-8 conversion of connection-charset bytes
-           plus COPY escapes for backslash, newline, carriage return, tab);
+           plus COPY escapes for backslash, newline, carriage return, tab),
+           NULLs counting 2 bytes for \\N;
          - every other column weighs 3x its CAST AS VARCHAR length (same
            UTF-8 conversion plus COPY escapes as text BLOBs);
          - one byte per column covers tab separators and the newline.
@@ -378,20 +380,24 @@ def _reject_oversized_blobs(fb_cur, table: Table, cols_to_import: list,
         name = pg_quote_ident(c.name)
         if is_binary_column(c, binary_domains):
             # 2x hex expansion plus the 3-character \\x COPY prefix, emitted
-            # only for non-NULL values (NULL serializes as \N instead).
+            # only for non-NULL values (NULL serializes as 2-byte \N instead).
             weighted_terms.append(
-                f'(CASE WHEN {name} IS NULL THEN 0 '
+                f'(CASE WHEN {name} IS NULL THEN 2 '
                 f'ELSE 2 * OCTET_LENGTH({name}) + 3 END)')
         else:
+            # NULL text serializes as 2-byte \N instead of 3x nothing.
             quoted = f'COALESCE(OCTET_LENGTH({name}), 0)'
-            weighted_terms.append(f'3 * ({quoted})')
+            weighted_terms.append(
+                f'(CASE WHEN {name} IS NULL THEN 2 ELSE 3 * ({quoted}) END)')
     for c in other_cols:
         # 3x as well: CHAR/VARCHAR values undergo the same UTF-8 conversion
         # (up to 3 bytes per WIN1252 byte, e.g. €) plus COPY escapes as text
         # BLOBs; numerics and dates only overcount by bytes, harmlessly.
-        quoted = (f'COALESCE(OCTET_LENGTH(CAST({pg_quote_ident(c.name)} '
-                  f'AS VARCHAR(32765))), 0)')
-        weighted_terms.append(f'3 * ({quoted})')
+        # NULL serializes as 2-byte \N instead of 3x nothing.
+        name = pg_quote_ident(c.name)
+        quoted = f'COALESCE(OCTET_LENGTH(CAST({name} AS VARCHAR(32765))), 0)'
+        weighted_terms.append(
+            f'(CASE WHEN {name} IS NULL THEN 2 ELSE 3 * ({quoted}) END)')
     weighted_terms.append(str(len(cols_to_import)))
     max_exprs.append(f'MAX({" + ".join(weighted_terms)})')
     fb_cur.execute(
