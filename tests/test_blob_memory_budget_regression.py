@@ -3,7 +3,7 @@ import multiprocessing
 import os
 import tracemalloc
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from config import MigrationConfig
 from engine.data_migrator import (
@@ -17,9 +17,13 @@ from engine.data_migrator import (
 from engine.database_migrator import DatabaseMigrator
 from models import Column, Table
 from tests.db_isolation import (
+    STRICT_ENV_VAR,
     get_test_firebird_connection,
+    require_live_databases,
     require_live_firebird,
     requires_firebird,
+    requires_live_databases,
+    reset_availability_cache,
     unique_name,
 )
 
@@ -1170,14 +1174,30 @@ class TestRealDriverMemoryBudget(unittest.TestCase):
 
     def _make_blob_table(self, payload_bytes):
         from tests.db_isolation import get_test_firebird_connection as _connect
+        table_name = unique_name('MEM_BLOB').upper()
         fb_con = _connect()
         try:
-            table_name = unique_name('MEM_BLOB').upper()
             cur = fb_con.cursor()
             cur.execute(f"CREATE TABLE {table_name} (ID INTEGER, PAYLOAD BLOB SUB_TYPE 0)")
             fb_con.commit()
             cur.execute(f"INSERT INTO {table_name} VALUES (?, ?)", (1, payload_bytes))
             fb_con.commit()
+        except Exception:
+            # Partial preparation must not orphan the table: clean up what
+            # was created before re-raising for the caller to handle.
+            try:
+                drop_con = _connect()
+                try:
+                    drop_con.cursor().execute(f"DROP TABLE {table_name}")
+                    drop_con.commit()
+                finally:
+                    try:
+                        drop_con.close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            raise
         finally:
             try:
                 fb_con.close()
@@ -1189,11 +1209,17 @@ class TestRealDriverMemoryBudget(unittest.TestCase):
         from tests.db_isolation import get_test_firebird_connection as _connect
         # Fresh connection: the loader connection caches prepared statements
         # keeping an "interest" that would block DROP TABLE as "in use".
-        fb_con = _connect()
+        # Best-effort: cleanup must never mask the test's own failure.
+        try:
+            fb_con = _connect()
+        except Exception:
+            return
         try:
             cur = fb_con.cursor()
             cur.execute(f"DROP TABLE {table_name}")
             fb_con.commit()
+        except Exception:
+            pass
         finally:
             try:
                 fb_con.close()
@@ -1229,6 +1255,20 @@ class TestRealDriverMemoryBudget(unittest.TestCase):
             cur = pg_con.cursor()
             cur.execute(f'DROP TABLE IF EXISTS "{table_name.lower()}";')
             cur.execute(f'CREATE TABLE "{table_name.lower()}" (id INTEGER, payload BYTEA);')
+        except Exception:
+            try:
+                drop_con = _connect()
+                try:
+                    drop_con.autocommit = True
+                    drop_con.cursor().execute(f'DROP TABLE IF EXISTS "{table_name.lower()}";')
+                finally:
+                    try:
+                        drop_con.close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            raise
         finally:
             try:
                 pg_con.close()
@@ -1237,13 +1277,30 @@ class TestRealDriverMemoryBudget(unittest.TestCase):
 
     def _drop_pg_table(self, table_name):
         from tests.db_isolation import get_test_postgres_connection as _connect
-        pg_con = _connect()
+        # Best-effort: cleanup must never mask the test's own failure.
+        try:
+            pg_con = _connect()
+        except Exception:
+            return
         try:
             pg_con.autocommit = True
             pg_con.cursor().execute(f'DROP TABLE IF EXISTS "{table_name.lower()}";')
+        except Exception:
+            pass
         finally:
             try:
                 pg_con.close()
+            except Exception:
+                pass
+
+    def _drop_all(self, created):
+        """Drops (kind, name) fixtures in reverse order; never raises."""
+        for kind, name in reversed(created):
+            try:
+                if kind == 'fb':
+                    self._drop_blob_table(name)
+                else:
+                    self._drop_pg_table(name)
             except Exception:
                 pass
 
@@ -1347,15 +1404,7 @@ class TestRealDriverMemoryBudget(unittest.TestCase):
             finally:
                 proc.join(timeout=60)
         finally:
-            drop_con = _connect()
-            try:
-                drop_con.cursor().execute(f"DROP TABLE {table_name}")
-                drop_con.commit()
-            finally:
-                try:
-                    drop_con.close()
-                except Exception:
-                    pass
+            self._drop_blob_table(table_name)
         self.assertFalse(res.get('success'))
         self.assertIn('exceeds per-worker buffer', res.get('error'))
         self.assertEqual(
@@ -1364,7 +1413,7 @@ class TestRealDriverMemoryBudget(unittest.TestCase):
         )
         self.assertLess(res.get('peak_delta'), self.REJECT_PEAK_BOUND)
 
-    @requires_firebird
+    @requires_live_databases
     def test_real_copy_import_bounds_peak_and_sizes(self):
         """
         P2: same 2 MiB path with a REAL PostgreSQL COPY (libpq buffering
@@ -1372,13 +1421,13 @@ class TestRealDriverMemoryBudget(unittest.TestCase):
         limit, the PG roundtrip is bit-exact, and the RSS peak stays
         within the explicit limit-plus-margin bound.
         """
-        from tests.db_isolation import is_postgres_available, require_live_postgres
-
         blob = os.urandom(2 * 1024 * 1024)
-        table_name = self._make_blob_table(blob)
-        self._make_pg_table(table_name)
+        created = []
         try:
-            require_live_postgres(self)
+            table_name = self._make_blob_table(blob)
+            created.append(('fb', table_name))
+            self._make_pg_table(table_name)
+            created.append(('pg', table_name))
             res = self._run_child(
                 table_name, self.BUFFER_LIMIT, 4 * 1024 * 1024, use_real_pg=True)
             self.assertTrue(res.get('success'), f"Child failed: {res.get('error')}")
@@ -1397,25 +1446,26 @@ class TestRealDriverMemoryBudget(unittest.TestCase):
             self.assertEqual(len(pg_rows), 1)
             self.assertEqual(pg_rows[0], blob)
         finally:
-            self._drop_blob_table(table_name)
-            self._drop_pg_table(table_name)
+            self._drop_all(created)
 
-    @requires_firebird
+    @requires_live_databases
     def test_simultaneous_workers_bound_aggregate_peak(self):
         """
         P2: two workers importing concurrently (real Firebird reads, real
         PostgreSQL COPYs into separate tables). Each worker respects its own
         budget and the SUM of peaks stays within twice the per-worker bound.
         """
-        from tests.db_isolation import require_live_postgres
-
         blob = os.urandom(2 * 1024 * 1024)
-        table_a = self._make_blob_table(blob)
-        table_b = self._make_blob_table(blob)
-        self._make_pg_table(table_a)
-        self._make_pg_table(table_b)
+        created = []
         try:
-            require_live_postgres(self)
+            table_a = self._make_blob_table(blob)
+            created.append(('fb', table_a))
+            table_b = self._make_blob_table(blob)
+            created.append(('fb', table_b))
+            self._make_pg_table(table_a)
+            created.append(('pg', table_a))
+            self._make_pg_table(table_b)
+            created.append(('pg', table_b))
             ctx = multiprocessing.get_context('spawn')
             launched = []
             try:
@@ -1433,10 +1483,7 @@ class TestRealDriverMemoryBudget(unittest.TestCase):
                 for proc, _ in launched:
                     proc.join(timeout=60)
         finally:
-            self._drop_blob_table(table_a)
-            self._drop_blob_table(table_b)
-            self._drop_pg_table(table_a)
-            self._drop_pg_table(table_b)
+            self._drop_all(created)
         for res in results:
             self.assertTrue(res.get('success'), f"Child failed: {res.get('error')}")
             self.assertEqual(res.get('rows'), 1)
@@ -1450,6 +1497,162 @@ class TestRealDriverMemoryBudget(unittest.TestCase):
             sum(r.get('peak_delta') for r in results), 2 * self.PEAK_BOUND,
             "Aggregate peak of simultaneous workers exceeded twice the per-worker bound",
         )
+
+
+class TestFixtureCleanup(unittest.TestCase):
+    """
+    P2: fixtures must never leak. Both databases are required BEFORE any
+    fixture is created (skip outside strict mode, failure within it), and
+    partial preparation (failing table creates, failing worker spawn) still
+    removes everything already created.
+    """
+
+    def _unreachable_pg_env(self, strict):
+        old = {k: os.environ.get(k) for k in ('TEST_PG_HOST', STRICT_ENV_VAR)}
+        os.environ['TEST_PG_HOST'] = '192.0.2.1'
+        if strict:
+            os.environ[STRICT_ENV_VAR] = '1'
+        else:
+            os.environ.pop(STRICT_ENV_VAR, None)
+        reset_availability_cache()
+        return old
+
+    def _restore_env(self, old):
+        for key, value in old.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        reset_availability_cache()
+
+    def _fb_table_exists(self, name):
+        fb_con = get_test_firebird_connection()
+        try:
+            cur = fb_con.cursor()
+            cur.execute(
+                "SELECT 1 FROM RDB$RELATIONS WHERE RDB$RELATION_NAME = ?", (name,))
+            return cur.fetchone() is not None
+        finally:
+            try:
+                fb_con.close()
+            except Exception:
+                pass
+
+    def _pg_table_exists(self, name):
+        from tests.db_isolation import get_test_postgres_connection as _connect
+        pg_con = _connect()
+        try:
+            cur = pg_con.cursor()
+            cur.execute(
+                "SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = %s;",
+                (name.lower(),))
+            return cur.fetchone() is not None
+        finally:
+            try:
+                pg_con.close()
+            except Exception:
+                pass
+
+    def test_pg_unavailable_skips_before_creating_objects(self):
+        old = self._unreachable_pg_env(strict=False)
+        try:
+            case = TestRealDriverMemoryBudget('test_real_copy_import_bounds_peak_and_sizes')
+            with patch.object(
+                TestRealDriverMemoryBudget, '_make_blob_table',
+                side_effect=AssertionError('fixture must not be created on skip'),
+            ):
+                with self.assertRaises(unittest.SkipTest):
+                    case.test_real_copy_import_bounds_peak_and_sizes()
+        finally:
+            self._restore_env(old)
+
+    def test_pg_unavailable_fails_in_strict_mode_without_fixtures(self):
+        old = self._unreachable_pg_env(strict=True)
+        try:
+            case = TestRealDriverMemoryBudget('test_real_copy_import_bounds_peak_and_sizes')
+            with patch.object(
+                TestRealDriverMemoryBudget, '_make_blob_table',
+                side_effect=AssertionError('fixture must not be created on strict failure'),
+            ):
+                with self.assertRaises(AssertionError):
+                    case.test_real_copy_import_bounds_peak_and_sizes()
+        finally:
+            self._restore_env(old)
+
+    def test_first_table_failure_propagates_without_orphans(self):
+        mock_con = MagicMock()
+        mock_cur = MagicMock()
+        mock_con.cursor.return_value = mock_cur
+        calls = []
+
+        def execute(sql, *args, **kwargs):
+            calls.append(str(sql))
+            if len(calls) == 2:
+                raise Exception('INSERT boom')
+            return None
+
+        mock_cur.execute.side_effect = execute
+        case = TestRealDriverMemoryBudget('test_real_copy_import_bounds_peak_and_sizes')
+        with patch('tests.db_isolation.get_test_firebird_connection', return_value=mock_con):
+            with self.assertRaisesRegex(Exception, 'INSERT boom'):
+                case._make_blob_table(b'x')
+        drops = [sql for sql in calls if 'DROP TABLE' in sql]
+        self.assertTrue(drops, "Partial preparation must attempt cleanup of the created table")
+
+    @requires_live_databases
+    def test_second_table_failure_removes_all_fixtures(self):
+        created_fb, created_pg = [], []
+
+        orig_make_blob = TestRealDriverMemoryBudget._make_blob_table
+        orig_make_pg = TestRealDriverMemoryBudget._make_pg_table
+
+        def recording_blob(inst, payload):
+            name = orig_make_blob(inst, payload)
+            created_fb.append(name)
+            return name
+
+        state = {'n': 0}
+
+        def flaky_pg(inst, name):
+            state['n'] += 1
+            if state['n'] == 2:
+                raise RuntimeError('pg boom')
+            created_pg.append(name)
+            return orig_make_pg(inst, name)
+
+        case = TestRealDriverMemoryBudget('test_simultaneous_workers_bound_aggregate_peak')
+        with patch.object(TestRealDriverMemoryBudget, '_make_blob_table', recording_blob), \
+             patch.object(TestRealDriverMemoryBudget, '_make_pg_table', flaky_pg):
+            with self.assertRaisesRegex(RuntimeError, 'pg boom'):
+                case.test_simultaneous_workers_bound_aggregate_peak()
+        for name in created_fb:
+            self.assertFalse(self._fb_table_exists(name), f"Leaked Firebird table {name}")
+        for name in created_pg:
+            self.assertFalse(self._pg_table_exists(name), f"Leaked PostgreSQL table {name}")
+
+    @requires_live_databases
+    def test_worker_spawn_failure_removes_all_fixtures(self):
+        created = []
+        orig_make_blob = TestRealDriverMemoryBudget._make_blob_table
+
+        def recording_blob(inst, payload):
+            name = orig_make_blob(inst, payload)
+            created.append(name)
+            return name
+
+        real_ctx = multiprocessing.get_context('spawn')
+        mock_ctx = MagicMock()
+        mock_ctx.Queue.side_effect = lambda: real_ctx.Queue()
+        mock_ctx.Process.side_effect = RuntimeError('spawn boom')
+
+        case = TestRealDriverMemoryBudget('test_simultaneous_workers_bound_aggregate_peak')
+        with patch.object(TestRealDriverMemoryBudget, '_make_blob_table', recording_blob), \
+             patch('multiprocessing.get_context', return_value=mock_ctx):
+            with self.assertRaisesRegex(RuntimeError, 'spawn boom'):
+                case.test_simultaneous_workers_bound_aggregate_peak()
+        self.assertTrue(created, "Fixtures should have been created before the spawn failure")
+        for name in created:
+            self.assertFalse(self._fb_table_exists(name), f"Leaked Firebird table {name}")
 
 
 if __name__ == '__main__':
