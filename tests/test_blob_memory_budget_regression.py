@@ -1921,20 +1921,14 @@ class TestRealDriverMemoryBudget(unittest.TestCase):
         table.columns.append(Column('B', 'BLOB SUBTYPE 0', nullable=True))
 
         table_name = unique_name('MEM_NULLB').upper()
-        fb_con = get_test_firebird_connection()
+        created = []
         try:
-            cur = fb_con.cursor()
-            cur.execute(
-                f"CREATE TABLE {table_name} (A BLOB SUB_TYPE 0, B BLOB SUB_TYPE 0)")
-            fb_con.commit()
-            cur.execute(f"INSERT INTO {table_name} VALUES (?, ?)", (b'X' * 15, None))
-            fb_con.commit()
-        finally:
-            try:
-                fb_con.close()
-            except Exception:
-                pass
-        try:
+            self._make_custom_fb_table(
+                table_name,
+                f"CREATE TABLE {table_name} (A BLOB SUB_TYPE 0, B BLOB SUB_TYPE 0)",
+                [(f"INSERT INTO {table_name} VALUES (?, ?)", (b'X' * 15, None))],
+            )
+            created.append(('fb', table_name))
             table.name = table_name
             for max_buffer, accepted in ((36, False), (37, True), (64, True)):
                 with self.subTest(max_buffer=max_buffer):
@@ -1956,7 +1950,7 @@ class TestRealDriverMemoryBudget(unittest.TestCase):
                         except Exception:
                             pass
         finally:
-            self._drop_blob_table(table_name)
+            self._drop_all(created)
 
     @requires_live_databases
     def test_real_copy_import_bounds_peak_and_sizes(self):
@@ -2454,6 +2448,61 @@ class TestFixtureCleanup(unittest.TestCase):
         finally:
             case._drop_all(created)
         self.assertFalse(self._fb_table_exists(table_name))
+
+    @requires_firebird
+    def test_null_shape_insert_failure_leaves_no_table(self):
+        """
+        P2: preparation of the NULL-pair shape (15 bytes, NULL) fails at
+        INSERT after a committed CREATE -> the table must be absent from
+        the catalog before any safety-net cleanup runs, with the original
+        error propagated.
+        """
+        real_con = get_test_firebird_connection()
+
+        class _FailInsertCur:
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, *args, **kwargs):
+                if str(sql).strip().upper().startswith('INSERT'):
+                    raise Exception('INSERT boom')
+                return self._real.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        mock_con = MagicMock()
+        mock_con.cursor.return_value = _FailInsertCur(real_con.cursor())
+        mock_con.commit.side_effect = lambda: real_con.commit()
+        mock_con.close.side_effect = lambda: None
+        table_name = unique_name('MEM_NULLFAIL').upper()
+        case = TestRealDriverMemoryBudget('test_live_null_row_boundary_below_equal_above')
+        try:
+            with patch('tests.db_isolation.get_test_firebird_connection', return_value=mock_con):
+                with self.assertRaisesRegex(Exception, 'INSERT boom'):
+                    case._make_custom_fb_table(
+                        table_name,
+                        f"CREATE TABLE {table_name} (A BLOB SUB_TYPE 0, B BLOB SUB_TYPE 0)",
+                        [(f"INSERT INTO {table_name} VALUES (?, ?)", (b'X' * 15, None))])
+            self.assertFalse(self._fb_table_exists(table_name))
+        finally:
+            try:
+                real_con.close()
+            except Exception:
+                pass
+            safety = get_test_firebird_connection()
+            try:
+                cur = safety.cursor()
+                try:
+                    cur.execute(f"DROP TABLE {table_name}")
+                    safety.commit()
+                except Exception:
+                    pass
+            finally:
+                try:
+                    safety.close()
+                except Exception:
+                    pass
 
 
 if __name__ == '__main__':
