@@ -953,10 +953,11 @@ class TestBinaryPrefixBudget(unittest.TestCase):
 
     def test_null_blob_pair_rejected_before_read(self):
         """
-        P2 repro: two BLOBs (15 bytes, NULL) under a 36 buffer. The old
-        estimate (35, NULL counted as zero) admitted the row and failed at
-        37 serialized bytes after fetchmany()+TRUNCATE; counting 2 bytes
-        per NULL (37) rejects in the preventive query.
+        P2 repro: two BLOBs (15 bytes, NULL) under a 36 buffer with a VALID
+        config (max 18: 18x2 <= 36 passes fail-fast). The preventive query
+        must run, be read, and reject the 37-byte aggregate (NULL as 2-byte
+        \\N); the specific aggregate error plus zero side effects prove the
+        rejection came from the row budget, never the config gate.
         """
         table = Table('TAB_NULL15')
         table.columns.append(Column('A', 'BLOB SUBTYPE 0', nullable=True))
@@ -971,9 +972,20 @@ class TestBinaryPrefixBudget(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             _import_single_table(
                 table, mock_fb_cur, mock_pg_cur, mock_pg_con,
-                max_buffer_bytes=36, max_blob_bytes=32,
+                max_buffer_bytes=36, max_blob_bytes=18,
             )
-        self.assertIn('exceeds per-worker buffer', str(ctx.exception))
+        self.assertIn('Aggregated BLOB row of 37 bytes', str(ctx.exception))
+        # The preventive query executed exactly once (main SELECT never ran)
+        # and its result was read: no fail-fast short-circuit.
+        self.assertEqual(mock_fb_cur.execute.call_count, 1)
+        precheck_sql = mock_fb_cur.execute.call_args[0][0]
+        self.assertIn('MAX(', precheck_sql)
+        self.assertIn('OCTET_LENGTH', precheck_sql)
+        mock_fb_cur.fetchone.assert_called_once()
+        # NULL counting is encoded in the query itself: reverting it to zero
+        # changes the statement, so the mock alone cannot hide the regression.
+        self.assertIn('IS NULL', precheck_sql)
+        self.assertIn('THEN 2', precheck_sql)
         mock_fb_cur.fetchmany.assert_not_called()
         mock_pg_cur.execute.assert_not_called()
         mock_pg_cur.copy_expert.assert_not_called()
