@@ -332,17 +332,25 @@ def _estimate_row_bytes(row, max_blob_bytes: int = None) -> int:
 
 
 def _reject_oversized_blobs(fb_cur, table: Table, cols_to_import: list,
-                            max_blob_bytes: int,
-                            blob_domains: set[str] = None) -> None:
+                            max_blob_bytes: int, max_buffer_bytes: int,
+                            blob_domains: set[str] = None,
+                            binary_domains: set[str] = None) -> None:
     """
-    Server-side guardrail: rejects the table when any stored BLOB exceeds
-    max_blob_bytes, BEFORE the driver materializes a single BLOB.
+    Server-side guardrail, evaluated BEFORE the driver materializes a single
+    BLOB and before any target write. Two checks, one round trip:
 
-    The installed Firebird driver fully materializes every BLOB column as
-    soon as fetchmany() returns, so the chunked per-BLOB checks during
-    serialization come too late to bound driver-side allocation. A single
-    aggregate query (MAX over OCTET_LENGTH per BLOB column, computed
-    server-side without transferring blob bytes) proves all values fit.
+    1. Individual limit: MAX(OCTET_LENGTH) per BLOB column must fit
+       max_blob_bytes (names the offending column).
+    2. Aggregate row budget: the worst row's weighted BLOB payload must fit
+       max_buffer_bytes once serialized. Binary columns weigh 2x (hex
+       expansion: the 2x factor reserves equal space for driver-side raw
+       bytes and serialized output); text columns weigh 1x. This rejects
+       rows of individually-valid BLOBs that are collectively excessive
+       (e.g. eight 4 MiB BLOBs under an 8 MiB worker buffer).
+
+    Conceptually max_buffer_bytes is the BUFFER limit (serialized COPY
+    bytes), while worker MEMORY transiently holds raw driver data plus the
+    serialized buffer; the 2x weight keeps the aggregate within budget.
     Values that are not plain ints (e.g. unconfigured test doubles) are
     ignored here; the streaming checks remain the backstop for them.
     """
@@ -351,11 +359,20 @@ def _reject_oversized_blobs(fb_cur, table: Table, cols_to_import: list,
     blob_cols = [c for c in cols_to_import if is_blob_column(c, blob_domains)]
     if not blob_cols:
         return
-    max_exprs = ", ".join(
-        f'MAX(OCTET_LENGTH({pg_quote_ident(c.name)}))' for c in blob_cols
-    )
+    max_exprs = []
+    for c in blob_cols:
+        quoted = f'OCTET_LENGTH({pg_quote_ident(c.name)})'
+        max_exprs.append(f'MAX({quoted})')
+    weighted_terms = []
+    for c in blob_cols:
+        quoted = f'COALESCE(OCTET_LENGTH({pg_quote_ident(c.name)}), 0)'
+        if is_binary_column(c, binary_domains):
+            weighted_terms.append(f'2 * ({quoted})')
+        else:
+            weighted_terms.append(f'({quoted})')
+    max_exprs.append(f'MAX({" + ".join(weighted_terms)})')
     fb_cur.execute(
-        f'SELECT {max_exprs} FROM {pg_quote_ident(table.name)}'
+        f'SELECT {", ".join(max_exprs)} FROM {pg_quote_ident(table.name)}'
     )
     row = fb_cur.fetchone()
     if not row:
@@ -369,6 +386,16 @@ def _reject_oversized_blobs(fb_cur, table: Table, cols_to_import: list,
                 f"{max_blob_bytes} bytes (stored maximum is {max_len} bytes, "
                 f"table '{table.name}'). Rejected before driver materialization."
             )
+    worst = row[len(blob_cols)] if len(row) > len(blob_cols) else None
+    if isinstance(worst, bool) or not isinstance(worst, int):
+        return
+    if worst > max_buffer_bytes:
+        raise ValueError(
+            f"Aggregated BLOB row of {worst} bytes exceeds per-worker buffer "
+            f"of {max_buffer_bytes} bytes (table '{table.name}', "
+            f"{len(blob_cols)} BLOB column(s)): individually valid BLOBs are "
+            f"collectively excessive. Rejected before driver materialization."
+        )
 
 
 def _import_single_table(
@@ -421,7 +448,10 @@ def _import_single_table(
     pg_columns_str = ", ".join(pg_column_names)
 
     # Fail before any target write and before the driver materializes blobs.
-    _reject_oversized_blobs(fb_cur, table, cols_to_import, max_blob_bytes, blob_domains)
+    _reject_oversized_blobs(
+        fb_cur, table, cols_to_import,
+        max_blob_bytes, max_buffer_bytes, blob_domains, binary_domains
+    )
 
     # Clean existing table data (no CASCADE: constraints don't exist at this pipeline stage,
     # and CASCADE would be dangerous with concurrent workers if they did)

@@ -785,6 +785,89 @@ class TestBlobMemoryBudgetRegression(unittest.TestCase):
         self.assertIn('Olá 🚀 mundo', combined.replace('\\n', '\n'))
 
 
+class TestAggregateRowBudget(unittest.TestCase):
+    """
+    P2: the per-BLOB pre-check alone lets eight individually-valid 4 MiB
+    BLOBs through under an 8 MiB worker buffer; the driver would then
+    materialize them all before the row check. The aggregate worst-row
+    check (binary 2x for hex headroom, text 1x) rejects such rows before
+    any fetchmany().
+    """
+
+    def _blob_table(self, count, blob_type='BLOB SUBTYPE 0'):
+        table = Table('TAB_AGG')
+        table.columns.append(Column('ID', 'INTEGER', nullable=False))
+        for i in range(count):
+            table.columns.append(Column(f'B{i}', blob_type, nullable=True))
+        return table
+
+    def test_eight_individually_valid_blobs_rejected_as_row(self):
+        table = self._blob_table(8)
+        maxes = tuple([4 * 1024 * 1024] * 8 + [2 * 8 * 4 * 1024 * 1024])
+        mock_fb_cur = MagicMock()
+        mock_pg_cur = MagicMock()
+        mock_pg_con = MagicMock()
+        mock_fb_cur.fetchone.return_value = maxes
+        mock_fb_cur.fetchmany.side_effect = [[
+            tuple([1] + [b'X' * 100] * 8)
+        ], []]
+
+        with self.assertRaises(ValueError) as ctx:
+            _import_single_table(
+                table, mock_fb_cur, mock_pg_cur, mock_pg_con,
+                max_buffer_bytes=8 * 1024 * 1024,
+                max_blob_bytes=16 * 1024 * 1024,
+            )
+        self.assertIn('exceeds per-worker buffer', str(ctx.exception))
+        mock_fb_cur.fetchmany.assert_not_called()
+        mock_pg_con.commit.assert_not_called()
+
+    def test_fitting_aggregate_passes(self):
+        table = self._blob_table(2)
+        mock_fb_cur = MagicMock()
+        mock_pg_cur = MagicMock()
+        mock_pg_con = MagicMock()
+        # 1 KiB + 2 KiB binary -> 6 KiB weighted, well under 8 MiB.
+        mock_fb_cur.fetchone.return_value = (1024, 2048, 2 * (1024 + 2048))
+        mock_fb_cur.fetchmany.side_effect = [[(1, b'A' * 1024, b'B' * 2048)], []]
+        total, _ = _import_single_table(
+            table, mock_fb_cur, mock_pg_cur, mock_pg_con,
+            max_buffer_bytes=8 * 1024 * 1024,
+            max_blob_bytes=4 * 1024 * 1024,
+        )
+        self.assertEqual(total, 1)
+
+    def test_mixed_binary_and_text_weighting(self):
+        table = Table('TAB_MIX')
+        table.columns.append(Column('ID', 'INTEGER', nullable=False))
+        table.columns.append(Column('BIN', 'BLOB SUBTYPE 0', nullable=True))
+        table.columns.append(Column('TXT', 'BLOB SUBTYPE 1', nullable=True))
+        mock_fb_cur = MagicMock()
+        mock_pg_cur = MagicMock()
+        mock_pg_con = MagicMock()
+        # 3 MiB binary (6 MiB weighted) + 1 MiB text (1 MiB) = 7 MiB <= 8 MiB.
+        mock_fb_cur.fetchone.return_value = (3 * 1024 * 1024, 1 * 1024 * 1024, 7 * 1024 * 1024)
+        mock_fb_cur.fetchmany.side_effect = [[(1, b'X' * 100, 'y' * 100)], []]
+        total, _ = _import_single_table(
+            table, mock_fb_cur, mock_pg_cur, mock_pg_con,
+            max_buffer_bytes=8 * 1024 * 1024,
+            max_blob_bytes=4 * 1024 * 1024,
+        )
+        self.assertEqual(total, 1)
+
+        # Same layout but 3 MiB + 3 MiB text-heavy row: 6 + 3 = 9 MiB > 8 MiB.
+        mock_fb_cur2 = MagicMock()
+        mock_fb_cur2.fetchone.return_value = (3 * 1024 * 1024, 3 * 1024 * 1024, 9 * 1024 * 1024)
+        with self.assertRaises(ValueError) as ctx:
+            _import_single_table(
+                table, mock_fb_cur2, MagicMock(), MagicMock(),
+                max_buffer_bytes=8 * 1024 * 1024,
+                max_blob_bytes=4 * 1024 * 1024,
+            )
+        self.assertIn('exceeds per-worker buffer', str(ctx.exception))
+        mock_fb_cur2.fetchmany.assert_not_called()
+
+
 class _FakePgCur:
     """Minimal COPY-capturing cursor (spawn-picklable, no PG server needed)."""
 
@@ -846,16 +929,41 @@ def _rss_peak_bytes():
     return peak if sys.platform == 'darwin' else peak * 1024
 
 
-def _child_real_driver_import(queue, table_name, max_buffer_bytes, max_blob_bytes):
+class _RecordingPgCur:
+    """Wraps a real PG cursor recording delivered COPY buffer sizes."""
+
+    def __init__(self, real_cur):
+        self._cur = real_cur
+        self.copy_sizes = []
+
+    def execute(self, *args, **kwargs):
+        return self._cur.execute(*args, **kwargs)
+
+    def copy_expert(self, sql, buf):
+        self.copy_sizes.append(buf.byte_count)
+        return self._cur.copy_expert(sql, buf)
+
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
+
+
+def _child_real_driver_import(queue, table_name, max_buffer_bytes, max_blob_bytes,
+                              use_real_pg=False):
     """
     Spawn target: runs _import_single_table with the REAL Firebird driver
-    (which materializes BLOBs inside fetchmany) and a fake PG side, so the
-    measured peak covers driver read + serialization + COPY buffering.
+    (which materializes BLOBs inside fetchmany). use_real_pg False keeps the
+    fake PG side; True runs a REAL PostgreSQL COPY into the table named
+    table_name.lower() (created by the parent) with delivered buffer sizes
+    recorded through the wrapper. The measured peak covers driver read +
+    serialization + COPY buffering in both modes.
     Reports RSS peak delta, fetchmany count and copied content.
     """
     from engine.data_migrator import _import_single_table
     from models import Column, Table
-    from tests.db_isolation import get_test_firebird_connection
+    from tests.db_isolation import (
+        get_test_firebird_connection,
+        get_test_postgres_connection,
+    )
 
     table = Table(table_name)
     table.columns.append(Column('ID', 'INTEGER', nullable=False))
@@ -863,23 +971,36 @@ def _child_real_driver_import(queue, table_name, max_buffer_bytes, max_blob_byte
 
     fb_con = get_test_firebird_connection()
     fb_cur = _CountingFbCur(fb_con.cursor())
-    pg_con = _FakePgConn()
+    if not use_real_pg:
+        pg_con = _FakePgConn()
+        pg_cur = pg_con.cur
+        real_pg_con = None
+    else:
+        real_pg_con = get_test_postgres_connection()
+        pg_con = real_pg_con
+        pg_cur = _RecordingPgCur(real_pg_con.cursor())
     baseline = _rss_peak_bytes()
     try:
         rows, _ = _import_single_table(
-            table, fb_cur, pg_con.cur, pg_con,
+            table, fb_cur, pg_cur, pg_con,
             max_buffer_bytes=max_buffer_bytes,
             max_blob_bytes=max_blob_bytes,
         )
-        copies = list(pg_con.cur.copies)
+        if not use_real_pg:
+            copies = list(pg_con.cur.copies)
+            copy_sizes = [len(c.encode('utf-8')) for c in copies]
+            head_hex = copies[0][:256] if copies else ''
+        else:
+            copy_sizes = list(pg_cur.copy_sizes)
+            head_hex = ''
         queue.put({
             'success': True,
             'rows': rows,
             'peak_delta': _rss_peak_bytes() - baseline,
             'fetchmany_calls': fb_cur.fetchmany_calls,
-            'copy_sizes': [len(c.encode('utf-8')) for c in copies],
-            'copy_count': len(copies),
-            'head_hex': copies[0][:256] if copies else '',
+            'copy_sizes': copy_sizes,
+            'copy_count': len(copy_sizes),
+            'head_hex': head_hex,
         })
     except Exception as exc:
         queue.put({
@@ -893,6 +1014,11 @@ def _child_real_driver_import(queue, table_name, max_buffer_bytes, max_blob_byte
             fb_con.close()
         except Exception:
             pass
+        if real_pg_con is not None:
+            try:
+                real_pg_con.close()
+            except Exception:
+                pass
 
 
 class TestRealDriverMemoryBudget(unittest.TestCase):
@@ -936,18 +1062,65 @@ class TestRealDriverMemoryBudget(unittest.TestCase):
             except Exception:
                 pass
 
-    def _run_child(self, table_name, max_buffer_bytes, max_blob_bytes):
+    # Explicit memory model: BUFFER_LIMIT bounds every delivered COPY
+    # buffer (the announced limit); PEAK_BOUND additionally covers one raw
+    # driver-side copy plus interpreter/libpq slack (3x the buffer).
+    BUFFER_LIMIT = 8 * 1024 * 1024
+    PEAK_BOUND = 3 * BUFFER_LIMIT
+    REJECT_PEAK_BOUND = 2 * 1024 * 1024
+
+    def _run_child(self, table_name, max_buffer_bytes, max_blob_bytes,
+                   use_real_pg=False):
         ctx = multiprocessing.get_context('spawn')
         queue = ctx.Queue()
         proc = ctx.Process(
             target=_child_real_driver_import,
-            args=(queue, table_name, max_buffer_bytes, max_blob_bytes),
+            args=(queue, table_name, max_buffer_bytes, max_blob_bytes, use_real_pg),
         )
         proc.start()
         try:
             return queue.get(timeout=180)
         finally:
             proc.join(timeout=60)
+
+    def _make_pg_table(self, table_name):
+        from tests.db_isolation import get_test_postgres_connection as _connect
+        pg_con = _connect()
+        try:
+            pg_con.autocommit = True
+            cur = pg_con.cursor()
+            cur.execute(f'DROP TABLE IF EXISTS "{table_name.lower()}";')
+            cur.execute(f'CREATE TABLE "{table_name.lower()}" (id INTEGER, payload BYTEA);')
+        finally:
+            try:
+                pg_con.close()
+            except Exception:
+                pass
+
+    def _drop_pg_table(self, table_name):
+        from tests.db_isolation import get_test_postgres_connection as _connect
+        pg_con = _connect()
+        try:
+            pg_con.autocommit = True
+            pg_con.cursor().execute(f'DROP TABLE IF EXISTS "{table_name.lower()}";')
+        finally:
+            try:
+                pg_con.close()
+            except Exception:
+                pass
+
+    def _read_pg_payload(self, table_name):
+        from tests.db_isolation import get_test_postgres_connection as _connect
+        pg_con = _connect()
+        try:
+            cur = pg_con.cursor()
+            cur.execute(f'SELECT payload FROM "{table_name.lower()}" ORDER BY id;')
+            return [bytes(r[0]) for r in cur.fetchall()]
+        finally:
+            try:
+                pg_con.close()
+            except Exception:
+                pass
 
     @requires_firebird
     def test_real_driver_import_bounds_rss_peak(self):
@@ -958,17 +1131,17 @@ class TestRealDriverMemoryBudget(unittest.TestCase):
         blob = os.urandom(2 * 1024 * 1024)
         table_name = self._make_blob_table(blob)
         try:
-            res = self._run_child(table_name, 8 * 1024 * 1024, 4 * 1024 * 1024)
+            res = self._run_child(table_name, self.BUFFER_LIMIT, 4 * 1024 * 1024)
         finally:
             self._drop_blob_table(table_name)
         self.assertTrue(res.get('success'), f"Child failed: {res.get('error')}")
         self.assertEqual(res.get('rows'), 1)
         self.assertLess(
-            res.get('peak_delta'), 48 * 1024 * 1024,
+            res.get('peak_delta'), self.PEAK_BOUND,
             f"RSS peak delta ({res['peak_delta'] / (1024 * 1024):.1f}MiB) exceeds bound "
             f"for a 2MiB BLOB under an 8MiB worker budget",
         )
-        self.assertLessEqual(max(res.get('copy_sizes')), 8 * 1024 * 1024)
+        self.assertLessEqual(max(res.get('copy_sizes')), self.BUFFER_LIMIT)
         self.assertIn(blob.hex()[:64], res.get('head_hex'))
 
     @requires_firebird
@@ -981,7 +1154,7 @@ class TestRealDriverMemoryBudget(unittest.TestCase):
         blob = os.urandom(3 * 1024 * 1024)
         table_name = self._make_blob_table(blob)
         try:
-            res = self._run_child(table_name, 8 * 1024 * 1024, 1 * 1024 * 1024)
+            res = self._run_child(table_name, self.BUFFER_LIMIT, 1 * 1024 * 1024)
         finally:
             self._drop_blob_table(table_name)
         self.assertFalse(res.get('success'))
@@ -991,9 +1164,96 @@ class TestRealDriverMemoryBudget(unittest.TestCase):
             "Oversized BLOB must be rejected before any fetchmany materializes it",
         )
         self.assertLess(
-            res.get('peak_delta'), 2 * 1024 * 1024,
+            res.get('peak_delta'), self.REJECT_PEAK_BOUND,
             f"RSS peak delta ({res['peak_delta'] / (1024 * 1024):.2f}MiB) shows "
             f"the 3MiB BLOB was materialized despite the limit",
+        )
+
+    @requires_firebird
+    def test_real_copy_import_bounds_peak_and_sizes(self):
+        """
+        P2: same 2 MiB path with a REAL PostgreSQL COPY (libpq buffering
+        included). Every delivered buffer respects the announced 8 MiB
+        limit, the PG roundtrip is bit-exact, and the RSS peak stays
+        within the explicit limit-plus-margin bound.
+        """
+        from tests.db_isolation import is_postgres_available, require_live_postgres
+
+        blob = os.urandom(2 * 1024 * 1024)
+        table_name = self._make_blob_table(blob)
+        self._make_pg_table(table_name)
+        try:
+            require_live_postgres(self)
+            res = self._run_child(
+                table_name, self.BUFFER_LIMIT, 4 * 1024 * 1024, use_real_pg=True)
+            self.assertTrue(res.get('success'), f"Child failed: {res.get('error')}")
+            self.assertEqual(res.get('rows'), 1)
+            for size in res.get('copy_sizes'):
+                self.assertLessEqual(
+                    size, self.BUFFER_LIMIT,
+                    f"Real COPY buffer of {size} bytes exceeds {self.BUFFER_LIMIT} limit",
+                )
+            self.assertLess(
+                res.get('peak_delta'), self.PEAK_BOUND,
+                f"RSS peak delta ({res['peak_delta'] / (1024 * 1024):.1f}MiB) exceeds "
+                f"explicit bound with real Firebird + real COPY",
+            )
+            pg_rows = self._read_pg_payload(table_name)
+            self.assertEqual(len(pg_rows), 1)
+            self.assertEqual(pg_rows[0], blob)
+        finally:
+            self._drop_blob_table(table_name)
+            self._drop_pg_table(table_name)
+
+    @requires_firebird
+    def test_simultaneous_workers_bound_aggregate_peak(self):
+        """
+        P2: two workers importing concurrently (real Firebird reads, real
+        PostgreSQL COPYs into separate tables). Each worker respects its own
+        budget and the SUM of peaks stays within twice the per-worker bound.
+        """
+        from tests.db_isolation import require_live_postgres
+
+        blob = os.urandom(2 * 1024 * 1024)
+        table_a = self._make_blob_table(blob)
+        table_b = self._make_blob_table(blob)
+        self._make_pg_table(table_a)
+        self._make_pg_table(table_b)
+        try:
+            require_live_postgres(self)
+            ctx = multiprocessing.get_context('spawn')
+            launched = []
+            try:
+                for table_name in (table_a, table_b):
+                    queue = ctx.Queue()
+                    proc = ctx.Process(
+                        target=_child_real_driver_import,
+                        args=(queue, table_name, self.BUFFER_LIMIT,
+                              4 * 1024 * 1024, True),
+                    )
+                    proc.start()
+                    launched.append((proc, queue))
+                results = [queue.get(timeout=180) for _, queue in launched]
+            finally:
+                for proc, _ in launched:
+                    proc.join(timeout=60)
+        finally:
+            self._drop_blob_table(table_a)
+            self._drop_blob_table(table_b)
+            self._drop_pg_table(table_a)
+            self._drop_pg_table(table_b)
+        for res in results:
+            self.assertTrue(res.get('success'), f"Child failed: {res.get('error')}")
+            self.assertEqual(res.get('rows'), 1)
+            self.assertLess(
+                res.get('peak_delta'), self.PEAK_BOUND,
+                "Per-worker peak exceeded its explicit bound under concurrency",
+            )
+            for size in res.get('copy_sizes'):
+                self.assertLessEqual(size, self.BUFFER_LIMIT)
+        self.assertLessEqual(
+            sum(r.get('peak_delta') for r in results), 2 * self.PEAK_BOUND,
+            "Aggregate peak of simultaneous workers exceeded twice the per-worker bound",
         )
 
 
