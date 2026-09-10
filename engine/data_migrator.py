@@ -344,8 +344,9 @@ def _reject_oversized_blobs(fb_cur, table: Table, cols_to_import: list,
        max_blob_bytes (names the offending column).
     2. Aggregate row budget: a conservative estimate of the ENTIRE worst
        serialized row must fit max_buffer_bytes:
-         - binary BLOBs weigh 2x (hex expansion; the 2x factor reserves equal
-           space for driver-side raw bytes and serialized output);
+         - binary BLOBs weigh 2x plus the 3-character \\x COPY prefix, both
+           skipped for NULL values (hex expansion reserves equal space for
+           driver-side raw bytes and serialized output);
          - text BLOBs weigh 3x (UTF-8 conversion of connection-charset bytes
            plus COPY escapes for backslash, newline, carriage return, tab);
          - every other column weighs 3x its CAST AS VARCHAR length (same
@@ -374,10 +375,15 @@ def _reject_oversized_blobs(fb_cur, table: Table, cols_to_import: list,
         max_exprs.append(f'MAX({quoted})')
     weighted_terms = []
     for c in blob_cols:
-        quoted = f'COALESCE(OCTET_LENGTH({pg_quote_ident(c.name)}), 0)'
+        name = pg_quote_ident(c.name)
         if is_binary_column(c, binary_domains):
-            weighted_terms.append(f'2 * ({quoted})')
+            # 2x hex expansion plus the 3-character \\x COPY prefix, emitted
+            # only for non-NULL values (NULL serializes as \N instead).
+            weighted_terms.append(
+                f'(CASE WHEN {name} IS NULL THEN 0 '
+                f'ELSE 2 * OCTET_LENGTH({name}) + 3 END)')
         else:
+            quoted = f'COALESCE(OCTET_LENGTH({name}), 0)'
             weighted_terms.append(f'3 * ({quoted})')
     for c in other_cols:
         # 3x as well: CHAR/VARCHAR values undergo the same UTF-8 conversion

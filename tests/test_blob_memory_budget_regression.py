@@ -877,6 +877,81 @@ class TestAggregateRowBudget(unittest.TestCase):
         mock_fb_cur2.fetchmany.assert_not_called()
 
 
+class TestBinaryPrefixBudget(unittest.TestCase):
+    """
+    P2: the aggregate counted 2x size plus separators but forgot the
+    3-character \\\\x COPY prefix of each non-NULL binary value. Two 15-byte
+    BLOBs were estimated at 62 bytes while the row occupies 68, so a
+    64-byte buffer accepted pre-read and failed at 67 bytes mid-row.
+    """
+
+    def _two_blob_table(self):
+        table = Table('TAB_PX')
+        table.columns.append(Column('A', 'BLOB SUBTYPE 0', nullable=True))
+        table.columns.append(Column('B', 'BLOB SUBTYPE 0', nullable=True))
+        return table
+
+    def test_prefix_shortfall_rejected_before_read(self):
+        table = self._two_blob_table()
+        mock_fb_cur = MagicMock()
+        mock_pg_cur = MagicMock()
+        mock_pg_con = MagicMock()
+        # (2x15+3) + (2x15+3) + 2 seps = 68 > 64.
+        mock_fb_cur.fetchone.return_value = (15, 15, 68)
+        mock_fb_cur.fetchmany.side_effect = [[(b'X' * 15, b'Y' * 15)], []]
+
+        with self.assertRaises(ValueError) as ctx:
+            _import_single_table(
+                table, mock_fb_cur, mock_pg_cur, mock_pg_con,
+                max_buffer_bytes=64, max_blob_bytes=32,
+            )
+        self.assertIn('exceeds per-worker buffer', str(ctx.exception))
+        mock_fb_cur.fetchmany.assert_not_called()
+        mock_pg_cur.execute.assert_not_called()
+        mock_pg_con.commit.assert_not_called()
+
+    def test_empty_and_null_binaries(self):
+        table = self._two_blob_table()
+        mock_fb_cur = MagicMock()
+        mock_pg_cur = MagicMock()
+        mock_pg_con = MagicMock()
+        # Empty serializes to the 3-byte prefix; NULL to \N (no prefix).
+        # Worst row: (2x0+3) + 0 + 2 seps + trailing newline... = 8.
+        mock_fb_cur.fetchone.return_value = (0, 0, 8)
+        mock_fb_cur.fetchmany.side_effect = [[(b'', None), (None, b'')], []]
+
+        total, _ = _import_single_table(
+            table, mock_fb_cur, mock_pg_cur, mock_pg_con,
+            max_buffer_bytes=64, max_blob_bytes=32,
+        )
+        self.assertEqual(total, 2)
+        combined = ''.join(c[0][1].getvalue() for c in mock_pg_cur.copy_expert.call_args_list)
+        self.assertIn('\\\\x\t\\N\n', combined)
+        self.assertIn('\\N\t\\\\x\n', combined)
+        for call in mock_pg_cur.copy_expert.call_args_list:
+            self.assertLessEqual(call[0][1].byte_count, 64)
+
+    def test_exact_boundary_row_passes_with_exact_content(self):
+        table = Table('TAB_BOUND')
+        table.columns.append(Column('B', 'BLOB SUBTYPE 0', nullable=True))
+        mock_fb_cur = MagicMock()
+        mock_pg_cur = MagicMock()
+        mock_pg_con = MagicMock()
+        # Worst == budget exactly: (2x10+3) + 1 sep = 24 <= 24.
+        mock_fb_cur.fetchone.return_value = (10, 24)
+        payload = b'0123456789'
+        mock_fb_cur.fetchmany.side_effect = [[(payload,)], []]
+
+        total, _ = _import_single_table(
+            table, mock_fb_cur, mock_pg_cur, mock_pg_con,
+            max_buffer_bytes=24, max_blob_bytes=12,
+        )
+        self.assertEqual(total, 1)
+        buf = mock_pg_cur.copy_expert.call_args[0][1]
+        self.assertEqual(buf.byte_count, 24)
+        self.assertEqual(buf.getvalue(), '\\\\x' + payload.hex() + '\n')
+
+
 class TestTextualAggregateBudget(unittest.TestCase):
     """
     P2: the preventive check weighted text 1x, but COPY escapes (tab,
@@ -898,8 +973,8 @@ class TestTextualAggregateBudget(unittest.TestCase):
         mock_fb_cur = MagicMock()
         mock_pg_cur = MagicMock()
         mock_pg_con = MagicMock()
-        # 3x40B tabs + ID: 3*120 + 2*1 + 4 seps = 366 > 128.
-        mock_fb_cur.fetchone.return_value = (40, 40, 40, 366)
+        # 3x40B tabs x3 + 3x1 ID + 4 seps = 367 > 128.
+        mock_fb_cur.fetchone.return_value = (40, 40, 40, 367)
         mock_fb_cur.fetchmany.side_effect = [[(1, '\t' * 40, '\t' * 40, '\t' * 40)], []]
 
         with self.assertRaises(ValueError) as ctx:
@@ -943,9 +1018,9 @@ class TestTextualAggregateBudget(unittest.TestCase):
         table.columns.append(Column('TXT', 'BLOB SUBTYPE 1', nullable=True))
         table.columns.append(Column('BIN', 'BLOB SUBTYPE 0', nullable=True))
         max_buffer = 1024
-        # Boundary: 3x100 text + 2x200 binary + 3x1 ID + 3 seps = 706 <= 1024.
+        # Boundary: 3x100 text + (2x200+3) binary + 3x1 ID + 3 seps = 709.
         ok_fb, ok_pg, ok_con = MagicMock(), MagicMock(), MagicMock()
-        ok_fb.fetchone.return_value = (100, 200, 706)
+        ok_fb.fetchone.return_value = (100, 200, 709)
         ok_fb.fetchmany.side_effect = [[(1, 'é' * 50, b'Z' * 200)], []]
         total, _ = _import_single_table(
             table, ok_fb, ok_pg, ok_con,
@@ -980,9 +1055,9 @@ class TestTextualAggregateBudget(unittest.TestCase):
         mock_fb_cur = MagicMock()
         mock_pg_cur = MagicMock()
         mock_pg_con = MagicMock()
-        # Per-column MAX (BLOB B only) + aggregate: 3x200 (VC) + 2x1 (BIN)
-        # + 3x1 (ID) + 3 seps = 608 > 512.
-        mock_fb_cur.fetchone.return_value = (1, 608)
+        # Per-column MAX (BLOB B only) + aggregate: 3x200 (VC) + (2x1+3)
+        # (BIN) + 3x1 (ID) + 3 seps = 611 > 512.
+        mock_fb_cur.fetchone.return_value = (1, 611)
         mock_fb_cur.fetchmany.side_effect = [[(7, '€' * 200, b'\x01')], []]
 
         with self.assertRaises(ValueError) as ctx:
@@ -1664,6 +1739,53 @@ class TestRealDriverMemoryBudget(unittest.TestCase):
                 with self.assertRaises(ValueError) as ctx:
                     _reject_oversized_blobs(
                         counting, table, table.columns, 256, 512)
+                self.assertIn('exceeds per-worker buffer', str(ctx.exception))
+                self.assertEqual(counting.fetchmany_calls, 0)
+            finally:
+                try:
+                    check_con.close()
+                except Exception:
+                    pass
+        finally:
+            self._drop_blob_table(table_name)
+
+    @requires_firebird
+    def test_live_binary_prefix_counted_before_read(self):
+        """
+        P2: two 15-byte binary BLOBs under a 64 buffer. The old 2x-only
+        estimate (62) admitted the row and failed at 67 serialized bytes;
+        counting the 3-character hex prefix per value (68 total) the live
+        aggregate rejects with zero fetchmany() calls.
+        """
+        from engine.data_migrator import _reject_oversized_blobs
+
+        table = Table('TAB_PFX_LIVE')
+        table.columns.append(Column('A', 'BLOB SUBTYPE 0', nullable=True))
+        table.columns.append(Column('B', 'BLOB SUBTYPE 0', nullable=True))
+
+        table_name = unique_name('MEM_PREFIX').upper()
+        fb_con = get_test_firebird_connection()
+        try:
+            cur = fb_con.cursor()
+            cur.execute(
+                f"CREATE TABLE {table_name} (A BLOB SUB_TYPE 0, B BLOB SUB_TYPE 0)")
+            fb_con.commit()
+            cur.execute(
+                f"INSERT INTO {table_name} VALUES (?, ?)", (b'X' * 15, b'Y' * 15))
+            fb_con.commit()
+        finally:
+            try:
+                fb_con.close()
+            except Exception:
+                pass
+        try:
+            check_con = get_test_firebird_connection()
+            try:
+                counting = _CountingFbCur(check_con.cursor())
+                table.name = table_name
+                with self.assertRaises(ValueError) as ctx:
+                    _reject_oversized_blobs(
+                        counting, table, table.columns, 32, 64)
                 self.assertIn('exceeds per-worker buffer', str(ctx.exception))
                 self.assertEqual(counting.fetchmany_calls, 0)
             finally:
