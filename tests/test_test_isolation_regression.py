@@ -291,6 +291,90 @@ class TestSourceStateRejectedWithoutShortcuts(unittest.TestCase):
         self.assertNotIn('MagicMock', source)
 
 
+class TestNoCredentialLeak(unittest.TestCase):
+    """
+    Accepts: skip/failure messages identify host, port and database only.
+    A sentinel password must appear in neither the skip reason nor the
+    strict-mode exception, for PostgreSQL and Firebird alike.
+    """
+
+    SENTINEL_PG = 'S3ntinel-PG-pw-9zq'
+    SENTINEL_FB = 'S3ntinel-FB-pw-9zq'
+
+    def _with_sentinel_unreachable(self, strict, fn):
+        old = {k: os.environ.get(k) for k in (
+            'TEST_PG_HOST', 'TEST_FB_HOST',
+            'TEST_PG_PASSWORD', 'TEST_FB_PASSWORD', STRICT_ENV_VAR,
+        )}
+        os.environ['TEST_PG_HOST'] = '192.0.2.1'
+        os.environ['TEST_FB_HOST'] = '192.0.2.1'
+        os.environ['TEST_PG_PASSWORD'] = self.SENTINEL_PG
+        os.environ['TEST_FB_PASSWORD'] = self.SENTINEL_FB
+        if strict:
+            os.environ[STRICT_ENV_VAR] = '1'
+        else:
+            os.environ.pop(STRICT_ENV_VAR, None)
+        reset_availability_cache()
+        try:
+            return fn()
+        finally:
+            for key, value in old.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            reset_availability_cache()
+
+    def test_skip_reason_hides_passwords(self):
+        def run():
+            case = unittest.TestCase()
+            for guard, sentinel in (
+                (db_isolation.require_live_postgres, self.SENTINEL_PG),
+                (db_isolation.require_live_firebird, self.SENTINEL_FB),
+            ):
+                with self.assertRaises(unittest.SkipTest) as ctx:
+                    guard(case)
+                message = str(ctx.exception)
+                self.assertNotIn(sentinel, message)
+                self.assertNotIn('password', message.lower())
+            return True
+
+        self._with_sentinel_unreachable(False, run)
+
+    def test_skip_reason_keeps_host_port_and_database(self):
+        def run():
+            case = unittest.TestCase()
+            with self.assertRaises(unittest.SkipTest) as ctx:
+                db_isolation.require_live_postgres(case)
+            message = str(ctx.exception)
+            self.assertIn('192.0.2.1', message)
+            self.assertIn('firebird2postgres_test', message)
+            with self.assertRaises(unittest.SkipTest) as ctx:
+                db_isolation.require_live_firebird(case)
+            message = str(ctx.exception)
+            self.assertIn('192.0.2.1', message)
+            self.assertIn('firebird2postgres_test', message)
+            return True
+
+        self._with_sentinel_unreachable(False, run)
+
+    def test_strict_failure_hides_passwords(self):
+        def run():
+            case = unittest.TestCase()
+            for guard, sentinel in (
+                (db_isolation.require_live_postgres, self.SENTINEL_PG),
+                (db_isolation.require_live_firebird, self.SENTINEL_FB),
+            ):
+                with self.assertRaises(AssertionError) as ctx:
+                    guard(case)
+                message = str(ctx.exception)
+                self.assertNotIn(sentinel, message)
+                self.assertNotIn('password', message.lower())
+            return True
+
+        self._with_sentinel_unreachable(True, run)
+
+
 class TestDefTimeAnnotationsResolve(unittest.TestCase):
     """
     Guards collection on Python <= 3.13, where annotations are evaluated

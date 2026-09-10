@@ -143,12 +143,25 @@ def reset_availability_cache() -> None:
     is_firebird_available.cache_clear()
 
 
+def _safe_db_identity(db_name: str) -> str:
+    """
+    Non-secret database identification for skip/failure messages:
+    host, port and database only. Credentials must never appear in
+    test output, where CI logs are broadly visible.
+    """
+    if 'PostgreSQL' in db_name:
+        cfg = get_test_postgres_config()
+        return f"host={cfg.host} port={cfg.port} dbname={cfg.dbname}"
+    cfg = get_test_firebird_config()
+    return f"host={cfg.host} port={cfg.port} database={cfg.database}"
+
+
 def _require_or_skip(testcase, available: bool, db_name: str) -> None:
     if available:
         return
     message = (
         f"Live {db_name} test database required but unavailable "
-        f"(config: {get_test_postgres_config() if 'PostgreSQL' in db_name else get_test_firebird_config()})."
+        f"({_safe_db_identity(db_name)})."
     )
     if is_strict_integration_mode():
         raise AssertionError(
