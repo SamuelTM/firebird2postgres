@@ -278,6 +278,20 @@ class DatabaseMigrator:
         raw = DdlExporter._fetch_domain_map(self.fb_con.cursor())
         return {str(src).upper(): str(pg).upper() for src, pg in raw.items()}
 
+    def _get_trigger_name_mapping(self) -> dict[str, str]:
+        """
+        Returns the exact source->defined trigger name mapping (both uppercase)
+        computed from the source catalog with the same rule as export
+        (trg_{sequence:05d}_{source}), so position-prefixed triggers validate
+        by identity instead of fuzzy prefix stripping. Returns {} when no
+        source connection is available, falling back to exact matching.
+        Catalog errors propagate: an unverifiable mapping must never approve.
+        """
+        if self.fb_con is None:
+            return {}
+        raw = DdlExporter._fetch_trigger_map(self.fb_con.cursor())
+        return {str(src).upper(): str(pg).upper() for src, pg in raw.items()}
+
     def validate_artifacts(self, output_dir: str = None,
                            expected_counts: dict[str, int] = None,
                            expected_objects: dict[str, list[str] | set[str]] = None) -> dict[str, bool]:
@@ -310,6 +324,22 @@ class DatabaseMigrator:
             expected_objects = self.ddl_exporter.get_source_objects()
 
         domain_mapping: dict[str, str] | None = None
+        trigger_mapping: dict[str, str] | None = None
+
+        def mapping_for(fname, expected) -> dict[str, str] | None:
+            """Exact source->defined mapping for renamed categories, else None."""
+            nonlocal domain_mapping, trigger_mapping
+            if not expected:
+                return None
+            if fname == DumpFiles.DOMAINS_PG:
+                if domain_mapping is None:
+                    domain_mapping = self._get_domain_name_mapping()
+                return domain_mapping
+            if fname == DumpFiles.TRIGGERS_PG:
+                if trigger_mapping is None:
+                    trigger_mapping = self._get_trigger_name_mapping()
+                return trigger_mapping
+            return None
 
         verified_empty = {}
         for fname in target_files:
@@ -328,33 +358,23 @@ class DatabaseMigrator:
                     )
                 else:
                     allow_empty = (len(exp_objs) == 0)
-                    name_mapping = None
-                    if fname == DumpFiles.DOMAINS_PG and len(exp_objs) > 0:
-                        if domain_mapping is None:
-                            domain_mapping = self._get_domain_name_mapping()
-                        name_mapping = domain_mapping
                     self.sql_runner.validate_file(
                         file_path,
                         expected_objects=exp_objs,
                         allow_empty=allow_empty,
                         object_type=cat_type,
-                        name_mapping=name_mapping
+                        name_mapping=mapping_for(fname, exp_objs)
                     )
             elif expected_counts is not None:
                 exp_val = expected_counts.get(fname, 0)
                 if isinstance(exp_val, (list, set, tuple)):
                     allow_empty = (len(exp_val) == 0)
-                    name_mapping = None
-                    if fname == DumpFiles.DOMAINS_PG and len(exp_val) > 0:
-                        if domain_mapping is None:
-                            domain_mapping = self._get_domain_name_mapping()
-                        name_mapping = domain_mapping
                     self.sql_runner.validate_file(
                         file_path,
                         expected_objects=exp_val,
                         allow_empty=allow_empty,
                         object_type=cat_type,
-                        name_mapping=name_mapping
+                        name_mapping=mapping_for(fname, exp_val)
                     )
                 else:
                     allow_empty = (exp_val == 0)

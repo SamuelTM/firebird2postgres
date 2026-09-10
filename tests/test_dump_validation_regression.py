@@ -10,6 +10,19 @@ from models.firebird_types import build_domain_mapping
 from utils.sql_runner import SqlRunner, extract_defined_objects
 
 
+class _RowsCursor:
+    """Minimal cursor stub feeding catalog rows to the real mapping code."""
+
+    def __init__(self, rows):
+        self._rows = list(rows)
+
+    def execute(self, *args, **kwargs):
+        return None
+
+    def fetchall(self):
+        return list(self._rows)
+
+
 class TestDumpValidationRegression(unittest.TestCase):
     """
     Regression tests verifying that DDL dumps are validated by object identity and type,
@@ -50,10 +63,11 @@ class TestDumpValidationRegression(unittest.TestCase):
         CREATE TRIGGER "BI_CLIENTES" BEFORE INSERT ON "clientes" FOR EACH ROW EXECUTE FUNCTION "f"();
         """
         trig_objs = extract_defined_objects(trig_sql, 'TRIGGER')
-        self.assertIn('BI_PED', trig_objs)
         self.assertIn('TRG_00000_BI_PED', trig_objs)
         self.assertIn('BI_CLIENTES', trig_objs)
         self.assertNotIn('TRG_00000_BI_PED_FUNC', trig_objs)
+        # No fuzzy trg_ sequence-prefix alias: one definition, one identity.
+        self.assertNotIn('BI_PED', trig_objs)
 
         # Domains (in DO block)
         dom_sql = """
@@ -397,6 +411,107 @@ class TestDumpValidationRegression(unittest.TestCase):
                 self.migrator.validate_artifacts(output_dir=tmpdir)
 
             self.assertIn("missing 1 expected DOMAIN(s): FOO_DOM", str(ctx.exception))
+
+    @staticmethod
+    def _trigger_ddl(pg_name, table='t'):
+        return (
+            f'CREATE OR REPLACE FUNCTION "{pg_name}_func"() RETURNS TRIGGER '
+            f'AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql;\n'
+            f'CREATE TRIGGER "{pg_name}" BEFORE INSERT ON "{table}" FOR EACH ROW '
+            f'EXECUTE FUNCTION "{pg_name}_func"();\n'
+        )
+
+    def _mock_trigger_catalog(self, rows):
+        """
+        Mocks the source trigger catalog with (name, sequence) rows and lets
+        the REAL _fetch_trigger_map compute the exact mapping. Returns it.
+        """
+        from engine.ddl_exporter import DdlExporter as _DdlExporter
+        mapping = _DdlExporter._fetch_trigger_map(_RowsCursor(rows))
+        self.migrator.ddl_exporter.get_source_objects = MagicMock(return_value={
+            DumpFiles.DOMAINS_PG: [],
+            DumpFiles.PROCEDURES_PG: [],
+            DumpFiles.VIEWS_PG: [],
+            DumpFiles.TRIGGERS_PG: [name for name, _ in rows],
+        })
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = list(rows)
+        self.mock_fb.cursor.return_value = mock_cursor
+        return mapping
+
+    @staticmethod
+    def _write_trigger_dump(tmpdir, triggers_sql):
+        with open(os.path.join(tmpdir, DumpFiles.TRIGGERS_PG), "w", encoding="utf-8") as f:
+            f.write(triggers_sql)
+        for cat in [DumpFiles.DOMAINS_PG, DumpFiles.PROCEDURES_PG, DumpFiles.VIEWS_PG]:
+            with open(os.path.join(tmpdir, cat), "w", encoding="utf-8") as f:
+                f.write("/* EMPTY */\n")
+
+    def test_complete_prefixed_triggers_pass_validation(self):
+        """Both position-prefixed definitions present: exact mapping approves."""
+        mapping = self._mock_trigger_catalog([("BI", 0), ("TRG_00000_BI", 5)])
+        self.assertEqual(mapping, {"BI": "trg_00000_bi", "TRG_00000_BI": "trg_00005_trg_00000_bi"})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_trigger_dump(
+                tmpdir,
+                self._trigger_ddl("trg_00000_bi")
+                + self._trigger_ddl("trg_00005_trg_00000_bi"),
+            )
+            verified = self.migrator.validate_artifacts(output_dir=tmpdir)
+            self.assertFalse(verified[DumpFiles.TRIGGERS_PG])
+
+    def test_removing_either_prefixed_trigger_definition_fails(self):
+        """
+        P1 acceptance: source triggers BI (seq 0) and TRG_00000_BI (seq 5).
+        Removing EITHER definition must fail before DROP, reporting the
+        source identity — one definition can no longer satisfy both.
+        """
+        self._mock_trigger_catalog([("BI", 0), ("TRG_00000_BI", 5)])
+        cases = [
+            (self._trigger_ddl("trg_00005_trg_00000_bi"), "BI"),
+            (self._trigger_ddl("trg_00000_bi"), "TRG_00000_BI"),
+        ]
+        for dump_sql, missing in cases:
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as tmpdir:
+                self._write_trigger_dump(tmpdir, dump_sql)
+
+                drop_called = []
+                self.migrator.drop_schema = lambda: drop_called.append(True)
+
+                with self.assertRaises(ValueError) as ctx:
+                    self.migrator.validate_artifacts(output_dir=tmpdir)
+
+                self.assertIn(f"missing 1 expected TRIGGER(s): {missing}", str(ctx.exception))
+                self.assertEqual(drop_called, [])
+
+    def test_trigger_position_is_part_of_identity(self):
+        """
+        P1 regression: positions differ, so trg_00000_bi must NOT satisfy a
+        BI whose sequence is 7 (exact pg name trg_00007_bi).
+        """
+        self._mock_trigger_catalog([("BI", 7)])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_trigger_dump(tmpdir, self._trigger_ddl("trg_00000_bi"))
+            with self.assertRaises(ValueError) as ctx:
+                self.migrator.validate_artifacts(output_dir=tmpdir)
+            self.assertIn("missing 1 expected TRIGGER(s): BI", str(ctx.exception))
+
+    def test_trigger_name_with_trg_prefix_validates_by_mapping(self):
+        """
+        P1 regression: a source trigger already starting with trg_
+        (TRG_TEST, seq 3 -> trg_00003_trg_test) validates through the exact
+        mapping, while extraction alone holds no bare TRG_TEST alias.
+        """
+        mapping = self._mock_trigger_catalog([("TRG_TEST", 3)])
+        self.assertEqual(mapping, {"TRG_TEST": "trg_00003_trg_test"})
+        dump_sql = self._trigger_ddl("trg_00003_trg_test")
+        defined = extract_defined_objects(dump_sql, 'TRIGGER')
+        self.assertIn('TRG_00003_TRG_TEST', defined)
+        self.assertNotIn('TRG_TEST', defined)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_trigger_dump(tmpdir, dump_sql)
+            verified = self.migrator.validate_artifacts(output_dir=tmpdir)
+            self.assertFalse(verified[DumpFiles.TRIGGERS_PG])
 
 
 if __name__ == "__main__":

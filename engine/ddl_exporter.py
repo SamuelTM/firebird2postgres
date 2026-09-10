@@ -295,6 +295,36 @@ class DdlExporter:
         return domain_map
 
     @staticmethod
+    def _fetch_trigger_map(cursor) -> dict[str, str]:
+        """
+        Builds the exact source->PostgreSQL trigger name mapping used at export:
+        pg_name = f"trg_{sequence:05d}_{source.lower()}", with NULL sequences
+        treated as 0. Same filters as export_firebird_triggers and
+        get_source_objects so validation compares identical populations.
+        Keys are uppercase source names, values lowercase PG names.
+        """
+        cursor.execute("""
+            SELECT RDB$TRIGGER_NAME, RDB$TRIGGER_SEQUENCE
+            FROM RDB$TRIGGERS
+            WHERE RDB$SYSTEM_FLAG = 0
+              AND RDB$TRIGGER_SOURCE IS NOT NULL
+              AND (RDB$TRIGGER_INACTIVE = 0 OR RDB$TRIGGER_INACTIVE IS NULL)
+            ORDER BY RDB$TRIGGER_NAME;
+        """)
+        mapping: dict[str, str] = {}
+        for row in cursor.fetchall() or []:
+            if not row or not row[0]:
+                continue
+            src = str(row[0]).strip()
+            seq = row[1] if len(row) > 1 and row[1] is not None else 0
+            try:
+                seq_num = int(seq)
+            except (ValueError, TypeError):
+                seq_num = 0
+            mapping[src.upper()] = f"trg_{seq_num:05d}_{src.lower()}"
+        return mapping
+
+    @staticmethod
     def _fetch_domain_types(cursor) -> dict[str, str]:
         _, domain_types = DdlExporter._fetch_domain_info(cursor)
         return domain_types

@@ -216,18 +216,13 @@ def scan_ddl_text(text: str) -> tuple[str, list[str], list[str]]:
 def _match_creates(code_text: str, patterns: list[tuple], idents: list[str]) -> set[str]:
     """Runs CREATE-object patterns over code-only text with opaque identifiers."""
     defined = set()
-    for cat, pat in patterns:
+    for _, pat in patterns:
         for m in pat.finditer(code_text):
             if m.group(1) is not None:
                 raw_name = idents[int(m.group(1))].strip()
             else:
                 raw_name = m.group(2).strip()
-            upper_name = raw_name.upper()
-            defined.add(upper_name)
-            if cat == 'TRIGGER':
-                # Strip sequence prefix if present (e.g. trg_00000_bi_ped -> BI_PED)
-                stripped = re.sub(r'^trg_\d+_', '', raw_name, flags=re.IGNORECASE).upper()
-                defined.add(stripped)
+            defined.add(raw_name.upper())
     return defined
 
 
