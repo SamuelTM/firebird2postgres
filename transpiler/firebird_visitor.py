@@ -749,7 +749,25 @@ def _normalize_type_of(sql: str, domain_types: dict[str, str] = None) -> str:
         m_dom = re.match(r'^\bTYPE\s+OF\s+([a-zA-Z0-9_$]+|\"[^\"]+\")', full_kw, re.IGNORECASE)
         if m_dom:
             raw_dom = m_dom.group(1)
-            clean_dom = raw_dom.strip(' "').upper()
+            is_delimited = len(raw_dom) >= 2 and raw_dom.startswith('"') and raw_dom.endswith('"')
+            if is_delimited:
+                clean_dom = raw_dom.strip(' "').upper()
+                if clean_dom in norm_domain_types:
+                    base_type = norm_domain_types[clean_dom]
+                    try:
+                        base_type = get_postgres_type(base_type)
+                    except Exception:
+                        pass
+                    return base_type
+                raise ValueError(f"Unknown domain '{raw_dom}' in TYPE OF expression.")
+            clean_dom = raw_dom.upper()
+            # Bare native type names denote the native type, never a homonym
+            # domain: TYPE OF INTEGER is INTEGER even beside domain "INTEGER".
+            if clean_dom in _NATIVE_TYPE_WORDS:
+                try:
+                    return get_postgres_type(clean_dom)
+                except Exception:
+                    return clean_dom
             if clean_dom in norm_domain_types:
                 base_type = norm_domain_types[clean_dom]
                 try:
@@ -765,10 +783,14 @@ def _normalize_type_of(sql: str, domain_types: dict[str, str] = None) -> str:
 
 # Single-word native type names that a BARE (unquoted) reference always
 # denotes, even when a domain of the same name exists. Firebird resolves
-# unquoted identifiers case-insensitively, and reserved type names such as
-# INT128 (reserved in Firebird 4) can never address a delimited domain:
-# only "NAME" (delimited) may resolve through the domain map.
-_RESERVED_NATIVE_TYPE_WORDS = frozenset({'BLOB', 'INT128', 'DECFLOAT'})
+# unquoted identifiers case-insensitively, and these reserved type names
+# (Firebird 4 appendix C) can never address a delimited domain: only
+# "NAME" (delimited) may resolve through the domain map.
+_NATIVE_TYPE_WORDS = frozenset({
+    'BIGINT', 'BLOB', 'BOOLEAN', 'CHAR', 'CHARACTER', 'DATE', 'DEC',
+    'DECFLOAT', 'DECIMAL', 'DOUBLE', 'FLOAT', 'INT', 'INTEGER', 'INT128',
+    'NUMERIC', 'SMALLINT', 'TIME', 'TIMESTAMP', 'VARCHAR',
+})
 
 
 def convert_firebird_type_declaration(raw_type: str, domain_map: dict[str, str] = None) -> str:
@@ -786,7 +808,7 @@ def convert_firebird_type_declaration(raw_type: str, domain_map: dict[str, str] 
                 return domain_map[inner]
         else:
             u = stripped.upper()
-            if u not in _RESERVED_NATIVE_TYPE_WORDS and u in domain_map:
+            if u not in _NATIVE_TYPE_WORDS and u in domain_map:
                 return domain_map[u]
     cleaned = re.sub(r'(?i)\bBLOB\s+SUBTYPE\s+(?:1|TEXT)\b', 'TEXT', raw_type)
     cleaned = re.sub(r'(?i)\bBLOB\s+SUBTYPE\s+(?:0|BINARY)\b', 'BYTEA', cleaned)

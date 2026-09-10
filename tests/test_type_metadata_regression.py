@@ -195,6 +195,108 @@ class TestTypeMetadataRegression(unittest.TestCase):
         self.assertIn('V_NUM NUMERIC(39);', transpiled)
         self.assertIn('CAST(V_NUM AS NUMERIC(39))', transpiled)
 
+    def test_all_native_type_words_ignore_homonym_domains(self):
+        """
+        P1 acceptance sweep: every supported native type word stays native
+        when bare (the homonym domain map must have zero effect), while the
+        delimited form resolves to its domain.
+        """
+        from transpiler.firebird_visitor import (
+            _NATIVE_TYPE_WORDS,
+            convert_firebird_type_declaration,
+        )
+        self.assertGreaterEqual(len(_NATIVE_TYPE_WORDS), 15)
+        for word in sorted(_NATIVE_TYPE_WORDS):
+            dm = {word: f'{word.lower()}_dom'}
+            with self.subTest(word=word):
+                # Bare: map is invisible, identical to the no-map conversion.
+                self.assertEqual(
+                    convert_firebird_type_declaration(word, domain_map=dm),
+                    convert_firebird_type_declaration(word),
+                )
+                self.assertNotIn(
+                    f'{word.lower()}_dom',
+                    convert_firebird_type_declaration(word, domain_map=dm),
+                )
+                # Delimited: resolves to the domain.
+                self.assertEqual(
+                    convert_firebird_type_declaration(f'"{word}"', domain_map=dm),
+                    f'{word.lower()}_dom',
+                )
+        # Spot checks pinning the native outputs (not just map-invisibility).
+        self.assertEqual(convert_firebird_type_declaration('INT128', {'INT128': 'x'}), 'NUMERIC(39)')
+        self.assertEqual(convert_firebird_type_declaration('BLOB', {'BLOB': 'x'}), 'BYTEA')
+        self.assertEqual(convert_firebird_type_declaration('INTEGER', {'INTEGER': 'x'}), 'INTEGER')
+        self.assertEqual(convert_firebird_type_declaration('DATE', {'DATE': 'x'}), 'DATE')
+
+    def test_native_integer_and_date_beside_domains_in_procedure(self):
+        """
+        P1 acceptance: same database owning "INTEGER"/"DATE" domains with
+        CHECK/NOT NULL flavor. Bare declarations keep native types across
+        parameters, variables and casts; delimited ones use the domains.
+        """
+        fb_proc = """
+        CREATE OR ALTER PROCEDURE SP_MIXED_T (
+            P_IDOM "INTEGER",
+            P_INUM INTEGER,
+            P_DDOM "DATE",
+            P_DDAT DATE
+        ) RETURNS (
+            O_IDOM "INTEGER",
+            O_INUM INTEGER
+        ) AS
+        DECLARE VARIABLE V_IDOM "INTEGER";
+        DECLARE VARIABLE V_INUM INTEGER;
+        DECLARE VARIABLE V_DDOM "DATE";
+        DECLARE VARIABLE V_DDAT DATE;
+        BEGIN
+            V_IDOM = P_IDOM;
+            V_INUM = P_INUM;
+            V_DDOM = P_DDOM;
+            V_DDAT = P_DDAT;
+            O_IDOM = CAST(V_IDOM AS "INTEGER");
+            O_INUM = CAST(V_INUM AS INTEGER) + CAST(V_DDAT AS DATE);
+            SUSPEND;
+        END;
+        """
+        dm = {'INTEGER': 'integer_dom', 'DATE': 'date_dom'}
+        transpiled = FirebirdToPostgresVisitor.transpile(fb_proc, domain_map=dm)
+        for frag in ('P_IDOM integer_dom', 'OUT O_IDOM integer_dom',
+                     'V_IDOM integer_dom;', 'CAST(V_IDOM AS integer_dom)',
+                     'P_DDOM date_dom', 'V_DDOM date_dom;'):
+            self.assertIn(frag, transpiled)
+        for frag in ('P_INUM INTEGER', 'OUT O_INUM INTEGER',
+                     'V_INUM INTEGER;', 'CAST(V_INUM AS INTEGER)',
+                     'P_DDAT DATE', 'V_DDAT DATE;', 'CAST(V_DDAT AS DATE)'):
+            self.assertIn(frag, transpiled)
+        # No native slot may carry a domain with constraints: exact
+        # wrong pairings must be absent (line checks would false-positive
+        # on the shared signature line).
+        for wrong in ('P_INUM integer_dom', 'V_INUM integer_dom',
+                      'O_INUM integer_dom', 'P_DDAT date_dom',
+                      'V_DDAT date_dom', 'CAST(V_INUM AS integer_dom)',
+                      'CAST(V_DDAT AS date_dom)'):
+            self.assertNotIn(wrong, transpiled)
+
+    def test_type_of_distinguishes_native_from_domain(self):
+        """
+        P1 acceptance: TYPE OF "INTEGER" follows the domain base type while
+        bare TYPE OF INTEGER stays native; unknown names still raise.
+        Distinct base types (BIGINT vs INTEGER) expose any hijack.
+        """
+        from transpiler.firebird_visitor import _normalize_type_of
+        dt = {'INTEGER': 'BIGINT', 'DATE': 'TIMESTAMP'}
+        self.assertEqual(
+            _normalize_type_of('X TYPE OF "INTEGER" Y', dt), 'X BIGINT Y')
+        self.assertEqual(
+            _normalize_type_of('X TYPE OF INTEGER Y', dt), 'X INTEGER Y')
+        self.assertEqual(
+            _normalize_type_of('X TYPE OF "DATE" Y', dt), 'X TIMESTAMP Y')
+        self.assertEqual(
+            _normalize_type_of('X TYPE OF DATE Y', dt), 'X DATE Y')
+        with self.assertRaises(ValueError):
+            _normalize_type_of('X TYPE OF NOPE Y', dt)
+
 
     def test_octets_domain_and_column_metadata(self):
         """
