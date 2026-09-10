@@ -354,11 +354,12 @@ def _reject_oversized_blobs(fb_cur, table: Table, cols_to_import: list,
 
     Conceptually max_buffer_bytes is the BUFFER limit (serialized COPY
     bytes), while worker MEMORY transiently holds raw driver data plus the
-    serialized buffer. A probe query failure (e.g. an exotic type the CAST
-    cannot render) only logs a warning and proceeds: the exact per-row cap
-    during streaming remains the hard guarantee that no over-limit buffer
-    is ever delivered. Values that are not plain ints (e.g. unconfigured
-    test doubles) are likewise ignored here.
+    serialized buffer. Probe failures (prepare, conversion, permission,
+    result read) always propagate: when limits cannot be verified the import
+    halts before any fetchmany() or destination write. No fallback query may
+    continue without establishing the same guarantee. Values that are not
+    plain ints (e.g. unconfigured test doubles) are ignored here; the
+    streaming checks remain the backstop for them.
     """
     if max_blob_bytes is None or max_blob_bytes <= 0:
         return
@@ -383,17 +384,10 @@ def _reject_oversized_blobs(fb_cur, table: Table, cols_to_import: list,
         weighted_terms.append(f'2 * ({quoted})')
     weighted_terms.append(str(len(cols_to_import)))
     max_exprs.append(f'MAX({" + ".join(weighted_terms)})')
-    try:
-        fb_cur.execute(
-            f'SELECT {", ".join(max_exprs)} FROM {pg_quote_ident(table.name)}'
-        )
-        row = fb_cur.fetchone()
-    except firebirdsql.Error as e:
-        logger.warning(
-            f"Aggregate BLOB pre-check unavailable for '{table.name}': {e}. "
-            f"Proceeding; per-row streaming limits still apply."
-        )
-        return
+    fb_cur.execute(
+        f'SELECT {", ".join(max_exprs)} FROM {pg_quote_ident(table.name)}'
+    )
+    row = fb_cur.fetchone()
     if not row:
         return
     for col, max_len in zip(blob_cols, row):

@@ -5,6 +5,8 @@ import tracemalloc
 import unittest
 from unittest.mock import MagicMock, patch
 
+import firebirdsql
+
 from config import MigrationConfig
 from engine.data_migrator import (
     DataMigrator,
@@ -965,6 +967,45 @@ class TestTextualAggregateBudget(unittest.TestCase):
         bad_fb.fetchmany.assert_not_called()
 
 
+    def test_probe_errors_propagate_without_reads_or_writes(self):
+        """
+        P1: a failing preventive query (prepare, conversion, permission or
+        result read) must abort the import. No fetchmany() may run and no
+        destination command (TRUNCATE/COPY) may execute.
+        """
+        table = Table('TAB_PROBE')
+        table.columns.append(Column('ID', 'INTEGER', nullable=False))
+        table.columns.append(Column('B', 'BLOB SUBTYPE 0', nullable=True))
+
+        failures = {
+            'prepare': {'execute': firebirdsql.OperationalError('syntax', [335544569], -104)},
+            'conversion': {'execute': firebirdsql.OperationalError('conversion', [335544569], -413)},
+            'permission': {'execute': firebirdsql.OperationalError('denied', [335544352], -551)},
+            'result-read': {'fetchone': firebirdsql.OperationalError('lost', [335544648], -902)},
+        }
+        for kind, faults in failures.items():
+            with self.subTest(kind=kind):
+                mock_fb_cur = MagicMock()
+                mock_pg_cur = MagicMock()
+                mock_pg_con = MagicMock()
+                if 'execute' in faults:
+                    mock_fb_cur.execute.side_effect = faults['execute']
+                if 'fetchone' in faults:
+                    mock_fb_cur.fetchone.side_effect = faults['fetchone']
+                mock_fb_cur.fetchmany.side_effect = [[(1, b'X' * 100)], []]
+
+                with self.assertRaises(firebirdsql.Error):
+                    _import_single_table(
+                        table, mock_fb_cur, mock_pg_cur, mock_pg_con,
+                        max_buffer_bytes=8 * 1024 * 1024,
+                        max_blob_bytes=4 * 1024 * 1024,
+                    )
+                mock_fb_cur.fetchmany.assert_not_called()
+                mock_pg_cur.execute.assert_not_called()
+                mock_pg_cur.copy_expert.assert_not_called()
+                mock_pg_con.commit.assert_not_called()
+
+
 class _FakePgCur:
     """Minimal COPY-capturing cursor (spawn-picklable, no PG server needed)."""
 
@@ -1412,6 +1453,97 @@ class TestRealDriverMemoryBudget(unittest.TestCase):
             "Tab-heavy text row must be rejected before any fetchmany materializes it",
         )
         self.assertLess(res.get('peak_delta'), self.REJECT_PEAK_BOUND)
+
+    @requires_firebird
+    def test_probe_query_runs_on_supported_types_and_charsets(self):
+        """
+        P1: the preventive aggregate (per-column MAX, weighted row MAX with
+        OCTET_LENGTH/CAST/COALESCE) executes against the live server across
+        supported scalar, blob and charset variants without raising, and the
+        recorded statement proves the same guarantee as production.
+        """
+        from engine.data_migrator import _reject_oversized_blobs
+
+        table = Table('TAB_PROBE_TYPES')
+        table.columns.append(Column('ID', 'INTEGER', nullable=False))
+        table.columns.append(Column('VC1252', 'VARCHAR(20)', nullable=True))
+        table.columns.append(Column('VCUTF', 'VARCHAR(20)', nullable=True))
+        table.columns.append(Column('VOCT', 'CHAR(8) CHARACTER SET OCTETS', nullable=True))
+        table.columns.append(Column('N', 'NUMERIC(10,2)', nullable=True))
+        table.columns.append(Column('DT', 'DATE', nullable=True))
+        table.columns.append(Column('TS', 'TIMESTAMP', nullable=True))
+        table.columns.append(Column('F', 'BOOLEAN', nullable=True))
+        table.columns.append(Column('BB', 'BLOB SUBTYPE 0', nullable=True))
+        table.columns.append(Column('BT', 'BLOB SUBTYPE 1', nullable=True))
+
+        table_name = unique_name('MEM_TYPES').upper()
+
+        def _run_phase(statements):
+            fb_con = get_test_firebird_connection()
+            try:
+                cur = fb_con.cursor()
+                for sql, params in statements:
+                    if params is None:
+                        cur.execute(sql)
+                    else:
+                        cur.execute(sql, params)
+                fb_con.commit()
+            finally:
+                try:
+                    fb_con.close()
+                except Exception:
+                    pass
+
+        try:
+            _run_phase([(
+                f"CREATE TABLE {table_name} (ID INTEGER, VC1252 VARCHAR(20), "
+                f"VCUTF VARCHAR(20) CHARACTER SET UTF8, "
+                f"VOCT CHAR(8) CHARACTER SET OCTETS, N NUMERIC(10,2), "
+                f"DT DATE, TS TIMESTAMP, F BOOLEAN, "
+                f"BB BLOB SUB_TYPE 0, BT BLOB SUB_TYPE 1)", None)])
+            # WIN1252-transportable multibyte values only: the connection
+            # charset cannot carry emoji (covered by mocked serialization
+            # tests instead). Accents exercise UTF-8 expansion server-side.
+            _run_phase([(
+                f"INSERT INTO {table_name} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (1, 'ação', 'ação ç', b'\x00\xffAB', '150.50',
+                 '2026-09-08', '2026-09-08 15:30:45', True,
+                 b'\xde\xad', 'texto com ç'),
+            )])
+
+            executed = []
+
+            class _RecordingCur:
+                def __init__(self, real):
+                    self._real = real
+
+                def execute(self, *args, **kwargs):
+                    executed.append(args[0] if args else '')
+                    return self._real.execute(*args, **kwargs)
+
+                def fetchone(self):
+                    return self._real.fetchone()
+
+                def fetchall(self):
+                    return self._real.fetchall()
+
+            probe_con = get_test_firebird_connection()
+            try:
+                table.name = table_name
+                _reject_oversized_blobs(
+                    _RecordingCur(probe_con.cursor()), table, table.columns,
+                    1 * 1024 * 1024, 8 * 1024 * 1024,
+                )
+            finally:
+                try:
+                    probe_con.close()
+                except Exception:
+                    pass
+            probe_sql = ' '.join(executed)
+            for token in ('OCTET_LENGTH', 'COALESCE', 'CAST', 'MAX('):
+                self.assertIn(token, probe_sql)
+        finally:
+            self._drop_blob_table(table_name)
 
     @requires_live_databases
     def test_real_copy_import_bounds_peak_and_sizes(self):
