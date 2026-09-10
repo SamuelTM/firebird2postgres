@@ -6,6 +6,7 @@ from tests.db_isolation import (
     get_test_postgres_connection,
     is_firebird_available,
     is_postgres_available,
+    require_live_databases,
     requires_live_databases,
 )
 from transpiler import FirebirdToPostgresVisitor
@@ -100,6 +101,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
         """
         Valid selectable procedure: returns rows successfully on both Firebird and PostgreSQL.
         """
+        require_live_databases(self)
         fb_sql = """
         CREATE OR ALTER PROCEDURE P_TEST_VALID_SEL
         RETURNS (R INTEGER NOT NULL)
@@ -133,6 +135,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
         """
         Valid executable procedure: returns scalar value successfully on both Firebird and PostgreSQL.
         """
+        require_live_databases(self)
         fb_sql = """
         CREATE OR ALTER PROCEDURE P_TEST_VALID_EXEC
         RETURNS (R INTEGER NOT NULL)
@@ -163,6 +166,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
         """
         Uninitialized output in selectable procedure: fails on SUSPEND on both Firebird and PostgreSQL.
         """
+        require_live_databases(self)
         fb_sql = """
         CREATE OR ALTER PROCEDURE P_TEST_UNINIT_SEL
         RETURNS (R INTEGER NOT NULL)
@@ -195,6 +199,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
         """
         Uninitialized output in executable procedure: fails at routine end on both Firebird and PostgreSQL.
         """
+        require_live_databases(self)
         fb_sql = """
         CREATE OR ALTER PROCEDURE P_TEST_UNINIT_EXEC
         RETURNS (R INTEGER NOT NULL)
@@ -226,6 +231,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
         """
         Explicit assignment of NULL to NOT NULL output parameter: fails at assignment on both.
         """
+        require_live_databases(self)
         fb_sql = """
         CREATE OR ALTER PROCEDURE P_TEST_ASSIGN_NULL
         RETURNS (R INTEGER NOT NULL)
@@ -260,6 +266,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
         Multiple rows respect the constraint individually:
         Row 1 is valid, row 2 assigns NULL and triggers validation error.
         """
+        require_live_databases(self)
         fb_sql = """
         CREATE OR ALTER PROCEDURE P_TEST_MULTI_SUSPEND
         RETURNS (R INTEGER NOT NULL)
@@ -301,6 +308,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
         """
         Singleton SELECT NULL INTO NOT NULL output parameter: fails at runtime.
         """
+        require_live_databases(self)
         fb_sql = """
         CREATE OR ALTER PROCEDURE P_TEST_SEL_NULL
         RETURNS (R INTEGER NOT NULL)
@@ -334,6 +342,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
         """
         FOR SELECT NULL INTO NOT NULL output parameter: fails on loop iteration.
         """
+        require_live_databases(self)
         fb_sql = """
         CREATE OR ALTER PROCEDURE P_TEST_FOR_NULL
         RETURNS (R INTEGER NOT NULL)
@@ -370,6 +379,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
         Early EXIT in selectable procedure before any SUSPEND yields empty set without error.
         Firebird and PostgreSQL both return 0 rows.
         """
+        require_live_databases(self)
         fb_sql = """
         CREATE OR ALTER PROCEDURE P_TEST_EARLY_EXIT_SEL
         RETURNS (R INTEGER NOT NULL)
@@ -403,6 +413,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
         Early EXIT in executable procedure when NOT NULL output is uninitialized:
         Fails on EXIT in both Firebird and PostgreSQL.
         """
+        require_live_databases(self)
         fb_sql = """
         CREATE OR ALTER PROCEDURE P_TEST_EARLY_EXIT_EXEC
         RETURNS (R INTEGER NOT NULL)
@@ -438,6 +449,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
         - Input parameter NULL check happens on routine entry.
         - Output parameter NULL check happens on assignment and emission.
         """
+        require_live_databases(self)
         fb_sql = """
         CREATE OR ALTER PROCEDURE P_TEST_IN_OUT_DISTINCT (
             P_IN INTEGER NOT NULL
@@ -491,6 +503,7 @@ class TestOutputNotNullRegression(unittest.TestCase):
         Verify that in procedures with multiple outputs, NOT NULL is enforced only on
         the specific parameter declared NOT NULL, and nullable output can be NULL.
         """
+        require_live_databases(self)
         fb_sql = """
         CREATE OR ALTER PROCEDURE P_TEST_MIXED_OUT
         RETURNS (

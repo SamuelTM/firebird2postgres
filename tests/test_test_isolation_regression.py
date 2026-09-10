@@ -343,5 +343,124 @@ class TestDefTimeAnnotationsResolve(unittest.TestCase):
         )
 
 
+_LIVE_HANDLE_NAMES = {'pg_cur', 'fb_cur', 'pg_con', 'fb_con'}
+_LIVE_CONNECT_CALLS = {'get_test_postgres_connection', 'get_test_firebird_connection'}
+_REQUIRE_CALLS = {'require_live_postgres', 'require_live_firebird', 'require_live_databases'}
+_CLASS_GATE_DECORATORS = {'requires_postgres_class', 'requires_firebird_class', 'requires_live_databases_class'}
+
+
+def _decorator_names(decorator_list):
+    names = set()
+    for dec in decorator_list:
+        if isinstance(dec, ast.Name):
+            names.add(dec.id)
+        elif isinstance(dec, ast.Attribute):
+            names.add(dec.attr)
+        elif isinstance(dec, ast.Call):
+            func = dec.func
+            if isinstance(func, ast.Name):
+                names.add(func.id)
+            elif isinstance(func, ast.Attribute):
+                names.add(func.attr)
+    return names
+
+
+def _ungated_live_tests(path: pathlib.Path) -> list[str]:
+    """
+    Returns test_* methods that touch live database handles without a
+    lazy gate (require_* call or requires_* decorator, including class
+    level). Such methods pass vacuously when databases are down.
+    """
+    tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+    offenders: list[str] = []
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        class_gated = bool(_decorator_names(node.decorator_list) & _CLASS_GATE_DECORATORS)
+        for item in node.body:
+            if not isinstance(item, ast.FunctionDef) or not item.name.startswith('test_'):
+                continue
+            uses_live = False
+            gated = class_gated or bool(
+                _decorator_names(item.decorator_list) & (_REQUIRE_CALLS | {
+                    'requires_postgres', 'requires_firebird', 'requires_live_databases',
+                } | _CLASS_GATE_DECORATORS)
+            )
+            for child in ast.walk(item):
+                # self.pg_cur / self.fb_cur / ... : the lazy setUp pattern
+                # holding a real connection (or None). Bare locals are
+                # ignored: mock-only tests build MagicMock factories with
+                # the same words (e.g. nested make_pg_con helpers).
+                if isinstance(child, ast.Attribute) and child.attr in _LIVE_HANDLE_NAMES:
+                    uses_live = True
+                elif (isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+                        and child.func.id in (_LIVE_CONNECT_CALLS | _REQUIRE_CALLS)):
+                    if child.func.id in _REQUIRE_CALLS:
+                        gated = True
+                    else:
+                        uses_live = True
+            if uses_live and not gated:
+                offenders.append(f"{path.name}:{item.lineno}: {item.name}")
+    return offenders
+
+
+class TestLiveTestsAreGated(unittest.TestCase):
+    """
+    Accepts: cada teste de integração exige seus bancos antes de começar.
+    No test_* method touching live handles may run assertions (or nothing)
+    without first requiring its databases: explicit skip outside strict
+    mode, hard failure with REQUIRE_INTEGRATION=1. Holds when the test is
+    executed individually, not just in a full-suite run.
+    """
+
+    def test_every_live_test_method_is_gated(self):
+        offenders: list[str] = []
+        for path in sorted(TESTS_DIR.glob('test_*.py')):
+            if path.name == 'test_test_isolation_regression.py':
+                continue
+            offenders.extend(_ungated_live_tests(path))
+        self.assertEqual(
+            offenders, [],
+            "Integration tests without a database gate (vacuous pass when DBs are down):\n"
+            + "\n".join(offenders),
+        )
+
+    def _run_single_test(self, node_id: str, strict: bool) -> subprocess.CompletedProcess:
+        env = dict(os.environ)
+        env['TEST_PG_HOST'] = '192.0.2.1'
+        env['TEST_FB_HOST'] = '192.0.2.1'
+        env['POSTGRES_HOST'] = '192.0.2.1'
+        env['FIREBIRD_HOST'] = '192.0.2.1'
+        if strict:
+            env[STRICT_ENV_VAR] = '1'
+        else:
+            env.pop(STRICT_ENV_VAR, None)
+        return subprocess.run(
+            [sys.executable, '-m', 'pytest', node_id, '-q'],
+            cwd=str(TESTS_DIR.parent),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+
+    def test_single_integration_test_skips_without_databases(self):
+        proc = self._run_single_test(
+            'tests/test_output_not_null_regression.py::TestOutputNotNullRegression::test_regression_valid_output_selectable',
+            strict=False,
+        )
+        self.assertEqual(proc.returncode, 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+        self.assertIn('1 skipped', proc.stdout)
+        self.assertNotIn('1 passed', proc.stdout)
+
+    def test_single_integration_test_fails_in_strict_mode_without_databases(self):
+        proc = self._run_single_test(
+            'tests/test_output_not_null_regression.py::TestOutputNotNullRegression::test_regression_valid_output_selectable',
+            strict=True,
+        )
+        self.assertNotEqual(proc.returncode, 0, f"Must fail, got:\n{proc.stdout}")
+        self.assertIn('1 failed', proc.stdout)
+
+
 if __name__ == '__main__':
     unittest.main()
