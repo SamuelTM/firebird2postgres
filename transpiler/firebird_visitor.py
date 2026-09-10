@@ -1726,34 +1726,40 @@ class ASTDialectRewriter(FirebirdParserVisitor):
         return TableSource(table_name=t_name, alias=alias, qualifier=qualifier, subquery_ctx=subquery_ctx)
 
     @staticmethod
-    def _using_columns_of_join(join_clause) -> set[str] | None:
+    def _join_kind_and_columns(join_clause) -> tuple[str, list[str] | None]:
         """
-        Returns the lowercased USING column names of one join_clause, or None
-        when the join is not a USING join (ON / CROSS / comma): only USING
-        merges the shared columns, every other join preserves both sides.
+        Classifies one join_clause for star expansion: ('using', columns),
+        ('natural', None) or ('all', None) for ON / CROSS / comma joins.
+        Only USING (and NATURAL, its implicit form) merges shared columns;
+        every other join preserves both sides.
         """
-        if not join_clause or not hasattr(join_clause, 'join_using_part'):
-            return None
-        try:
-            jups = join_clause.join_using_part()
-        except Exception:
-            return None
-        if not jups:
-            return None
-        if not isinstance(jups, list):
-            jups = [jups]
-        cols: set[str] = set()
-        for jup in jups:
+        if join_clause is not None:
             try:
-                pcl = jup.paren_column_list() if hasattr(jup, 'paren_column_list') else None
-                if pcl and hasattr(pcl, 'column_list') and pcl.column_list():
-                    for col in pcl.column_list().column_name():
-                        raw = col.getText().strip('":').lower()
-                        if raw:
-                            cols.add(raw)
+                jups = join_clause.join_using_part() if hasattr(join_clause, 'join_using_part') else None
             except Exception:
-                pass
-        return cols
+                jups = None
+            if jups:
+                if not isinstance(jups, list):
+                    jups = [jups]
+                cols: list[str] = []
+                for jup in jups:
+                    try:
+                        pcl = jup.paren_column_list() if hasattr(jup, 'paren_column_list') else None
+                        if pcl and hasattr(pcl, 'column_list') and pcl.column_list():
+                            for col in pcl.column_list().column_name():
+                                raw = col.getText().strip('":').lower()
+                                if raw and raw not in cols:
+                                    cols.append(raw)
+                    except Exception:
+                        pass
+                return 'using', cols
+            try:
+                natural = join_clause.NATURAL() if hasattr(join_clause, 'NATURAL') else None
+            except Exception:
+                natural = None
+            if natural:
+                return 'natural', None
+        return 'all', None
 
     @staticmethod
     def _extract_tables_from_query_block(qb: FirebirdParser.Query_blockContext) -> list[TableSource]:
@@ -1778,16 +1784,88 @@ class ASTDialectRewriter(FirebirdParserVisitor):
         return tables
 
     @staticmethod
-    def _extract_join_segments(qb: FirebirdParser.Query_blockContext
-                               ) -> list[list[tuple[TableSource, set[str] | None]]]:
+    def _grouped_inner_table_ref(aux):
         """
-        Splits each comma-separated table_ref into its ordered join chain:
-        [(table, using_cols|None), ...] starting with the leftmost table
-        (using None: keeps everything). A USING join suppresses only the
-        columns it lists, and only when already projected by its own chain;
-        ON / CROSS joins and comma siblings preserve both sides.
+        Returns the nested table_ref when aux is a parenthesized join group
+        like (T JOIN U USING(K)), else None. A derived subquery (SELECT...)
+        is NOT a join group and stays on the existing subquery path.
         """
-        chains: list[list[tuple[TableSource, set[str] | None]]] = []
+        try:
+            t_int = aux.table_ref_aux_internal() if aux and hasattr(aux, 'table_ref_aux_internal') else None
+        except Exception:
+            return None
+        if t_int is None or not hasattr(t_int, 'table_ref'):
+            return None
+        try:
+            nested = t_int.table_ref()
+        except Exception:
+            return None
+        if nested is None:
+            return None
+        try:
+            dml = t_int.dml_table_expression_clause() if hasattr(t_int, 'dml_table_expression_clause') else None
+            if dml is not None and hasattr(dml, 'select_statement') and dml.select_statement():
+                return None
+        except Exception:
+            pass
+        return nested
+
+    @staticmethod
+    def _join_operand_from_aux(aux):
+        """
+        Builds a star-expansion operand: ('table', TableSource) for plain or
+        derived tables, ('group', substeps, alias) for parenthesized joins.
+        """
+        if aux and hasattr(aux, 'table_alias') and aux.table_alias():
+            group_alias = aux.table_alias().getText().strip()
+        else:
+            group_alias = None
+        nested = ASTDialectRewriter._grouped_inner_table_ref(aux)
+        if nested is not None:
+            return ('group', ASTDialectRewriter._steps_from_table_ref(nested), group_alias)
+        return ('table', ASTDialectRewriter._table_source_from_aux(aux))
+
+    @staticmethod
+    def _steps_from_table_ref(tr) -> list:
+        """
+        Ordered join steps of one table_ref: [(operand, kind, cols), ...]
+        with the leftmost operand first (kind None). kind is 'using' (cols
+        in USING-list order), 'natural' or 'all' (ON / CROSS / comma).
+        """
+        steps: list = []
+        if tr is None:
+            return steps
+        try:
+            aux = tr.table_ref_aux() if hasattr(tr, 'table_ref_aux') else None
+        except Exception:
+            aux = None
+        if aux is not None:
+            steps.append((ASTDialectRewriter._join_operand_from_aux(aux), None, None))
+        try:
+            join_clauses = tr.join_clause() if hasattr(tr, 'join_clause') else None
+        except Exception:
+            join_clauses = None
+        if join_clauses:
+            if not isinstance(join_clauses, list):
+                join_clauses = [join_clauses]
+            for jc in join_clauses:
+                try:
+                    right_aux = jc.table_ref_aux() if hasattr(jc, 'table_ref_aux') else None
+                except Exception:
+                    right_aux = None
+                if right_aux is None:
+                    continue
+                kind, cols = ASTDialectRewriter._join_kind_and_columns(jc)
+                steps.append((ASTDialectRewriter._join_operand_from_aux(right_aux), kind, cols))
+        return steps
+
+    @staticmethod
+    def _extract_join_segments(qb: FirebirdParser.Query_blockContext) -> list:
+        """
+        Splits each comma-separated table_ref into its ordered join steps
+        (operands may nest parenthesized groups recursively).
+        """
+        chains: list = []
         if not qb or not qb.from_clause():
             return chains
         trl = qb.from_clause().table_ref_list()
@@ -1795,24 +1873,93 @@ class ASTDialectRewriter(FirebirdParserVisitor):
             return chains
 
         for tr in trl.table_ref():
-            chain: list[tuple[TableSource, set[str] | None]] = []
-            if hasattr(tr, 'table_ref_aux') and tr.table_ref_aux():
-                src = ASTDialectRewriter._table_source_from_aux(tr.table_ref_aux())
-                if src:
-                    chain.append((src, None))
-            if hasattr(tr, 'join_clause') and tr.join_clause():
-                join_clauses = tr.join_clause()
-                if not isinstance(join_clauses, list):
-                    join_clauses = [join_clauses]
-                for jc in join_clauses:
-                    if hasattr(jc, 'table_ref_aux') and jc.table_ref_aux():
-                        src = ASTDialectRewriter._table_source_from_aux(jc.table_ref_aux())
-                        if src:
-                            chain.append((src, ASTDialectRewriter._using_columns_of_join(jc)))
-            if chain:
-                chains.append(chain)
+            try:
+                steps = ASTDialectRewriter._steps_from_table_ref(tr)
+            except Exception:
+                steps = []
+            if steps:
+                chains.append(steps)
         return chains
-        return tables
+
+    @staticmethod
+    def _flatten_chain_sources(chain) -> list:
+        """All real TableSources in a step chain, descending into groups."""
+        out: list = []
+        for operand, _kind, _cols in chain:
+            if not isinstance(operand, tuple) or not operand:
+                continue
+            if operand[0] == 'group':
+                for sub_step in operand[1]:
+                    out.extend(ASTDialectRewriter._flatten_chain_sources([sub_step]))
+            elif len(operand) == 2 and operand[1] is not None:
+                out.append(operand[1])
+        return out
+
+    @staticmethod
+    def _table_operand_columns(src, sub_symbols: dict) -> list:
+        """Ordered (name, type) columns of one plain table operand."""
+        qualifier = ((src.alias_clean or src.table_name_clean) or '').lower() if src else ''
+        if not qualifier:
+            return []
+        prefix = qualifier + '.'
+        return [(k.split('.')[-1], v) for k, v in sub_symbols.items()
+                if k.lower().startswith(prefix)]
+
+    @staticmethod
+    def _merge_join_output(output: list, right: list, kind: str,
+                           cols: list | None) -> list:
+        """
+        Combines an accumulated left output with a right operand following
+        PostgreSQL SELECT * rules: USING lists its merged columns first (in
+        list order, typed left-then-right, None placeholder when unknown);
+        NATURAL merges common columns in left-table order; ON / CROSS /
+        comma append everything.
+        """
+        if kind == 'using':
+            merge_list = list(cols or [])
+        elif kind == 'natural':
+            right_names = {n.lower() for n, _ in right}
+            merge_list, seen = [], set()
+            for name, _ in output:
+                key = name.lower()
+                if key in right_names and key not in seen:
+                    seen.add(key)
+                    merge_list.append(name)
+        else:
+            return output + right
+
+        def _find(entries, want):
+            for entry_name, entry_type in entries:
+                if entry_name.lower() == want:
+                    return entry_name, entry_type
+            return None
+
+        merged = []
+        for wanted in merge_list:
+            hit = _find(output, wanted.lower()) or _find(right, wanted.lower())
+            merged.append(hit if hit else (wanted, None))
+        merged_set = {m.lower() for m in merge_list}
+        rest = [(n, t) for n, t in output if n.lower() not in merged_set]
+        rest.extend((n, t) for n, t in right if n.lower() not in merged_set)
+        return merged + rest
+
+    def _emit_star_steps(self, steps, sub_symbols: dict) -> list:
+        """Recursively expands join steps to an ordered (name, type) list."""
+        output: list = []
+        first = True
+        for operand, kind, cols in steps:
+            if isinstance(operand, tuple) and operand and operand[0] == 'group':
+                right = self._emit_star_steps(operand[1], sub_symbols)
+            elif isinstance(operand, tuple) and len(operand) == 2:
+                right = self._table_operand_columns(operand[1], sub_symbols)
+            else:
+                right = []
+            if first:
+                output = right
+            else:
+                output = self._merge_join_output(output, right, kind or 'all', cols)
+            first = False
+        return output
 
     @staticmethod
     def _extract_cte_definitions(select_only) -> dict[str, tuple]:
@@ -1896,7 +2043,20 @@ class ASTDialectRewriter(FirebirdParserVisitor):
 
             sub_tables = self._extract_tables_from_query_block(qb)
             sub_symbols = symbols.copy()
-            for st in sub_tables:
+            # Prep sees real tables including parenthesized groups (scope
+            # handling above keeps the historical flat list untouched).
+            prep_tables = list(sub_tables)
+            try:
+                prep_chains = self._extract_join_segments(qb)
+            except Exception:
+                prep_chains = []
+            _seen_prep = {id(t) for t in prep_tables}
+            for _chain in prep_chains:
+                for _src in self._flatten_chain_sources(_chain):
+                    if id(_src) not in _seen_prep:
+                        _seen_prep.add(id(_src))
+                        prep_tables.append(_src)
+            for st in prep_tables:
                 if st.subquery_ctx:
                     inner_proj = self._infer_subquery_projections(
                         st.subquery_ctx, symbols, merged_ctes, _resolving)
@@ -1941,29 +2101,16 @@ class ASTDialectRewriter(FirebirdParserVisitor):
             sl = qb.selected_list()
             if sl.getText() == '*':
                 # SELECT * projects only columns of tables that actually
-                # participate in this subquery (no out-of-scope leaks), one
-                # qualifier namespace per table (alias preferred), following
-                # each join chain in order. Duplicates across tables are kept
-                # in order, EXCEPT within a single JOIN ... USING: the shared
-                # column is presented only once per chain (first occurrence
-                # wins). JOIN ON / CROSS joins and comma siblings preserve
-                # both sides. Qualified T.* keeps every explicitly requested
-                # column.
+                # participate in this subquery (no out-of-scope leaks),
+                # expanding each join chain recursively so parenthesized
+                # groups keep their effective projection. Duplicates across
+                # tables are kept in order, EXCEPT within a single JOIN ...
+                # USING (or NATURAL): the shared columns are presented once,
+                # merged first in USING-list (or left-table) order. JOIN ON /
+                # CROSS joins and comma siblings preserve both sides.
+                # Qualified T.* keeps every explicitly requested column.
                 for chain in self._extract_join_segments(qb):
-                    emitted: set[str] = set()
-                    for src, using in chain:
-                        qualifier = (src.alias_clean or src.table_name_clean or '').lower()
-                        if not qualifier:
-                            continue
-                        prefix = qualifier + '.'
-                        for k, v in sub_symbols.items():
-                            if k.lower().startswith(prefix):
-                                col = k.split('.')[-1]
-                                if using is not None and col.lower() in using \
-                                        and col.lower() in emitted:
-                                    continue
-                                emitted.add(col.lower())
-                                projections.append((col, v))
+                    projections.extend(self._emit_star_steps(chain, sub_symbols))
                 return projections
 
             if hasattr(sl, 'select_list_elements') and sl.select_list_elements():

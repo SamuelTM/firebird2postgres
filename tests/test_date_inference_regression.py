@@ -315,6 +315,61 @@ class TestDateInferenceUnitRegression(unittest.TestCase):
         out = FirebirdToPostgresVisitor.transpile(sql, symbols=dict(symbols))
         self.assertIn("((X.C + (1) * INTERVAL '1 day')::date) - X.C", out)
 
+    def test_star_grouped_joins_left_right_and_nested(self):
+        """
+        P1 regression: parenthesized joins keep their effective projection
+        through left grouping, right grouping and nested groupings.
+        """
+        symbols = {"t.k": "INTEGER", "t.a": "INTEGER",
+                   "u.k": "INTEGER", "u.d": "DATE"}
+        left = ("WITH X(K,A,D) AS (SELECT * FROM (T JOIN U USING(K))) "
+                "SELECT DATEADD(DAY, 1, X.D) - X.D FROM X;")
+        out = FirebirdToPostgresVisitor.transpile(left, symbols=dict(symbols))
+        self.assertIn("((X.D + (1) * INTERVAL '1 day')::date) - X.D", out)
+
+        nested = ("WITH X(K,A,D) AS (SELECT * FROM ((T JOIN U USING(K)))) "
+                  "SELECT DATEADD(DAY, 1, X.D) - X.D FROM X;")
+        out = FirebirdToPostgresVisitor.transpile(nested, symbols=dict(symbols))
+        self.assertIn("((X.D + (1) * INTERVAL '1 day')::date) - X.D", out)
+
+        symbols2 = {"t.k": "INTEGER", "t.a": "INTEGER",
+                    "u.k": "INTEGER", "u.b": "INTEGER",
+                    "v.b": "INTEGER", "v.c": "DATE"}
+        right = ("WITH X(K,A,B,B2,C) AS (SELECT * FROM T JOIN "
+                 "(U JOIN V USING(B)) ON T.K = U.K) "
+                 "SELECT DATEADD(DAY, 1, X.C) - X.C FROM X;")
+        out = FirebirdToPostgresVisitor.transpile(right, symbols=dict(symbols2))
+        self.assertIn("((X.C + (1) * INTERVAL '1 day')::date) - X.C", out)
+
+    def test_star_natural_joins(self):
+        """
+        P1 regression: NATURAL joins merge the common columns implicitly
+        (INNER, LEFT and FULL), keeping the DATE visible to DATEADD.
+        """
+        symbols = {"t.k": "INTEGER", "t.a": "INTEGER",
+                   "u.k": "INTEGER", "u.d": "DATE"}
+        for join in ("INNER", "LEFT", "FULL"):
+            sql = (f"WITH X(K,A,D) AS (SELECT * FROM T NATURAL {join} JOIN U) "
+                   "SELECT DATEADD(DAY, 1, X.D) - X.D FROM X;")
+            out = FirebirdToPostgresVisitor.transpile(sql, symbols=dict(symbols))
+            self.assertIn("((X.D + (1) * INTERVAL '1 day')::date) - X.D", out,
+                          f"NATURAL {join} JOIN must merge K")
+
+    def test_using_list_order_before_physical_order(self):
+        """
+        P1 regression: merged columns come first in USING-list order, not in
+        physical table order — in both USING(B,X) and USING(X,B) spellings.
+        """
+        symbols = {"t.a": "INTEGER", "t.x": "INTEGER", "t.b": "DATE",
+                   "u.x": "DATE", "u.y": "INTEGER", "u.b": "INTEGER"}
+        for using, aliases, target in (("(B, X)", "(B,X,A,Y)", "B"),
+                                       ("(X, B)", "(X,B,A,Y)", "B")):
+            sql = (f"WITH X{aliases} AS (SELECT * FROM T JOIN U USING{using}) "
+                   f"SELECT DATEADD(DAY, 1, X.{target}) - X.{target} FROM X;")
+            out = FirebirdToPostgresVisitor.transpile(sql, symbols=dict(symbols))
+            self.assertIn(f"((X.{target} + (1) * INTERVAL '1 day')::date) - X.{target}",
+                          out, f"USING{using} must present merged columns first")
+
 
 @requires_postgres_class
 class TestDateInferenceLivePostgresRegression(unittest.TestCase):
@@ -683,6 +738,115 @@ class TestDateInferenceCrossDatabaseRegression(unittest.TestCase):
             for stmt in ("DROP TABLE IF EXISTS reg_mix_t CASCADE;",
                          "DROP TABLE IF EXISTS reg_mix_u CASCADE;",
                          "DROP TABLE IF EXISTS reg_mix_z CASCADE;"):
+                try:
+                    self.pg_cur.execute(stmt)
+                except Exception:
+                    pass
+
+    def test_star_grouped_join_matches_in_both_databases(self):
+        """
+        P1 regression: WITH X(K,A,D) AS (SELECT * FROM (T JOIN U USING(K)))
+        keeps the grouped projection in both databases — value 1, integer.
+        """
+        symbols = {"reg_grp_t.k": "INTEGER", "reg_grp_t.a": "INTEGER",
+                   "reg_grp_u.k": "INTEGER", "reg_grp_u.d": "DATE"}
+        try:
+            for stmt in ("CREATE TABLE REG_GRP_T (K INTEGER, A INTEGER);",
+                         "CREATE TABLE REG_GRP_U (K INTEGER, D DATE);"):
+                self.fb_cur.execute(stmt)
+            self.fb_con.commit()
+            self.fb_cur.execute("INSERT INTO REG_GRP_T VALUES (1, 10);")
+            self.fb_cur.execute("INSERT INTO REG_GRP_U VALUES (1, '2026-09-08');")
+            self.fb_con.commit()
+            for ddl in ("DROP TABLE IF EXISTS reg_grp_t CASCADE;",
+                        "DROP TABLE IF EXISTS reg_grp_u CASCADE;"):
+                self.pg_cur.execute(ddl)
+            self.pg_cur.execute("CREATE TABLE reg_grp_t (k INTEGER, a INTEGER);")
+            self.pg_cur.execute("CREATE TABLE reg_grp_u (k INTEGER, d DATE);")
+            self.pg_cur.execute("INSERT INTO reg_grp_t VALUES (1, 10);")
+            self.pg_cur.execute("INSERT INTO reg_grp_u VALUES (1, '2026-09-08');")
+
+            fb_sql = ("WITH X(K, A, D) AS (SELECT * FROM (REG_GRP_T "
+                      "JOIN REG_GRP_U USING(K))) "
+                      "SELECT DATEADD(DAY, 1, D) - D FROM X")
+            self.fb_cur.execute(fb_sql)
+            fb_rows = self.fb_cur.fetchall()
+            self.assertEqual([(1,)], [(r[0],) for r in fb_rows])
+            self.assertIsInstance(fb_rows[0][0], int)
+
+            pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql, symbols=dict(symbols))
+            self.assertIn("::date", pg_sql)
+            inner = pg_sql.rstrip().rstrip(';')
+            self.pg_cur.execute(
+                f"SELECT v, pg_typeof(v)::text FROM ({inner}) s(v);")
+            pg_row = self.pg_cur.fetchone()
+            self.assertIsNotNone(pg_row)
+            self.assertEqual(pg_row[0], fb_rows[0][0])
+            self.assertEqual(pg_row[1], "integer")
+        finally:
+            for stmt in ("DROP TABLE REG_GRP_T;", "DROP TABLE REG_GRP_U;"):
+                try:
+                    self.fb_cur.execute(stmt)
+                    self.fb_con.commit()
+                except Exception:
+                    pass
+            for stmt in ("DROP TABLE IF EXISTS reg_grp_t CASCADE;",
+                         "DROP TABLE IF EXISTS reg_grp_u CASCADE;"):
+                try:
+                    self.pg_cur.execute(stmt)
+                except Exception:
+                    pass
+
+    def test_star_natural_join_matches_in_both_databases(self):
+        """
+        P1 regression: NATURAL joins merge common columns implicitly in both
+        databases (INNER and LEFT with matched rows) — value 1, integer.
+        """
+        symbols = {"reg_grp_t.k": "INTEGER", "reg_grp_t.a": "INTEGER",
+                   "reg_grp_u.k": "INTEGER", "reg_grp_u.d": "DATE"}
+        try:
+            for stmt in ("CREATE TABLE REG_GRP_T (K INTEGER, A INTEGER);",
+                         "CREATE TABLE REG_GRP_U (K INTEGER, D DATE);"):
+                self.fb_cur.execute(stmt)
+            self.fb_con.commit()
+            self.fb_cur.execute("INSERT INTO REG_GRP_T VALUES (1, 10);")
+            self.fb_cur.execute("INSERT INTO REG_GRP_U VALUES (1, '2026-09-08');")
+            self.fb_con.commit()
+            for ddl in ("DROP TABLE IF EXISTS reg_grp_t CASCADE;",
+                        "DROP TABLE IF EXISTS reg_grp_u CASCADE;"):
+                self.pg_cur.execute(ddl)
+            self.pg_cur.execute("CREATE TABLE reg_grp_t (k INTEGER, a INTEGER);")
+            self.pg_cur.execute("CREATE TABLE reg_grp_u (k INTEGER, d DATE);")
+            self.pg_cur.execute("INSERT INTO reg_grp_t VALUES (1, 10);")
+            self.pg_cur.execute("INSERT INTO reg_grp_u VALUES (1, '2026-09-08');")
+
+            for join in ("INNER", "LEFT"):
+                fb_sql = (f"WITH X(K, A, D) AS (SELECT * FROM REG_GRP_T NATURAL {join} "
+                          f"JOIN REG_GRP_U) SELECT DATEADD(DAY, 1, D) - D FROM X")
+                self.fb_cur.execute(fb_sql)
+                fb_rows = self.fb_cur.fetchall()
+                self.assertEqual([(1,)], [(r[0],) for r in fb_rows],
+                                 f"NATURAL {join} native result")
+                self.assertIsInstance(fb_rows[0][0], int)
+
+                pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql, symbols=dict(symbols))
+                self.assertIn("::date", pg_sql)
+                inner = pg_sql.rstrip().rstrip(';')
+                self.pg_cur.execute(
+                    f"SELECT v, pg_typeof(v)::text FROM ({inner}) s(v);")
+                pg_row = self.pg_cur.fetchone()
+                self.assertIsNotNone(pg_row)
+                self.assertEqual(pg_row[0], fb_rows[0][0])
+                self.assertEqual(pg_row[1], "integer")
+        finally:
+            for stmt in ("DROP TABLE REG_GRP_T;", "DROP TABLE REG_GRP_U;"):
+                try:
+                    self.fb_cur.execute(stmt)
+                    self.fb_con.commit()
+                except Exception:
+                    pass
+            for stmt in ("DROP TABLE IF EXISTS reg_grp_t CASCADE;",
+                         "DROP TABLE IF EXISTS reg_grp_u CASCADE;"):
                 try:
                     self.pg_cur.execute(stmt)
                 except Exception:
