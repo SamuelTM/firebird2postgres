@@ -359,9 +359,11 @@ class TestDateInferenceUnitRegression(unittest.TestCase):
         """
         P1 regression: merged columns come first in USING-list order, not in
         physical table order — in both USING(B,X) and USING(X,B) spellings.
+        USING columns share compatible types here, so the statements are
+        executable in both databases.
         """
-        symbols = {"t.a": "INTEGER", "t.x": "INTEGER", "t.b": "DATE",
-                   "u.x": "DATE", "u.y": "INTEGER", "u.b": "INTEGER"}
+        symbols = {"t.a": "INTEGER", "t.x": "TIMESTAMP", "t.b": "DATE",
+                   "u.x": "TIMESTAMP", "u.y": "INTEGER", "u.b": "DATE"}
         for using, aliases, target in (("(B, X)", "(B,X,A,Y)", "B"),
                                        ("(X, B)", "(X,B,A,Y)", "B")):
             sql = (f"WITH X{aliases} AS (SELECT * FROM T JOIN U USING{using}) "
@@ -369,6 +371,48 @@ class TestDateInferenceUnitRegression(unittest.TestCase):
             out = FirebirdToPostgresVisitor.transpile(sql, symbols=dict(symbols))
             self.assertIn(f"((X.{target} + (1) * INTERVAL '1 day')::date) - X.{target}",
                           out, f"USING{using} must present merged columns first")
+
+    def test_merged_date_timestamp_promotes_to_timestamp(self):
+        """
+        P1 regression: a USING/NATURAL-merged DATE + TIMESTAMP column
+        promotes to TIMESTAMP (broader type), both side orders. No ::date
+        cast may truncate the time. All join kinds and all three contexts
+        (CTE, derived table, grouped join) share the rule; DATE + DATE
+        stays DATE with integer subtraction.
+        """
+        variants = []
+        for left, right in (("DATE", "TIMESTAMP"), ("TIMESTAMP", "DATE")):
+            variants.append(({"t.d": left, "u.d": right}, left, right))
+        contexts = [
+            ("WITH X(D) AS (SELECT * FROM T {j} JOIN U USING(D)) "
+             "SELECT DATEADD(DAY, 1, X.D) FROM X;", "X"),
+            ("WITH X(D) AS (SELECT * FROM T NATURAL {j} JOIN U) "
+             "SELECT DATEADD(DAY, 1, X.D) FROM X;", "X"),
+            ("SELECT DATEADD(DAY, 1, Y.D) FROM "
+             "(SELECT * FROM T {j} JOIN U USING(D)) Y;", "Y"),
+            ("WITH X(D) AS (SELECT * FROM (T {j} JOIN U USING(D))) "
+             "SELECT DATEADD(DAY, 1, X.D) FROM X;", "X"),
+        ]
+        for symbols, left, right in variants:
+            for join in ("INNER", "LEFT", "RIGHT", "FULL"):
+                for template, alias in contexts:
+                    sql = template.format(j=join)
+                    out = FirebirdToPostgresVisitor.transpile(sql, symbols=dict(symbols))
+                    self.assertIn(f"({alias}.D + (1) * INTERVAL '1 day')", out)
+                    self.assertNotIn("::date", out)
+                    self.assertNotIn("::timestamp", out)
+
+    def test_merged_date_date_stays_date(self):
+        """
+        P1 guard: DATE + DATE merges to DATE (cast kept, subtraction stays
+        integer) in every join kind.
+        """
+        symbols = {"t.d": "DATE", "u.d": "DATE"}
+        for join in ("INNER", "LEFT", "RIGHT", "FULL"):
+            sql = (f"WITH X(D) AS (SELECT * FROM T {join} JOIN U USING(D)) "
+                   "SELECT DATEADD(DAY, 1, X.D) - X.D FROM X;")
+            out = FirebirdToPostgresVisitor.transpile(sql, symbols=dict(symbols))
+            self.assertIn("((X.D + (1) * INTERVAL '1 day')::date) - X.D", out)
 
 
 @requires_postgres_class
@@ -495,6 +539,63 @@ class TestDateInferenceLivePostgresRegression(unittest.TestCase):
             self.assertEqual(row[1], "integer")
         finally:
             self.cur.execute("DROP TABLE IF EXISTS reg_cte_t CASCADE;")
+
+    def test_live_pg_merged_date_timestamp_stays_timestamp(self):
+        """
+        P1 regression (value AND type): DATE + TIMESTAMP merged by FULL
+        JOIN USING (and NATURAL) promotes to TIMESTAMP — matched rows,
+        unmatched rows on both sides and fractional times included.
+        Both side orders.
+        """
+        variants = [
+            # (tables, types, inserts_t, inserts_u, expected DATEADD rows)
+            (("reg_mrg_t", "reg_mrg_u"), ("DATE", "TIMESTAMP"),
+             ["'2026-09-07'", "'2026-09-08'"],
+             ["'2026-09-08 00:00:00'", "'2026-09-09 15:30:45.5'"],
+             [datetime.datetime(2026, 9, 8, 0, 0),
+              datetime.datetime(2026, 9, 9, 0, 0),
+              datetime.datetime(2026, 9, 10, 15, 30, 45, 500000)]),
+            (("reg_mrg_t2", "reg_mrg_u2"), ("TIMESTAMP", "DATE"),
+             ["'2026-09-07 00:00:00'", "'2026-09-08 00:00:00'"],
+             ["'2026-09-08'", "'2026-09-09'"],
+             [datetime.datetime(2026, 9, 8, 0, 0),
+              datetime.datetime(2026, 9, 9, 0, 0),
+              datetime.datetime(2026, 9, 10, 0, 0)]),
+        ]
+        try:
+            for (lower_t, lower_u), (type_t, type_u), ins_t, ins_u, expected_vals in variants:
+                self.cur.execute(f"DROP TABLE IF EXISTS {lower_t} CASCADE;")
+                self.cur.execute(f"DROP TABLE IF EXISTS {lower_u} CASCADE;")
+                self.cur.execute(f"CREATE TABLE {lower_t} (d {type_t});")
+                self.cur.execute(f"CREATE TABLE {lower_u} (d {type_u});")
+                for lit in ins_t:
+                    self.cur.execute(f"INSERT INTO {lower_t} VALUES ({lit});")
+                for lit in ins_u:
+                    self.cur.execute(f"INSERT INTO {lower_u} VALUES ({lit});")
+
+                upper_t, upper_u = lower_t.upper(), lower_u.upper()
+                symbols = {f"{lower_t}.d": type_t, f"{lower_u}.d": type_u}
+                expected = [(val, "timestamp without time zone") for val in expected_vals]
+                for join in ("FULL JOIN", "NATURAL FULL JOIN"):
+                    if "NATURAL" in join:
+                        inner = f"SELECT * FROM {upper_t} NATURAL FULL JOIN {upper_u}"
+                    else:
+                        inner = f"SELECT * FROM {upper_t} FULL JOIN {upper_u} USING(D)"
+                    fb_sql = (f"WITH X(D) AS ({inner}) "
+                              f"SELECT DATEADD(DAY, 1, X.D) FROM X;")
+                    pg_sel = FirebirdToPostgresVisitor.transpile(fb_sql, symbols=dict(symbols))
+                    self.assertNotIn("::date", pg_sel)
+                    self.cur.execute(
+                        f"SELECT v, pg_typeof(v)::text FROM "
+                        f"({pg_sel.rstrip().rstrip(';')}) s(v) ORDER BY v;")
+                    rows = self.cur.fetchall()
+                    self.assertEqual(
+                        [(r[0], r[1]) for r in rows], expected,
+                        f"{join} {type_t}+{type_u}")
+        finally:
+            for (lower_t, lower_u), _types, _t, _u, _exp in variants:
+                self.cur.execute(f"DROP TABLE IF EXISTS {lower_t} CASCADE;")
+                self.cur.execute(f"DROP TABLE IF EXISTS {lower_u} CASCADE;")
 
 
 @requires_live_databases_class
@@ -743,6 +844,96 @@ class TestDateInferenceCrossDatabaseRegression(unittest.TestCase):
                 except Exception:
                     pass
 
+    def test_same_type_merges_match_in_both_databases(self):
+        """
+        P1 regression: DATE+DATE merges stay DATE (integer subtraction) and
+        TIMESTAMP+TIMESTAMP merges preserve fractions, identically in
+        Firebird and PostgreSQL. Mixed DATE+TIMESTAMP USING is rejected by
+        this Firebird server, so promotion itself is covered by unit and
+        PostgreSQL-live tests.
+        """
+        try:
+            for stmt in ("CREATE TABLE REG_MRG_D1 (D DATE);",
+                         "CREATE TABLE REG_MRG_D2 (D DATE);",
+                         "CREATE TABLE REG_MRG_T1 (D TIMESTAMP);",
+                         "CREATE TABLE REG_MRG_T2 (D TIMESTAMP);"):
+                self.fb_cur.execute(stmt)
+            self.fb_con.commit()
+            self.fb_cur.execute("INSERT INTO REG_MRG_D1 VALUES ('2026-09-08');")
+            self.fb_cur.execute("INSERT INTO REG_MRG_D2 VALUES ('2026-09-08');")
+            self.fb_cur.execute("INSERT INTO REG_MRG_T1 VALUES ('2026-09-08 15:30:45.5');")
+            self.fb_cur.execute("INSERT INTO REG_MRG_T2 VALUES ('2026-09-08 15:30:45.5');")
+            self.fb_con.commit()
+            for ddl in ("DROP TABLE IF EXISTS reg_mrg_d1 CASCADE;",
+                        "DROP TABLE IF EXISTS reg_mrg_d2 CASCADE;",
+                        "DROP TABLE IF EXISTS reg_mrg_t1 CASCADE;",
+                        "DROP TABLE IF EXISTS reg_mrg_t2 CASCADE;"):
+                self.pg_cur.execute(ddl)
+            self.pg_cur.execute("CREATE TABLE reg_mrg_d1 (d DATE);")
+            self.pg_cur.execute("CREATE TABLE reg_mrg_d2 (d DATE);")
+            self.pg_cur.execute("CREATE TABLE reg_mrg_t1 (d TIMESTAMP);")
+            self.pg_cur.execute("CREATE TABLE reg_mrg_t2 (d TIMESTAMP);")
+            self.pg_cur.execute("INSERT INTO reg_mrg_d1 VALUES ('2026-09-08');")
+            self.pg_cur.execute("INSERT INTO reg_mrg_d2 VALUES ('2026-09-08');")
+            self.pg_cur.execute("INSERT INTO reg_mrg_t1 VALUES ('2026-09-08 15:30:45.5');")
+            self.pg_cur.execute("INSERT INTO reg_mrg_t2 VALUES ('2026-09-08 15:30:45.5');")
+
+            self.fb_cur.execute(
+                "SELECT DATEADD(DAY, 1, D) - D FROM REG_MRG_D1 FULL JOIN REG_MRG_D2 USING(D)")
+            fb_int = self.fb_cur.fetchall()
+            self.assertEqual([(1,)], [(r[0],) for r in fb_int])
+
+            pg_sql = FirebirdToPostgresVisitor.transpile(
+                "WITH X(D) AS (SELECT * FROM REG_MRG_D1 FULL JOIN REG_MRG_D2 USING(D)) "
+                "SELECT DATEADD(DAY, 1, X.D) - X.D FROM X;",
+                symbols={"reg_mrg_d1.d": "DATE", "reg_mrg_d2.d": "DATE"})
+            self.assertIn("::date", pg_sql)
+            inner = pg_sql.rstrip().rstrip(';')
+            self.pg_cur.execute(
+                f"SELECT v, pg_typeof(v)::text FROM ({inner}) s(v);")
+            pg_row = self.pg_cur.fetchone()
+            self.assertEqual((pg_row[0], pg_row[1]), (1, "integer"))
+            self.assertEqual(pg_row[0], fb_int[0][0])
+
+            self.fb_cur.execute(
+                "SELECT DATEADD(DAY, 1, D) FROM REG_MRG_T1 FULL JOIN REG_MRG_T2 USING(D)")
+            fb_ts = self.fb_cur.fetchall()
+            self.assertEqual(
+                [(datetime.datetime(2026, 9, 9, 15, 30, 45, 500000),)],
+                [(r[0],) for r in fb_ts])
+            self.assertIs(type(fb_ts[0][0]), datetime.datetime)
+
+            pg_sql = FirebirdToPostgresVisitor.transpile(
+                "WITH X(D) AS (SELECT * FROM REG_MRG_T1 FULL JOIN REG_MRG_T2 USING(D)) "
+                "SELECT DATEADD(DAY, 1, X.D) FROM X;",
+                symbols={"reg_mrg_t1.d": "TIMESTAMP", "reg_mrg_t2.d": "TIMESTAMP"})
+            self.assertNotIn("::date", pg_sql)
+            inner = pg_sql.rstrip().rstrip(';')
+            self.pg_cur.execute(
+                f"SELECT v, pg_typeof(v)::text FROM ({inner}) s(v);")
+            pg_row = self.pg_cur.fetchone()
+            self.assertEqual(
+                (pg_row[0], pg_row[1]),
+                (datetime.datetime(2026, 9, 9, 15, 30, 45, 500000),
+                 "timestamp without time zone"))
+            self.assertEqual(pg_row[0], fb_ts[0][0])
+        finally:
+            for stmt in ("DROP TABLE REG_MRG_D1;", "DROP TABLE REG_MRG_D2;",
+                         "DROP TABLE REG_MRG_T1;", "DROP TABLE REG_MRG_T2;"):
+                try:
+                    self.fb_cur.execute(stmt)
+                    self.fb_con.commit()
+                except Exception:
+                    pass
+            for stmt in ("DROP TABLE IF EXISTS reg_mrg_d1 CASCADE;",
+                         "DROP TABLE IF EXISTS reg_mrg_d2 CASCADE;",
+                         "DROP TABLE IF EXISTS reg_mrg_t1 CASCADE;",
+                         "DROP TABLE IF EXISTS reg_mrg_t2 CASCADE;"):
+                try:
+                    self.pg_cur.execute(stmt)
+                except Exception:
+                    pass
+
     def test_star_grouped_join_matches_in_both_databases(self):
         """
         P1 regression: WITH X(K,A,D) AS (SELECT * FROM (T JOIN U USING(K)))
@@ -911,6 +1102,45 @@ class TestDateInferenceLiveFirebirdRegression(unittest.TestCase):
         row = self.cur.fetchone()
         self.assertIsNotNone(row)
         self.assertEqual(row[0], 1)
+
+    def test_live_fb_same_type_merges(self):
+        """
+        P1 regression (executable ground): DATE+DATE merges stay DATE with
+        integer subtraction, TIMESTAMP+TIMESTAMP merges preserve fractions.
+        Mixed DATE+TIMESTAMP USING is rejected by this server, so promotion
+        itself is covered by unit and PostgreSQL-live tests.
+        """
+        try:
+            self.cur.execute("CREATE TABLE REG_FB_D1 (D DATE);")
+            self.cur.execute("CREATE TABLE REG_FB_D2 (D DATE);")
+            self.cur.execute("CREATE TABLE REG_FB_T1 (D TIMESTAMP);")
+            self.cur.execute("CREATE TABLE REG_FB_T2 (D TIMESTAMP);")
+            self.conn.commit()
+            self.cur.execute("INSERT INTO REG_FB_D1 VALUES ('2026-09-08');")
+            self.cur.execute("INSERT INTO REG_FB_D2 VALUES ('2026-09-08');")
+            self.cur.execute("INSERT INTO REG_FB_T1 VALUES ('2026-09-08 15:30:45.5');")
+            self.cur.execute("INSERT INTO REG_FB_T2 VALUES ('2026-09-08 15:30:45.5');")
+            self.conn.commit()
+
+            self.cur.execute(
+                "SELECT DATEADD(DAY, 1, D) - D FROM REG_FB_D1 FULL JOIN REG_FB_D2 USING(D)")
+            row = self.cur.fetchone()
+            self.assertEqual(row[0], 1)
+            self.assertIsInstance(row[0], int)
+
+            self.cur.execute(
+                "SELECT DATEADD(DAY, 1, D) FROM REG_FB_T1 FULL JOIN REG_FB_T2 USING(D)")
+            row = self.cur.fetchone()
+            self.assertEqual(row[0], datetime.datetime(2026, 9, 9, 15, 30, 45, 500000))
+            self.assertIs(type(row[0]), datetime.datetime)
+        finally:
+            for stmt in ("DROP TABLE REG_FB_D1;", "DROP TABLE REG_FB_D2;",
+                         "DROP TABLE REG_FB_T1;", "DROP TABLE REG_FB_T2;"):
+                try:
+                    self.cur.execute(stmt)
+                    self.conn.commit()
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":

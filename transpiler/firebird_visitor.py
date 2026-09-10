@@ -1905,6 +1905,22 @@ class ASTDialectRewriter(FirebirdParserVisitor):
         return [(k.split('.')[-1], v) for k, v in sub_symbols.items()
                 if k.lower().startswith(prefix)]
 
+    # Merged columns of compatible-but-different types assume the broader
+    # type (Firebird docs: combined columns). Only DATE + TIMESTAMP needs
+    # promotion today; anything else keeps the historical left-wins rule.
+    _MERGED_TYPE_PROMOTIONS = {frozenset({'DATE', 'TIMESTAMP'}): 'TIMESTAMP'}
+
+    @staticmethod
+    def _promote_merged_type(left_type, right_type):
+        """Resulting type of one merged USING/NATURAL column, or None."""
+        if not left_type or not right_type:
+            return left_type or right_type
+        upper_left, upper_right = str(left_type).upper(), str(right_type).upper()
+        if upper_left == upper_right:
+            return left_type
+        return ASTDialectRewriter._MERGED_TYPE_PROMOTIONS.get(
+            frozenset({upper_left, upper_right}))
+
     @staticmethod
     def _merge_join_output(output: list, right: list, kind: str,
                            cols: list | None) -> list:
@@ -1936,8 +1952,16 @@ class ASTDialectRewriter(FirebirdParserVisitor):
 
         merged = []
         for wanted in merge_list:
-            hit = _find(output, wanted.lower()) or _find(right, wanted.lower())
-            merged.append(hit if hit else (wanted, None))
+            left_hit = _find(output, wanted.lower())
+            right_hit = _find(right, wanted.lower())
+            if left_hit and right_hit:
+                promoted = ASTDialectRewriter._promote_merged_type(
+                    left_hit[1], right_hit[1])
+                merged.append((left_hit[0],
+                               promoted if promoted is not None else left_hit[1]))
+            else:
+                hit = left_hit or right_hit
+                merged.append(hit if hit else (wanted, None))
         merged_set = {m.lower() for m in merge_list}
         rest = [(n, t) for n, t in output if n.lower() not in merged_set]
         rest.extend((n, t) for n, t in right if n.lower() not in merged_set)
