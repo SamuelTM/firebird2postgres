@@ -67,3 +67,4 @@ venv.bak/
 # Application specific
 *.sql
 *.log
+dumps/
