@@ -1787,8 +1787,15 @@ class ASTDialectRewriter(FirebirdParserVisitor):
 
     def _infer_subquery_projections(self, select_stmt, symbols: dict[str, str],
                                     cte_defs: dict[str, tuple] = None,
-                                    _resolving: frozenset = frozenset()) -> dict[str, str]:
-        projections = {}
+                                    _resolving: frozenset = frozenset()) -> list[tuple[str, str | None]]:
+        """
+        Infers the projected columns of a subquery as an ORDERED list of
+        (name, type) pairs. Order and duplicates are preserved: SELECT T.D,
+        U.D yields two 'd' entries in written order, and SELECT * expands
+        per participating table. Type may be None when unknown (kept as a
+        positional slot, e.g. for CTE column-alias mapping).
+        """
+        projections: list[tuple[str, str | None]] = []
         if not select_stmt:
             return projections
         try:
@@ -1826,7 +1833,7 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                     inner_proj = self._infer_subquery_projections(
                         st.subquery_ctx, symbols, merged_ctes, _resolving)
                     alias_use = st.alias_clean or st.table_name_clean
-                    for c_name, c_type in inner_proj.items():
+                    for c_name, c_type in inner_proj:
                         if c_type:
                             sub_symbols[f"{alias_use}.{c_name}"] = c_type
                 elif st.table_name_clean in merged_ctes and st.table_name_clean not in _resolving:
@@ -1835,15 +1842,13 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                         sub_ctx, symbols, merged_ctes,
                         _resolving | {st.table_name_clean})
                     if col_aliases:
-                        aliased = {}
-                        for alias_name, (_, c_type) in zip(col_aliases, inner_proj.items()):
-                            if c_type:
-                                aliased[alias_name] = c_type
-                        inner_proj = aliased
+                        inner_proj = [(alias_name, c_type)
+                                      for alias_name, (_, c_type)
+                                      in zip(col_aliases, inner_proj)]
                     quals = {st.table_name_clean}
                     if st.alias_clean:
                         quals.add(st.alias_clean)
-                    for c_name, c_type in inner_proj.items():
+                    for c_name, c_type in inner_proj:
                         if c_type:
                             for q in quals:
                                 sub_symbols[f"{q}.{c_name}"] = c_type
@@ -1868,20 +1873,17 @@ class ASTDialectRewriter(FirebirdParserVisitor):
             sl = qb.selected_list()
             if sl.getText() == '*':
                 # SELECT * projects only columns of tables that actually
-                # participate in this subquery: symbols of unrelated outer
-                # tables (e.g. Z.D) must never leak into the projection.
-                allowed = set()
+                # participate in this subquery (no out-of-scope leaks), one
+                # qualifier namespace per table (alias preferred), in FROM
+                # order. Duplicates across tables are kept in order.
                 for st in sub_tables:
-                    if st.table_name_clean:
-                        allowed.add(st.table_name_clean.lower())
-                    if st.alias_clean:
-                        allowed.add(st.alias_clean.lower())
-                for k, v in sub_symbols.items():
-                    if '.' not in k:
+                    qualifier = (st.alias_clean or st.table_name_clean or '').lower()
+                    if not qualifier:
                         continue
-                    qualifier, _, col = k.partition('.')
-                    if qualifier.lower() in allowed:
-                        projections[col] = v
+                    prefix = qualifier + '.'
+                    for k, v in sub_symbols.items():
+                        if k.lower().startswith(prefix):
+                            projections.append((k.split('.')[-1], v))
                 return projections
 
             if hasattr(sl, 'select_list_elements') and sl.select_list_elements():
@@ -1890,8 +1892,8 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                         t_name = el.tableview_name().getText().strip('":').lower()
                         prefix = f"{t_name}."
                         for k, v in sub_symbols.items():
-                            if k.startswith(prefix):
-                                projections[k[len(prefix):]] = v
+                            if k.lower().startswith(prefix):
+                                projections.append((k[len(prefix):], v))
                     elif hasattr(el, 'expression') and el.expression():
                         col_name = None
                         if hasattr(el, 'column_alias') and el.column_alias():
@@ -1919,7 +1921,7 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                                 if col_part in sub_symbols:
                                     col_type = sub_symbols[col_part]
                         if col_name:
-                            projections[col_name] = col_type
+                            projections.append((col_name, col_type))
         except Exception:
             pass
         return projections
@@ -1972,12 +1974,12 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                         proj = self._infer_subquery_projections(
                             tbl.subquery_ctx, old_symbols, scope_ctes)
                         alias = tbl.alias_clean or tbl.table_name_clean
-                        for col_name, col_type in proj.items():
+                        for col_name, col_type in proj:
                             if col_type:
                                 self.symbols[f"{alias}.{col_name}"] = col_type
                         if hasattr(self, 'table_columns'):
                             cols = set(self.table_columns.get(tbl.table_name_clean, []))
-                            cols.update(proj.keys())
+                            cols.update(c for c, _ in proj)
                             self.table_columns[tbl.table_name_clean] = cols
                             if tbl.alias_clean:
                                 self.table_columns[tbl.alias_clean] = cols
@@ -1987,21 +1989,19 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                             sub_ctx, old_symbols, scope_ctes,
                             frozenset({tbl.table_name_clean}))
                         if col_aliases:
-                            aliased = {}
-                            for alias_name, (_, c_type) in zip(col_aliases, proj.items()):
-                                if c_type:
-                                    aliased[alias_name] = c_type
-                            proj = aliased
+                            proj = [(alias_name, c_type)
+                                    for alias_name, (_, c_type)
+                                    in zip(col_aliases, proj)]
                         quals = {tbl.table_name_clean}
                         if tbl.alias_clean:
                             quals.add(tbl.alias_clean)
-                        for col_name, col_type in proj.items():
+                        for col_name, col_type in proj:
                             if col_type:
                                 for q in quals:
                                     self.symbols[f"{q}.{col_name}"] = col_type
                         if hasattr(self, 'table_columns'):
                             cols = set(self.table_columns.get(tbl.table_name_clean, []))
-                            cols.update(proj.keys())
+                            cols.update(c for c, _ in proj)
                             self.table_columns[tbl.table_name_clean] = cols
                             if tbl.alias_clean:
                                 self.table_columns[tbl.alias_clean] = cols

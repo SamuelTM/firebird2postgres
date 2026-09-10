@@ -10,6 +10,7 @@ from tests.db_isolation import (
     require_live_firebird,
     require_live_postgres,
     requires_firebird_class,
+    requires_live_databases_class,
     requires_postgres_class,
 )
 from transpiler import FirebirdToPostgresVisitor
@@ -130,6 +131,57 @@ class TestDateInferenceUnitRegression(unittest.TestCase):
         sql = "WITH X AS (SELECT n FROM X) SELECT n FROM X;"
         out = FirebirdToPostgresVisitor.transpile(sql, symbols={})
         self.assertIn("X", out)
+
+    def test_same_name_projections_keep_positions_regardless_of_order(self):
+        """
+        P1 regression: SELECT T.D, U.D yields two 'd' slots in written order
+        instead of collapsing into one dict key. X(A,B) maps positionally,
+        so B is always U.D's type no matter how metadata was inserted.
+        """
+        sql = ("WITH X(A,B) AS (SELECT T.D, U.D FROM T JOIN U ON 1 = 1) "
+               "SELECT DATEADD(DAY, 1, X.B) - X.B FROM X;")
+        for symbols in ({"t.d": "TIMESTAMP", "u.d": "DATE"},
+                        {"u.d": "DATE", "t.d": "TIMESTAMP"}):
+            out = FirebirdToPostgresVisitor.transpile(sql, symbols=dict(symbols))
+            self.assertIn("((X.B + (1) * INTERVAL '1 day')::date) - X.B", out,
+                          f"failed for insertion order {list(symbols)}")
+
+    def test_star_cte_alias_follows_catalog_position_order(self):
+        """
+        P1 regression: WITH X(A,B) AS (SELECT * FROM T) pairs aliases with
+        T's real column order (K, D). Catalog rows inverted by position
+        still produce identical symbols, hence identical inference.
+        """
+        from unittest.mock import MagicMock
+        from engine.ddl_exporter import DdlExporter
+        rows_kd = [
+            ('T', 'K', 8, 0, 4, None, None, None, None, 0),
+            ('T', 'D', 12, 0, 4, None, None, None, None, 1),
+        ]
+        orders = []
+        for rows in (rows_kd, list(reversed(rows_kd))):
+            cur = MagicMock()
+            cur.fetchall.return_value = rows
+            symbols = DdlExporter._fetch_all_column_symbols(cur)
+            orders.append([k for k in symbols if '.' in k])
+            sql = ("WITH X(A,B) AS (SELECT * FROM T) "
+                   "SELECT DATEADD(DAY, 1, X.B) - X.B FROM X;")
+            out = FirebirdToPostgresVisitor.transpile(sql, symbols=dict(symbols))
+            self.assertIn("((X.B + (1) * INTERVAL '1 day')::date) - X.B", out)
+        self.assertEqual(orders[0], orders[1])
+        self.assertEqual(orders[0], ['t.k', 't.d'])
+
+    def test_explicit_aliased_same_name_projections(self):
+        """
+        P1 regression: SELECT T.D AS D1, U.D AS D2 keeps both identities
+        with their own types.
+        """
+        sql = ("WITH X AS (SELECT T.D AS D1, U.D AS D2 FROM T JOIN U ON 1 = 1) "
+               "SELECT DATEADD(DAY, 1, X.D2) - X.D2 FROM X;")
+        for symbols in ({"t.d": "TIMESTAMP", "u.d": "DATE"},
+                        {"u.d": "DATE", "t.d": "TIMESTAMP"}):
+            out = FirebirdToPostgresVisitor.transpile(sql, symbols=dict(symbols))
+            self.assertIn("((X.D2 + (1) * INTERVAL '1 day')::date) - X.D2", out)
 
 
 @requires_postgres_class
@@ -256,6 +308,146 @@ class TestDateInferenceLivePostgresRegression(unittest.TestCase):
             self.assertEqual(row[1], "integer")
         finally:
             self.cur.execute("DROP TABLE IF EXISTS reg_cte_t CASCADE;")
+
+
+@requires_live_databases_class
+class TestDateInferenceCrossDatabaseRegression(unittest.TestCase):
+    """
+    P1 regression: the same CTE queries run natively in Firebird and
+    transpiled in PostgreSQL must agree on VALUE and TYPE, with CTE column
+    positions (not metadata order) driving inference.
+    """
+
+    def setUp(self):
+        require_live_databases(self)
+        self.pg_con = get_test_postgres_connection()
+        self.pg_con.autocommit = True
+        self.pg_cur = self.pg_con.cursor()
+        self.fb_con = get_test_firebird_connection()
+        self.fb_cur = self.fb_con.cursor()
+        self._cleanup()
+        self.fb_cur.execute("CREATE TABLE REG_DATEPOS_T (K INTEGER, D DATE);")
+        self.fb_con.commit()
+        self.fb_cur.execute("INSERT INTO REG_DATEPOS_T VALUES (5, '2026-09-08');")
+        self.fb_con.commit()
+        self.fb_cur.execute("CREATE TABLE REG_DATEPOS_U (D DATE);")
+        self.fb_con.commit()
+        self.fb_cur.execute("INSERT INTO REG_DATEPOS_U VALUES ('2026-09-08');")
+        self.fb_con.commit()
+        self.fb_cur.execute("CREATE TABLE REG_DATEPOS_T1 (D TIMESTAMP);")
+        self.fb_con.commit()
+        self.fb_cur.execute("INSERT INTO REG_DATEPOS_T1 VALUES ('2026-09-08 15:30:45');")
+        self.fb_con.commit()
+        self.fb_cur.execute("CREATE TABLE REG_DATEPOS_T2 (D DATE);")
+        self.fb_con.commit()
+        self.fb_cur.execute("INSERT INTO REG_DATEPOS_T2 VALUES ('2026-09-08');")
+        self.fb_con.commit()
+        self.pg_cur.execute("DROP TABLE IF EXISTS reg_datepos_t CASCADE;")
+        self.pg_cur.execute("DROP TABLE IF EXISTS reg_datepos_u CASCADE;")
+        self.pg_cur.execute("DROP TABLE IF EXISTS reg_datepos_t1 CASCADE;")
+        self.pg_cur.execute("DROP TABLE IF EXISTS reg_datepos_t2 CASCADE;")
+        self.pg_cur.execute("CREATE TABLE reg_datepos_t (k INTEGER, d DATE);")
+        self.pg_cur.execute("CREATE TABLE reg_datepos_u (d DATE);")
+        self.pg_cur.execute("CREATE TABLE reg_datepos_t1 (d TIMESTAMP);")
+        self.pg_cur.execute("CREATE TABLE reg_datepos_t2 (d DATE);")
+        self.pg_cur.execute("INSERT INTO reg_datepos_t VALUES (5, '2026-09-08');")
+        self.pg_cur.execute("INSERT INTO reg_datepos_u VALUES ('2026-09-08');")
+        self.pg_cur.execute("INSERT INTO reg_datepos_t1 VALUES ('2026-09-08 15:30:45');")
+        self.pg_cur.execute("INSERT INTO reg_datepos_t2 VALUES ('2026-09-08');")
+
+    def _cleanup(self):
+        for stmt in ("DROP TABLE REG_DATEPOS_T;", "DROP TABLE REG_DATEPOS_U;",
+                     "DROP TABLE REG_DATEPOS_T1;", "DROP TABLE REG_DATEPOS_T2;"):
+            try:
+                self.fb_cur.execute(stmt)
+                self.fb_con.commit()
+            except Exception:
+                pass
+        for stmt in ("DROP TABLE IF EXISTS reg_datepos_t CASCADE;",
+                     "DROP TABLE IF EXISTS reg_datepos_u CASCADE;",
+                     "DROP TABLE IF EXISTS reg_datepos_t1 CASCADE;",
+                     "DROP TABLE IF EXISTS reg_datepos_t2 CASCADE;"):
+            try:
+                self.pg_cur.execute(stmt)
+            except Exception:
+                pass
+
+    def tearDown(self):
+        try:
+            self._cleanup()
+        finally:
+            try:
+                self.fb_cur.close()
+            except Exception:
+                pass
+            try:
+                self.fb_con.close()
+            except Exception:
+                pass
+            try:
+                self.pg_cur.close()
+            except Exception:
+                pass
+            try:
+                self.pg_con.close()
+            except Exception:
+                pass
+
+    def test_star_cte_position_matches_in_both_databases(self):
+        """
+        WITH X(A,B) AS (SELECT * FROM T): B is DATE by position in both
+        databases — value 1, PG type integer, FB native integer.
+        """
+        fb_sql = ("WITH X(A, B) AS (SELECT * FROM REG_DATEPOS_T) "
+                  "SELECT DATEADD(DAY, 1, B) - B FROM X")
+        self.fb_cur.execute(fb_sql)
+        fb_rows = self.fb_cur.fetchall()
+        self.assertEqual([(1,)], [(r[0],) for r in fb_rows])
+        self.assertIsInstance(fb_rows[0][0], int)
+
+        pg_sql = FirebirdToPostgresVisitor.transpile(
+            fb_sql, symbols={"reg_datepos_t.k": "INTEGER", "reg_datepos_t.d": "DATE"})
+        self.assertIn("::date", pg_sql)
+        self.cur_execute_pg(pg_sql, fb_rows)
+
+    def cur_execute_pg(self, pg_sql, fb_rows):
+        inner = pg_sql.rstrip().rstrip(';')
+        self.pg_cur.execute(
+            f"SELECT v, pg_typeof(v)::text FROM ({inner}) s(v);")
+        pg_row = self.pg_cur.fetchone()
+        self.assertIsNotNone(pg_row)
+        self.assertEqual(pg_row[0], fb_rows[0][0])
+        self.assertEqual(pg_row[1], "integer")
+
+    def test_same_name_projections_match_in_both_databases(self):
+        """
+        WITH X(A,B) AS (SELECT T1.D, T2.D ...) with T1.D TIMESTAMP and
+        T2.D DATE: A keeps the time, B stays a date subtraction. Values and
+        types agree across Firebird and PostgreSQL by position.
+        """
+        fb_sql = ("WITH X(A, B) AS (SELECT T1.D, T2.D FROM REG_DATEPOS_T1 T1 "
+                  "JOIN REG_DATEPOS_T2 T2 ON 1 = 1) "
+                  "SELECT DATEADD(HOUR, 1, A), DATEADD(DAY, 1, B) - B FROM X")
+        self.fb_cur.execute(fb_sql)
+        fb_rows = self.fb_cur.fetchall()
+        self.assertEqual(len(fb_rows), 1)
+        self.assertEqual(fb_rows[0][0], datetime.datetime(2026, 9, 8, 16, 30, 45))
+        self.assertEqual(fb_rows[0][1], 1)
+        self.assertIsInstance(fb_rows[0][1], int)
+
+        symbols = {"reg_datepos_t1.d": "TIMESTAMP", "reg_datepos_t2.d": "DATE"}
+        pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql, symbols=dict(symbols))
+        self.assertIn("(X.A + (1) * INTERVAL '1 hour')", pg_sql)
+        self.assertIn("::date", pg_sql)
+        inner = pg_sql.rstrip().rstrip(';')
+        self.pg_cur.execute(
+            f"SELECT a, pg_typeof(a)::text, b, pg_typeof(b)::text FROM ({inner}) s(a, b);")
+        pg_row = self.pg_cur.fetchone()
+        self.assertIsNotNone(pg_row)
+        self.assertEqual(pg_row[0], fb_rows[0][0])
+        self.assertEqual(pg_row[1], "timestamp without time zone")
+        self.assertEqual(pg_row[2], fb_rows[0][1])
+        self.assertEqual(pg_row[3], "integer")
 
 
 @requires_firebird_class

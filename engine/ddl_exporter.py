@@ -580,21 +580,41 @@ class DdlExporter:
         containing that column agree on the PostgreSQL type. This prevents cross-table
         type pollution where A.D(TIMESTAMP) and B.D(DATE) would make bare 'D' resolve
         to whichever table was read first from the catalog.
+        Rows are processed in (relation, field position) order — in SQL and,
+        defensively, re-sorted in Python — so SELECT * expansion and other
+        order-sensitive inference follow real column order regardless of the
+        order the catalog (or a mock) returns rows.
         """
         query = """
             SELECT TRIM(RF.RDB$RELATION_NAME), TRIM(RF.RDB$FIELD_NAME),
                    F.RDB$FIELD_TYPE, F.RDB$FIELD_SUB_TYPE, F.RDB$FIELD_LENGTH,
                    F.RDB$FIELD_PRECISION, F.RDB$FIELD_SCALE,
-                   F.RDB$CHARACTER_SET_ID, F.RDB$DIMENSIONS
+                   F.RDB$CHARACTER_SET_ID, F.RDB$DIMENSIONS,
+                   RF.RDB$FIELD_POSITION
             FROM RDB$RELATION_FIELDS RF
             JOIN RDB$FIELDS F ON RF.RDB$FIELD_SOURCE = F.RDB$FIELD_NAME
-            WHERE (RF.RDB$SYSTEM_FLAG = 0 OR RF.RDB$SYSTEM_FLAG IS NULL);
+            WHERE (RF.RDB$SYSTEM_FLAG = 0 OR RF.RDB$SYSTEM_FLAG IS NULL)
+            ORDER BY RF.RDB$RELATION_NAME, RF.RDB$FIELD_POSITION;
         """
         symbols = {}
         bare_types: dict[str, set[str]] = {}  # col -> {type1, type2, ...}
         try:
             cursor.execute(query)
-            for row in cursor.fetchall():
+            rows = list(cursor.fetchall())
+
+            def _position_key(row) -> tuple[str, int]:
+                try:
+                    rel = str(row[0]).strip().lower() if row and row[0] else ""
+                except Exception:
+                    rel = ""
+                try:
+                    pos = int(row[9]) if len(row) > 9 and row[9] is not None else 0
+                except (ValueError, TypeError):
+                    pos = 0
+                return (rel, pos)
+
+            rows.sort(key=_position_key)
+            for row in rows:
                 rel = row[0].lower() if row[0] else ""
                 col = row[1].lower() if row[1] else ""
                 try:
