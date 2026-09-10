@@ -102,6 +102,7 @@ class PostgresConfig:
 DEFAULT_MAX_BUFFER_BYTES_PER_WORKER: int = 32 * 1024 * 1024  # 32 MB buffer budget per worker
 DEFAULT_MAX_BLOB_BYTES: int = 16 * 1024 * 1024               # 16 MB per individual BLOB (serializes to ~32 MB hex)
 DEFAULT_TOTAL_MEMORY_BUDGET: int = 128 * 1024 * 1024         # 128 MB total budget across workers
+DEFAULT_MAX_WORKERS: int = 4                                 # default parallel table workers
 
 
 def _bool_converter(val: Any) -> bool:

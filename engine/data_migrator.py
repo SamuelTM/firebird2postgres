@@ -11,7 +11,8 @@ import psycopg2.extras
 
 from config import (
     get_firebird_connection, get_postgres_connection,
-    DEFAULT_MAX_BUFFER_BYTES_PER_WORKER, DEFAULT_MAX_BLOB_BYTES
+    DEFAULT_MAX_BUFFER_BYTES_PER_WORKER, DEFAULT_MAX_BLOB_BYTES,
+    DEFAULT_MAX_WORKERS
 )
 from models import Table, Column, pg_quote_ident
 
@@ -645,8 +646,25 @@ class DataMigrator:
         self.last_nul_stats: dict[str, dict[str, int]] = {}
 
     @staticmethod
+    def effective_workers(max_workers: int, source_info: dict = None) -> int:
+        """
+        Returns the worker count that will effectively execute given the
+        source state. Single-user shutdown (MON$SHUTDOWN_MODE=2) allows only
+        one connection — the main one — so parallel execution is impossible
+        and workers collapse to 1. Single source of truth shared by the
+        preflight budget check and the import itself.
+        """
+        if (source_info or {}).get('shutdown_mode') == 2 and max_workers > 1:
+            logger.warning(
+                "Source Firebird database is in single-user shutdown mode (MON$SHUTDOWN_MODE=2). "
+                "Only one connection is allowed; forcing sequential execution (max_workers=1)."
+            )
+            return 1
+        return max_workers
+
+    @staticmethod
     def calculate_memory_budget(
-        max_workers: int = 4,
+        max_workers: int = DEFAULT_MAX_WORKERS,
         total_budget: int = None,
         per_worker_budget: int = None,
         max_blob_bytes: int = None,
@@ -915,7 +933,7 @@ class DataMigrator:
     def import_data(
         self,
         table_objs: list[Table],
-        max_workers: int = 4,
+        max_workers: int = DEFAULT_MAX_WORKERS,
         executor: Executor = None,
         require_frozen_source: bool = True,
         allow_live_source: bool = False,
@@ -936,14 +954,7 @@ class DataMigrator:
 
         source_info = self.check_source_consistency(require_frozen=require_frozen_source, allow_live_source=allow_live)
 
-        # Single-user shutdown (mode 2) allows only one connection — the main one.
-        # Workers each open their own, so parallel execution is impossible.
-        if source_info.get('shutdown_mode') == 2 and max_workers > 1:
-            logger.warning(
-                "Source Firebird database is in single-user shutdown mode (MON$SHUTDOWN_MODE=2). "
-                "Only one connection is allowed; forcing sequential execution (max_workers=1)."
-            )
-            max_workers = 1
+        max_workers = self.effective_workers(max_workers, source_info)
 
         self.last_nul_stats = {}
 

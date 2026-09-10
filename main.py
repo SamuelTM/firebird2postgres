@@ -2,9 +2,10 @@ import sys
 import logging
 from config import (
     get_firebird_connection, get_postgres_connection, get_dump_path,
-    DumpFiles, setup_logging, MigrationConfig
+    DumpFiles, setup_logging, MigrationConfig, DEFAULT_MAX_WORKERS
 )
 from engine import DatabaseMigrator
+from engine.data_migrator import DataMigrator
 
 logger = logging.getLogger('main')
 
@@ -19,16 +20,20 @@ def run_migration(migrator: DatabaseMigrator) -> bool:
     # MUST run before DDL export and destructive DROP / TRUNCATE
     # -------------------------------------------------------------
     logger.info("Checking source database consistency (frozen source protection)...")
-    migrator.check_source_consistency()
+    source_info = migrator.check_source_consistency()
 
     # -------------------------------------------------------------
     # PRE-FLIGHT CHECK: Effective memory budget compatibility
     # MUST run before DDL export and destructive DROP / TRUNCATE:
-    # an impossible configuration (workers x per-worker > total, ...)
-    # must fail here, never after drop_schema() wiped the destination.
+    # an impossible configuration (effective workers x per-worker > total,
+    # ...) must fail here, never after drop_schema() wiped the destination.
+    # Uses the SAME effective worker count as the import itself
+    # (single-user sources force sequential execution).
     # -------------------------------------------------------------
     logger.info("Validating effective memory budget (workers vs total vs BLOB limit)...")
-    migrator.validate_memory_budget()
+    migrator.validate_memory_budget(
+        max_workers=DataMigrator.effective_workers(DEFAULT_MAX_WORKERS, source_info)
+    )
 
     # -------------------------------------------------------------
     # STEP 1: Export and transpile all Firebird DDLs

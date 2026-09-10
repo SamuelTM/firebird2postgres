@@ -496,6 +496,9 @@ class TestBlobMemoryBudgetRegression(unittest.TestCase):
             ('DM_DOCUMENTO_PDF',),
             ('DM_FOTO_ALUNO',)
         ]
+        # Explicit frozen source: DatabaseMigrator.import_data proves it
+        # before validating budgets and delegating.
+        mock_fb_cur.fetchone.side_effect = [(1, 0), (0,)]
 
         cfg = MigrationConfig(
             total_memory_budget_bytes=256 * 1024 * 1024,

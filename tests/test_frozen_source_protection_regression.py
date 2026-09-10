@@ -229,6 +229,71 @@ class TestFrozenSourceProtectionRegression(unittest.TestCase):
         self.assertIn('drop_schema', call_trace)
         self.assertIn('import_data', call_trace)
 
+    def test_single_user_valid_for_one_worker_passes_and_reuses_connection(self):
+        """
+        P2 acceptance: single-user source (MON$SHUTDOWN_MODE=2) with total
+        32MiB / 32MiB per worker is valid for ONE effective worker. The full
+        run_migration() must pass the preflight and execute sequentially,
+        reusing the caller connections instead of opening worker ones.
+        """
+        from models import Column, Table
+
+        # Frozen single-user source; three probes run
+        # (preflight + upfront import check + inner import check).
+        self.mock_fb_cur.fetchone.side_effect = [(0, 2), (0,)] * 3
+        self.mock_fb_cur.fetchmany.return_value = []
+
+        config = MigrationConfig(
+            total_memory_budget_bytes=32 * 1024 * 1024,
+            max_buffer_bytes_per_worker=32 * 1024 * 1024,
+            max_blob_bytes=16 * 1024 * 1024,
+        )
+        migrator, call_trace = self._setup_migrator_with_mocked_lifecycle(config=config)
+        # Keep the REAL import_data (still traced): only the surrounding
+        # lifecycle steps stay mocked.
+        real_import_data = DatabaseMigrator.import_data.__get__(migrator, DatabaseMigrator)
+        migrator.import_data = lambda *a, **k: (
+            call_trace.append('import_data'), real_import_data(*a, **k))[1]
+
+        t1, t2 = Table('T_SEQ_A'), Table('T_SEQ_B')
+        for table in (t1, t2):
+            table.columns.append(Column('ID', 'INTEGER', nullable=False))
+        migrator.table_objs = [t1, t2]
+
+        with patch('engine.data_migrator.get_firebird_connection') as mock_new_fb, \
+             patch('engine.data_migrator.get_postgres_connection') as mock_new_pg:
+            res = run_migration(migrator)
+
+        self.assertTrue(res)
+        self.assertIn('export_all_firebird_ddl', call_trace)
+        self.assertIn('drop_schema', call_trace)
+        self.assertIn('import_data', call_trace)
+        # Sequential single-user path: no worker connections opened.
+        mock_new_fb.assert_not_called()
+        mock_new_pg.assert_not_called()
+
+    def test_same_config_with_four_effective_workers_fails_before_drop(self):
+        """
+        P2 acceptance: the same 32MiB/32MiB configuration with FOUR effective
+        workers (frozen read-only source, no single-user reduction) must fail
+        the full run_migration() before drop_schema().
+        """
+        self.mock_fb_cur.fetchone.side_effect = [(1, 0), (0,)]
+
+        config = MigrationConfig(
+            total_memory_budget_bytes=32 * 1024 * 1024,
+            max_buffer_bytes_per_worker=32 * 1024 * 1024,
+            max_blob_bytes=16 * 1024 * 1024,
+        )
+        migrator, call_trace = self._setup_migrator_with_mocked_lifecycle(config=config)
+
+        with self.assertRaises(ValueError) as ctx:
+            run_migration(migrator)
+
+        self.assertIn("exceeds total budget", str(ctx.exception))
+        self.assertEqual(call_trace, [], "No lifecycle step may run, especially drop_schema")
+        self.assertNotIn('drop_schema', call_trace)
+
 
 if __name__ == '__main__':
     unittest.main()

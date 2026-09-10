@@ -1,5 +1,6 @@
 import logging
 
+from config import DEFAULT_MAX_WORKERS
 from models import Table, Sequence
 from transpiler import FirebirdToPostgresVisitor
 from utils import SqlRunner
@@ -159,7 +160,7 @@ class DatabaseMigrator:
 
     def validate_memory_budget(
         self,
-        max_workers: int = 4,
+        max_workers: int = DEFAULT_MAX_WORKERS,
         total_memory_budget: int = None,
         per_worker_budget: int = None,
         max_blob_bytes: int = None
@@ -187,7 +188,7 @@ class DatabaseMigrator:
 
     def import_data(
         self,
-        max_workers: int = 4,
+        max_workers: int = DEFAULT_MAX_WORKERS,
         require_frozen_source: bool = None,
         allow_live_source: bool = None,
         total_memory_budget: int = None,
@@ -201,17 +202,23 @@ class DatabaseMigrator:
         Enforces memory budgets per worker and overall, and streaming BLOB constraints.
         Returns True if successful, False if any table failed.
         """
-        # Pure-computation fail-fast: reject impossible memory configs before
-        # touching the source catalog or the destination database.
+        self._ensure_schema()
+        req_frozen = self.config.require_frozen_source if require_frozen_source is None else require_frozen_source
+        allow_live = self.config.allow_live_source if allow_live_source is None else allow_live_source
+
+        # Source state determines the EFFECTIVE worker count (single-user
+        # shutdown forces sequential execution), so the budget gate must use
+        # it — not the requested count. Read-only probe, no side effects.
+        source_info = self.data_migrator.check_source_consistency(
+            require_frozen=req_frozen, allow_live_source=allow_live
+        )
+        effective_workers = DataMigrator.effective_workers(max_workers, source_info)
         self.validate_memory_budget(
-            max_workers=max_workers,
+            max_workers=effective_workers,
             total_memory_budget=total_memory_budget,
             per_worker_budget=per_worker_budget,
             max_blob_bytes=max_blob_bytes
         )
-        self._ensure_schema()
-        req_frozen = self.config.require_frozen_source if require_frozen_source is None else require_frozen_source
-        allow_live = self.config.allow_live_source if allow_live_source is None else allow_live_source
 
         tot_budget = getattr(self.config, 'total_memory_budget_bytes', None) if total_memory_budget is None else total_memory_budget
         worker_budget = getattr(self.config, 'max_buffer_bytes_per_worker', None) if per_worker_budget is None else per_worker_budget
