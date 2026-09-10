@@ -248,6 +248,73 @@ class TestDateInferenceUnitRegression(unittest.TestCase):
         out = FirebirdToPostgresVisitor.transpile(sql, symbols=dict(symbols))
         self.assertIn("((X.D + (1) * INTERVAL '1 day')::date) - X.D", out)
 
+    def test_star_mixed_using_on_and_cross_join(self):
+        """
+        P1 regression: only the respective USING merges; ON and CROSS JOIN
+        preserve both sides. T(K,A) + U(K,B) USING(K) + Z(K,D) ON Z.K=T.K
+        projects [K,A,B,K,D], so X.D pairs with Z.D DATE.
+        """
+        symbols = {"t.k": "INTEGER", "t.a": "INTEGER",
+                   "u.k": "INTEGER", "u.b": "INTEGER",
+                   "z.k": "INTEGER", "z.d": "DATE"}
+        inner = "SELECT * FROM T JOIN U USING(K) JOIN Z ON Z.K = T.K"
+        sql = (f"WITH X(K,A,B,K2,D) AS ({inner}) "
+               "SELECT DATEADD(DAY, 1, X.D) - X.D FROM X;")
+        out = FirebirdToPostgresVisitor.transpile(sql, symbols=dict(symbols))
+        self.assertIn("((X.D + (1) * INTERVAL '1 day')::date) - X.D", out)
+
+        cross = ("WITH X(K,A,B,K2,D) AS (SELECT * FROM T JOIN U USING(K), Z) "
+                 "SELECT DATEADD(DAY, 1, X.D) - X.D FROM X;")
+        out_cross = FirebirdToPostgresVisitor.transpile(cross, symbols=dict(symbols))
+        self.assertIn("((X.D + (1) * INTERVAL '1 day')::date) - X.D", out_cross)
+
+    def test_star_join_using_repeated_name_outside_that_using(self):
+        """
+        P1 regression: a repeated name in a table NOT participating in that
+        USING is preserved. U.B and Z.B are different slots; only U.K merges.
+        """
+        symbols = {"t.k": "INTEGER", "t.a": "INTEGER",
+                   "u.k": "INTEGER", "u.b": "DATE",
+                   "z.b": "TIMESTAMP", "z.d": "DATE"}
+        sql = ("WITH X(K,A,B,B2,D) AS (SELECT * FROM T JOIN U USING(K) "
+               "JOIN Z ON Z.K = T.K) "
+               "SELECT DATEADD(DAY, 1, X.D) - X.D, "
+               "DATEADD(HOUR, 1, X.B2) FROM X;")
+        out = FirebirdToPostgresVisitor.transpile(sql, symbols=dict(symbols))
+        self.assertIn("((X.D + (1) * INTERVAL '1 day')::date) - X.D", out)
+        # Z.B TIMESTAMP kept its time (no ::date truncation).
+        self.assertIn("(X.B2 + (1) * INTERVAL '1 hour')", out)
+        self.assertNotIn("(X.B2 + (1) * INTERVAL '1 hour')::date", out)
+
+    def test_star_join_varying_column_order(self):
+        """
+        P1 regression: the merged projection follows FROM/table order with
+        per-join USING applied step by step, whatever the metadata order.
+        """
+        for symbols in ({"t.k": "INTEGER", "t.a": "DATE",
+                         "u.k": "DATE", "u.d": "DATE"},
+                        {"u.d": "DATE", "u.k": "DATE",
+                         "t.a": "DATE", "t.k": "INTEGER"}):
+            sql = ("WITH X(K,A,D) AS (SELECT * FROM T JOIN U USING(K)) "
+                   "SELECT DATEADD(DAY, 1, X.D) - X.D FROM X;")
+            out = FirebirdToPostgresVisitor.transpile(sql, symbols=dict(symbols))
+            self.assertIn("((X.D + (1) * INTERVAL '1 day')::date) - X.D", out,
+                          f"failed for order {list(symbols)}")
+
+    def test_star_join_using_chained_mixed_conditions(self):
+        """
+        P1 regression: chained joins mixing USING and ON merge exactly the
+        respective USING columns: [K,A,B,B2,C] with C DATE from V.
+        """
+        symbols = {"t.k": "INTEGER", "t.a": "INTEGER",
+                   "u.k": "INTEGER", "u.b": "INTEGER",
+                   "v.b": "INTEGER", "v.c": "DATE"}
+        sql = ("WITH X(K,A,B,B2,C) AS (SELECT * FROM T JOIN U USING(K) "
+               "JOIN V ON V.B = U.B) "
+               "SELECT DATEADD(DAY, 1, X.C) - X.C FROM X;")
+        out = FirebirdToPostgresVisitor.transpile(sql, symbols=dict(symbols))
+        self.assertIn("((X.C + (1) * INTERVAL '1 day')::date) - X.C", out)
+
 
 @requires_postgres_class
 class TestDateInferenceLivePostgresRegression(unittest.TestCase):
@@ -558,6 +625,68 @@ class TestDateInferenceCrossDatabaseRegression(unittest.TestCase):
             self.assertIsNotNone(pg_row)
             self.assertEqual(pg_row[0], fb_rows[0][0])
             self.assertEqual(pg_row[1], "integer")
+
+    def test_star_mixed_using_on_matches_in_both_databases(self):
+        """
+        P1 regression: mixing USING (merges K) with ON (keeps Z.K) yields
+        [K,A,B,K2,D]; X.D is DATE in both databases with value 1.
+        """
+        symbols = {"reg_mix_t.k": "INTEGER", "reg_mix_t.a": "INTEGER",
+                   "reg_mix_u.k": "INTEGER", "reg_mix_u.b": "INTEGER",
+                   "reg_mix_z.k": "INTEGER", "reg_mix_z.d": "DATE"}
+        try:
+            for stmt in ("CREATE TABLE REG_MIX_T (K INTEGER, A INTEGER);",
+                         "CREATE TABLE REG_MIX_U (K INTEGER, B INTEGER);",
+                         "CREATE TABLE REG_MIX_Z (K INTEGER, D DATE);"):
+                self.fb_cur.execute(stmt)
+            self.fb_con.commit()
+            self.fb_cur.execute("INSERT INTO REG_MIX_T VALUES (1, 10);")
+            self.fb_cur.execute("INSERT INTO REG_MIX_U VALUES (1, 20);")
+            self.fb_cur.execute("INSERT INTO REG_MIX_Z VALUES (1, '2026-09-08');")
+            self.fb_con.commit()
+            for ddl in ("DROP TABLE IF EXISTS reg_mix_t CASCADE;",
+                        "DROP TABLE IF EXISTS reg_mix_u CASCADE;",
+                        "DROP TABLE IF EXISTS reg_mix_z CASCADE;"):
+                self.pg_cur.execute(ddl)
+            self.pg_cur.execute("CREATE TABLE reg_mix_t (k INTEGER, a INTEGER);")
+            self.pg_cur.execute("CREATE TABLE reg_mix_u (k INTEGER, b INTEGER);")
+            self.pg_cur.execute("CREATE TABLE reg_mix_z (k INTEGER, d DATE);")
+            self.pg_cur.execute("INSERT INTO reg_mix_t VALUES (1, 10);")
+            self.pg_cur.execute("INSERT INTO reg_mix_u VALUES (1, 20);")
+            self.pg_cur.execute("INSERT INTO reg_mix_z VALUES (1, '2026-09-08');")
+
+            fb_sql = ("WITH X(K, A, B, K2, D) AS (SELECT * FROM REG_MIX_T "
+                      "JOIN REG_MIX_U USING(K) JOIN REG_MIX_Z ON REG_MIX_Z.K = REG_MIX_T.K) "
+                      "SELECT DATEADD(DAY, 1, D) - D FROM X")
+            self.fb_cur.execute(fb_sql)
+            fb_rows = self.fb_cur.fetchall()
+            self.assertEqual([(1,)], [(r[0],) for r in fb_rows])
+            self.assertIsInstance(fb_rows[0][0], int)
+
+            pg_sql = FirebirdToPostgresVisitor.transpile(fb_sql, symbols=dict(symbols))
+            self.assertIn("::date", pg_sql)
+            inner = pg_sql.rstrip().rstrip(';')
+            self.pg_cur.execute(
+                f"SELECT v, pg_typeof(v)::text FROM ({inner}) s(v);")
+            pg_row = self.pg_cur.fetchone()
+            self.assertIsNotNone(pg_row)
+            self.assertEqual(pg_row[0], fb_rows[0][0])
+            self.assertEqual(pg_row[1], "integer")
+        finally:
+            for stmt in ("DROP TABLE REG_MIX_T;", "DROP TABLE REG_MIX_U;",
+                         "DROP TABLE REG_MIX_Z;"):
+                try:
+                    self.fb_cur.execute(stmt)
+                    self.fb_con.commit()
+                except Exception:
+                    pass
+            for stmt in ("DROP TABLE IF EXISTS reg_mix_t CASCADE;",
+                         "DROP TABLE IF EXISTS reg_mix_u CASCADE;",
+                         "DROP TABLE IF EXISTS reg_mix_z CASCADE;"):
+                try:
+                    self.pg_cur.execute(stmt)
+                except Exception:
+                    pass
 
 
 @requires_firebird_class

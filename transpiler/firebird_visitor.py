@@ -1711,6 +1711,51 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                 )
 
     @staticmethod
+    def _table_source_from_aux(aux) -> Optional[TableSource]:
+        if not aux:
+            return None
+        alias = aux.table_alias().getText().strip() if aux.table_alias() else None
+        t_int = aux.table_ref_aux_internal()
+        t_name = t_int.getText().strip() if t_int else ""
+        qualifier = alias if alias else t_name
+        subquery_ctx = None
+        if t_int and hasattr(t_int, 'dml_table_expression_clause') and t_int.dml_table_expression_clause():
+            dml = t_int.dml_table_expression_clause()
+            if hasattr(dml, 'select_statement') and dml.select_statement():
+                subquery_ctx = dml.select_statement()
+        return TableSource(table_name=t_name, alias=alias, qualifier=qualifier, subquery_ctx=subquery_ctx)
+
+    @staticmethod
+    def _using_columns_of_join(join_clause) -> set[str] | None:
+        """
+        Returns the lowercased USING column names of one join_clause, or None
+        when the join is not a USING join (ON / CROSS / comma): only USING
+        merges the shared columns, every other join preserves both sides.
+        """
+        if not join_clause or not hasattr(join_clause, 'join_using_part'):
+            return None
+        try:
+            jups = join_clause.join_using_part()
+        except Exception:
+            return None
+        if not jups:
+            return None
+        if not isinstance(jups, list):
+            jups = [jups]
+        cols: set[str] = set()
+        for jup in jups:
+            try:
+                pcl = jup.paren_column_list() if hasattr(jup, 'paren_column_list') else None
+                if pcl and hasattr(pcl, 'column_list') and pcl.column_list():
+                    for col in pcl.column_list().column_name():
+                        raw = col.getText().strip('":').lower()
+                        if raw:
+                            cols.add(raw)
+            except Exception:
+                pass
+        return cols
+
+    @staticmethod
     def _extract_tables_from_query_block(qb: FirebirdParser.Query_blockContext) -> list[TableSource]:
         tables = []
         if not qb or not qb.from_clause():
@@ -1719,31 +1764,54 @@ class ASTDialectRewriter(FirebirdParserVisitor):
         if not trl:
             return tables
 
-        def extract_from_aux(aux) -> Optional[TableSource]:
-            if not aux:
-                return None
-            alias = aux.table_alias().getText().strip() if aux.table_alias() else None
-            t_int = aux.table_ref_aux_internal()
-            t_name = t_int.getText().strip() if t_int else ""
-            qualifier = alias if alias else t_name
-            subquery_ctx = None
-            if t_int and hasattr(t_int, 'dml_table_expression_clause') and t_int.dml_table_expression_clause():
-                dml = t_int.dml_table_expression_clause()
-                if hasattr(dml, 'select_statement') and dml.select_statement():
-                    subquery_ctx = dml.select_statement()
-            return TableSource(table_name=t_name, alias=alias, qualifier=qualifier, subquery_ctx=subquery_ctx)
-
         for tr in trl.table_ref():
             if hasattr(tr, 'table_ref_aux') and tr.table_ref_aux():
-                src = extract_from_aux(tr.table_ref_aux())
+                src = ASTDialectRewriter._table_source_from_aux(tr.table_ref_aux())
                 if src:
                     tables.append(src)
             if hasattr(tr, 'join_clause') and tr.join_clause():
                 for jc in tr.join_clause():
                     if hasattr(jc, 'table_ref_aux') and jc.table_ref_aux():
-                        src = extract_from_aux(jc.table_ref_aux())
+                        src = ASTDialectRewriter._table_source_from_aux(jc.table_ref_aux())
                         if src:
                             tables.append(src)
+        return tables
+
+    @staticmethod
+    def _extract_join_segments(qb: FirebirdParser.Query_blockContext
+                               ) -> list[list[tuple[TableSource, set[str] | None]]]:
+        """
+        Splits each comma-separated table_ref into its ordered join chain:
+        [(table, using_cols|None), ...] starting with the leftmost table
+        (using None: keeps everything). A USING join suppresses only the
+        columns it lists, and only when already projected by its own chain;
+        ON / CROSS joins and comma siblings preserve both sides.
+        """
+        chains: list[list[tuple[TableSource, set[str] | None]]] = []
+        if not qb or not qb.from_clause():
+            return chains
+        trl = qb.from_clause().table_ref_list()
+        if not trl:
+            return chains
+
+        for tr in trl.table_ref():
+            chain: list[tuple[TableSource, set[str] | None]] = []
+            if hasattr(tr, 'table_ref_aux') and tr.table_ref_aux():
+                src = ASTDialectRewriter._table_source_from_aux(tr.table_ref_aux())
+                if src:
+                    chain.append((src, None))
+            if hasattr(tr, 'join_clause') and tr.join_clause():
+                join_clauses = tr.join_clause()
+                if not isinstance(join_clauses, list):
+                    join_clauses = [join_clauses]
+                for jc in join_clauses:
+                    if hasattr(jc, 'table_ref_aux') and jc.table_ref_aux():
+                        src = ASTDialectRewriter._table_source_from_aux(jc.table_ref_aux())
+                        if src:
+                            chain.append((src, ASTDialectRewriter._using_columns_of_join(jc)))
+            if chain:
+                chains.append(chain)
+        return chains
         return tables
 
     @staticmethod
@@ -1874,34 +1942,28 @@ class ASTDialectRewriter(FirebirdParserVisitor):
             if sl.getText() == '*':
                 # SELECT * projects only columns of tables that actually
                 # participate in this subquery (no out-of-scope leaks), one
-                # qualifier namespace per table (alias preferred), in FROM
-                # order. Duplicates across tables are kept in order, EXCEPT
-                # JOIN ... USING columns: per SQL/Firebird semantics the
-                # shared column is presented only once (first occurrence
-                # wins), so later tables skip already-projected USING cols.
-                # Qualified T.* keeps every explicitly requested column.
-                using_cols = set()
-                try:
-                    using_cols = {
-                        c.lower()
-                        for c in self._extract_using_columns_from_query_block(qb)
-                    }
-                except Exception:
-                    pass
-                emitted_using: set[str] = set()
-                for st in sub_tables:
-                    qualifier = (st.alias_clean or st.table_name_clean or '').lower()
-                    if not qualifier:
-                        continue
-                    prefix = qualifier + '.'
-                    for k, v in sub_symbols.items():
-                        if k.lower().startswith(prefix):
-                            col = k.split('.')[-1]
-                            if col.lower() in using_cols:
-                                if col.lower() in emitted_using:
+                # qualifier namespace per table (alias preferred), following
+                # each join chain in order. Duplicates across tables are kept
+                # in order, EXCEPT within a single JOIN ... USING: the shared
+                # column is presented only once per chain (first occurrence
+                # wins). JOIN ON / CROSS joins and comma siblings preserve
+                # both sides. Qualified T.* keeps every explicitly requested
+                # column.
+                for chain in self._extract_join_segments(qb):
+                    emitted: set[str] = set()
+                    for src, using in chain:
+                        qualifier = (src.alias_clean or src.table_name_clean or '').lower()
+                        if not qualifier:
+                            continue
+                        prefix = qualifier + '.'
+                        for k, v in sub_symbols.items():
+                            if k.lower().startswith(prefix):
+                                col = k.split('.')[-1]
+                                if using is not None and col.lower() in using \
+                                        and col.lower() in emitted:
                                     continue
-                                emitted_using.add(col.lower())
-                            projections.append((col, v))
+                                emitted.add(col.lower())
+                                projections.append((col, v))
                 return projections
 
             if hasattr(sl, 'select_list_elements') and sl.select_list_elements():
