@@ -41,7 +41,9 @@ class DatabaseMigrator:
         """
         Extracts the DDL schema from Firebird system tables into memory.
         """
-        self.table_objs = self.extractor.extract_schema()
+        self.table_objs = self.extractor.extract_schema(
+            function_map=self.ddl_exporter.function_call_map
+        )
         self.sequence_objs = self.extractor.extract_sequences()
 
     def _ensure_schema(self):
@@ -249,6 +251,10 @@ class DatabaseMigrator:
                                    executor=None, chunksize: int = 4):
         self.ddl_exporter.export_firebird_procedures(output_file, converted_file, executor, chunksize)
 
+    def export_firebird_functions(self, output_file: str = None,
+                                  converted_file: str = None):
+        return self.ddl_exporter.export_firebird_functions(output_file, converted_file)
+
     def export_firebird_views(self, output_file: str = None,
                               converted_file: str = None,
                               executor=None, chunksize: int = 4):
@@ -318,9 +324,20 @@ class DatabaseMigrator:
             DumpFiles.VIEWS_PG,
             DumpFiles.TRIGGERS_PG,
         ]
+        # The normal catalog-driven path always validates functions. Explicit
+        # callers can opt into the same check by supplying the function key;
+        # old callers that predate function dumps remain compatible.
+        catalog_driven = expected_objects is None and expected_counts is None
+        explicit_function_check = (
+            (expected_objects is not None and DumpFiles.FUNCTIONS_PG in expected_objects)
+            or (expected_counts is not None and DumpFiles.FUNCTIONS_PG in expected_counts)
+        )
+        if catalog_driven or explicit_function_check:
+            target_files.insert(1, DumpFiles.FUNCTIONS_PG)
 
         category_types = {
             DumpFiles.DOMAINS_PG: 'DOMAIN',
+            DumpFiles.FUNCTIONS_PG: 'FUNCTION',
             DumpFiles.PROCEDURES_PG: 'PROCEDURE',
             DumpFiles.VIEWS_PG: 'VIEW',
             DumpFiles.TRIGGERS_PG: 'TRIGGER',

@@ -554,7 +554,7 @@ def _normalize_single_param_list(params_body: str, is_output: bool = False,
 def _normalize_procedure_params(sql: str, not_null_params: dict[str, list[str]] = None,
                                 not_null_outputs: dict[str, list[str]] = None) -> str:
     proc_pat = re.compile(
-        r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|(\b(?:CREATE(?:\s+OR\s+ALTER)?|RECREATE|ALTER)\s+PROCEDURE\s+([a-zA-Z0-9_$]+|\"[^\"]+\"))",
+        r"('(?:''|[^'])*'|/\*.*?\*/|--[^\n]*)|(\b(?:CREATE(?:\s+OR\s+ALTER)?|RECREATE|ALTER)\s+(PROCEDURE|FUNCTION)\s+([a-zA-Z0-9_$]+|\"[^\"]+\"))",
         flags=re.IGNORECASE
     )
     pos = 0
@@ -571,10 +571,12 @@ def _normalize_procedure_params(sql: str, not_null_params: dict[str, list[str]] 
             continue
 
         result.append(m.group(2))
-        proc_name = m.group(3).strip('"').lower() if m.group(3) else ""
+        proc_name = m.group(4).strip('"').lower() if m.group(4) else ""
         cur = m.end()
 
-        # Check for input parameters (...)
+        # Check for input parameters (...). Functions and procedures use the
+        # same Firebird parameter syntax; output parameters only belong to
+        # procedures and are handled below.
         next_tok_idx = _skip_comments_and_ws(sql, cur)
         if next_tok_idx < len(sql) and sql[next_tok_idx] == '(':
             end_paren, inside = _scan_balanced_parens(sql, next_tok_idx)
@@ -601,6 +603,57 @@ def _normalize_procedure_params(sql: str, not_null_params: dict[str, list[str]] 
         pos = cur
 
     return "".join(result)
+
+
+def _normalize_function_header(sql: str) -> str:
+    """Normalize Firebird function DDL accepted by the shared grammar.
+
+    The grammar represents scalar function returns with RETURN, while Firebird
+    DDL commonly uses RETURNS. Empty parameter lists are omitted because the
+    grammar's optional list cannot contain an empty pair. Only the declaration
+    prefix is changed; function bodies, strings and comments stay untouched.
+    """
+    chunks = _split_param_literals(sql)
+    # Keep offsets identical to the original SQL while hiding protected text.
+    code = ''.join(' ' * len(text) if is_literal else text for is_literal, text in chunks)
+    match = re.search(
+        r'\bCREATE\s+(?:OR\s+ALTER|OR\s+REPLACE)\s+FUNCTION\b|'
+        r'\bCREATE\s+FUNCTION\b|\bRECREATE\s+FUNCTION\b', code, re.IGNORECASE
+    )
+    if not match:
+        return sql
+
+    start = match.start()
+    return_match = re.search(r'\bRETURNS?\b|\bRETURN\b', code[match.end():], re.IGNORECASE)
+    if not return_match:
+        return sql
+    header_end = match.end() + return_match.end()
+
+    # Work on the original SQL prefix using a protected copy so a string or
+    # comment containing CREATE FUNCTION cannot become a declaration.
+    prefix = sql[:header_end]
+    prefix = re.sub(
+        r'\bCREATE\s+OR\s+ALTER\s+FUNCTION\b',
+        'CREATE OR REPLACE FUNCTION', prefix, count=1, flags=re.IGNORECASE
+    )
+    prefix = re.sub(
+        r'\bRECREATE\s+FUNCTION\b',
+        'CREATE OR REPLACE FUNCTION', prefix, count=1, flags=re.IGNORECASE
+    )
+    prefix = re.sub(
+        r'\bRETURNS\b', 'RETURN', prefix, count=1, flags=re.IGNORECASE
+    )
+    # Remove only an empty parameter list belonging to the declaration.
+    fn_match = re.search(
+        r'(\bFUNCTION\s+(?:"(?:""|[^"])+"|[A-Za-z_][A-Za-z0-9_$]*)\s*)\(\s*\)\s*(?=RETURN\b)',
+        prefix, re.IGNORECASE
+    )
+    if fn_match:
+        prefix = (
+            prefix[:fn_match.start()] + fn_match.group(1).rstrip() + ' '
+            + prefix[fn_match.end():]
+        )
+    return prefix + sql[header_end:]
 
 
 def _parse_first_skip_val(s: str, pos: int) -> tuple[Optional[str], int]:
@@ -1116,13 +1169,16 @@ class ASTDialectRewriter(FirebirdParserVisitor):
     are performed in semantic context, leaving string literals and comments 100% untouched.
     """
 
-    def __init__(self, rewriter: TokenStreamRewriter, symbols: dict[str, str] = None, expr_map: dict[str, str] = None, sequence_increments: dict[str, int] = None, domain_map: dict[str, str] = None):
+    def __init__(self, rewriter: TokenStreamRewriter, symbols: dict[str, str] = None, expr_map: dict[str, str] = None, sequence_increments: dict[str, int] = None, domain_map: dict[str, str] = None, function_map: dict[str, str] = None):
         super().__init__()
         self.rewriter = rewriter
         self.handled_qbs = set()
         self.symbols: dict[str, str] = {k.strip('":').lower(): v.upper() for k, v in symbols.items()} if symbols else {}
         self.expr_map: dict[str, str] = expr_map or {}
         self.domain_map: dict[str, str] = domain_map or {}
+        self.function_map: dict[str, str] = {
+            str(k).strip('"').upper(): str(v) for k, v in (function_map or {}).items()
+        }
         self.sequence_increments: dict[str, int] | None = (
             {k.strip('":').lower(): v for k, v in sequence_increments.items()}
             if sequence_increments is not None
@@ -1160,6 +1216,19 @@ class ASTDialectRewriter(FirebirdParserVisitor):
         finally:
             self.symbols = old_symbols
             self.local_vars = old_local_vars
+
+    def visitCreate_function_body(self, ctx: FirebirdParser.Create_function_bodyContext):
+        # Function parameters and locals have the same lexical lifetime as
+        # procedure parameters. Restore the outer scope before the next unit.
+        old_symbols = self.symbols.copy()
+        old_local_vars = self.local_vars.copy()
+        old_params = self.params.copy()
+        try:
+            return self.visitChildren(ctx)
+        finally:
+            self.symbols = old_symbols
+            self.local_vars = old_local_vars
+            self.params = old_params
 
     def visitCreate_trigger(self, ctx: FirebirdParser.Create_triggerContext):
         old_symbols = self.symbols.copy()
@@ -1434,6 +1503,14 @@ class ASTDialectRewriter(FirebirdParserVisitor):
                 )
             else:
                 raise ValueError(f"Unsupported DATEDIFF unit: '{part_str}'")
+        elif fn_name in self.function_map:
+            # Replace only the AST identifier token. Arguments remain in the
+            # token stream and are transformed by their own visitor nodes.
+            self.rewriter.replaceRangeTokens(
+                ctx.id_expression().start,
+                ctx.id_expression().stop,
+                self.function_map[fn_name]
+            )
 
         return None
 
@@ -2445,12 +2522,16 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
 
     def __init__(self, rewriter: TokenStreamRewriter = None, domain_map: dict[str, str] = None,
                  not_null_params: dict[str, list[str]] = None,
-                 not_null_outputs: dict[str, list[str]] = None):
+                 not_null_outputs: dict[str, list[str]] = None,
+                 function_return_not_null: bool = False):
         super().__init__()
         self.rewriter = rewriter
         self.domain_map = {k.strip().upper(): v.strip() for k, v in domain_map.items()} if domain_map else {}
         self.not_null_params = not_null_params or {}
         self.not_null_outputs = not_null_outputs or {}
+        self.function_return_not_null = function_return_not_null
+        self.current_function_return_not_null = False
+        self.current_function_return_variable = '__fb_return_value'
         self.current_not_null_outputs: dict[str, dict[str, str]] = {}
         self.current_proc_has_suspend: bool = False
 
@@ -2518,8 +2599,13 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         # Step 6: Normalize variable declarations (= initializers, DEFAULT ... NOT NULL, etc.)
         sql = _normalize_variable_declarations(sql)
 
-        # Step 7: Normalize procedure parameters (= to DEFAULT, strip NOT NULL)
+        # Step 7: Normalize routine parameters (= to DEFAULT, strip NOT NULL)
         sql = _normalize_procedure_params(sql, not_null_params=not_null_params, not_null_outputs=not_null_outputs)
+
+        # The generated grammar calls the Firebird function return keyword
+        # RETURN. Firebird DDL commonly spells it RETURNS; normalize only the
+        # function header so procedure syntax and string literals stay intact.
+        sql = _normalize_function_header(sql)
 
         # Step 8: Normalize EXECUTE PROCEDURE ... RETURNING_VALUES ...
         sql = _normalize_returning_values(sql)
@@ -2532,7 +2618,9 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
 
     @classmethod
     def transpile(cls, firebird_sql_string: str, symbols: dict[str, str] = None, domain_map: dict[str, str] = None,
-                  sequence_increments: dict[str, int] = None, domain_types: dict[str, str] = None) -> str:
+                  sequence_increments: dict[str, int] = None, domain_types: dict[str, str] = None,
+                  function_map: dict[str, str] = None,
+                  function_return_not_null: bool = False) -> str:
         """
         Parses Firebird SQL using Two-Stage Parsing (SLL -> LL), traverses the AST with the visitor,
         and applies dialect token rewriting to produce clean PostgreSQL SQL.
@@ -2614,11 +2702,19 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         rewriter = TokenStreamRewriter(stream)
 
         # Pass 1: Semantic token rewriting on AST
-        dialect_rewriter = ASTDialectRewriter(rewriter, symbols=symbols, expr_map=expr_map, sequence_increments=sequence_increments, domain_map=norm_domain_map)
+        dialect_rewriter = ASTDialectRewriter(
+            rewriter, symbols=symbols, expr_map=expr_map,
+            sequence_increments=sequence_increments, domain_map=norm_domain_map,
+            function_map=function_map
+        )
         dialect_rewriter.visit(tree)
 
         # Pass 2: High-level PL/pgSQL structure visitor
-        visitor = cls(rewriter=rewriter, domain_map=norm_domain_map, not_null_params=not_null_params, not_null_outputs=not_null_outputs)
+        visitor = cls(
+            rewriter=rewriter, domain_map=norm_domain_map,
+            not_null_params=not_null_params, not_null_outputs=not_null_outputs,
+            function_return_not_null=function_return_not_null
+        )
         pg_sql = visitor.visit(tree)
 
         if pg_sql:
@@ -2627,7 +2723,9 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         return pg_sql
 
     @classmethod
-    def transpile_expression(cls, expr: str, symbols: dict[str, str] = None, sequence_increments: dict[str, int] = None) -> str:
+    def transpile_expression(cls, expr: str, symbols: dict[str, str] = None,
+                             sequence_increments: dict[str, int] = None,
+                             function_map: dict[str, str] = None) -> str:
         """
         Transpiles a standalone Firebird SQL scalar expression (e.g. computed column, expression index)
         to PostgreSQL SQL, rewriting built-ins like IIF, DATEADD, DATEDIFF, LIST, GEN_ID.
@@ -2637,7 +2735,10 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         expr_clean = expr.strip()
         dummy_sql = f'CREATE VIEW "__v__" AS SELECT {expr_clean} FROM RDB$DATABASE;'
         try:
-            view_sql = cls.transpile(dummy_sql, symbols=symbols, sequence_increments=sequence_increments)
+            view_sql = cls.transpile(
+                dummy_sql, symbols=symbols, sequence_increments=sequence_increments,
+                function_map=function_map
+            )
             m = re.search(r'AS\s+SELECT\s+(.*)\s*;?$', view_sql, re.IGNORECASE | re.DOTALL)
             if m:
                 return m.group(1).strip().rstrip(';').strip()
@@ -2650,7 +2751,9 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
             raise RuntimeError(f"Failed to transpile Firebird expression '{expr_clean}' to PostgreSQL: {e}") from e
 
     @classmethod
-    def transpile_default_clause(cls, default_str: str | None, symbols: dict[str, str] = None, sequence_increments: dict[str, int] = None) -> str | None:
+    def transpile_default_clause(cls, default_str: str | None, symbols: dict[str, str] = None,
+                                 sequence_increments: dict[str, int] = None,
+                                 function_map: dict[str, str] = None) -> str | None:
         if not default_str:
             return None
         s = default_str.strip()
@@ -2661,11 +2764,16 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         else:
             expr = s
             has_default_kw = False
-        pg_expr = cls.transpile_expression(expr, symbols=symbols, sequence_increments=sequence_increments)
+        pg_expr = cls.transpile_expression(
+            expr, symbols=symbols, sequence_increments=sequence_increments,
+            function_map=function_map
+        )
         return f"DEFAULT {pg_expr}" if has_default_kw else pg_expr
 
     @classmethod
-    def transpile_check_clause(cls, check_str: str | None, symbols: dict[str, str] = None, sequence_increments: dict[str, int] = None) -> str | None:
+    def transpile_check_clause(cls, check_str: str | None, symbols: dict[str, str] = None,
+                               sequence_increments: dict[str, int] = None,
+                               function_map: dict[str, str] = None) -> str | None:
         if not check_str:
             return None
         s = check_str.strip()
@@ -2675,7 +2783,10 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
         else:
             m2 = re.match(r'^\s*CHECK\s+(.*)$', s, re.IGNORECASE | re.DOTALL)
             expr = m2.group(1).strip() if m2 else s
-        pg_expr = cls.transpile_expression(expr, symbols=symbols, sequence_increments=sequence_increments)
+        pg_expr = cls.transpile_expression(
+            expr, symbols=symbols, sequence_increments=sequence_increments,
+            function_map=function_map
+        )
         return f"CHECK ({pg_expr})"
 
     @staticmethod
@@ -2937,6 +3048,90 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
                 f'{decl_str}{body_str}\n'
                 f'{tag} LANGUAGE plpgsql {volatility};')
 
+    def visitCreate_function_body(self, ctx: FirebirdParser.Create_function_bodyContext):
+        """Translate a Firebird PSQL scalar function into PostgreSQL."""
+        raw_name = ctx.function_name().getText()
+        name_value = raw_name[1:-1].replace('""', '"') if raw_name.startswith('"') and raw_name.endswith('"') else raw_name
+        function_name = pg_quote_ident(name_value.lower())
+        function_key = name_value.lower()
+        params = [self.visit(param) for param in (ctx.parameter() or [])]
+        params_str = ", ".join(p for p in params if p)
+        return_type = self._convert_type(self.get_raw_text(ctx.type_spec()))
+
+        decl_str = ""
+        if ctx.seq_of_declare_specs():
+            decl_str = self.visit(ctx.seq_of_declare_specs()) or ""
+            if decl_str:
+                decl_str = f"DECLARE\n{decl_str}\n"
+
+        previous_return_guard = self.current_function_return_not_null
+        self.current_function_return_not_null = self.function_return_not_null
+        try:
+            body_str = self.visit(ctx.body()) if ctx.body() else ""
+        finally:
+            self.current_function_return_not_null = previous_return_guard
+        if not body_str:
+            raise NotImplementedError(
+                f"External or non-PSQL Firebird function '{function_name}' requires manual migration."
+            )
+
+        not_null_list = self.not_null_params.get(function_key, [])
+        if not_null_list and body_str:
+            not_null_set = {p.strip('"').lower() for p in not_null_list}
+            guards = []
+            for param in params:
+                param_name = param.split(None, 1)[0] if param.strip() else ''
+                if param_name.strip('"').lower() in not_null_set:
+                    guards.append(
+                        f"IF {param_name} IS NULL THEN "
+                        f"RAISE EXCEPTION 'Parameter \"%\" cannot be NULL', '{param_name.strip(chr(34))}'; END IF;"
+                    )
+            if guards:
+                guard_text = "\n".join(f"    {guard}" for guard in guards)
+                body_str = re.sub(
+                    r'^(\s*BEGIN\s*\r?\n?)',
+                    r'\1' + guard_text + '\n',
+                    body_str,
+                    count=1,
+                    flags=re.IGNORECASE
+                )
+
+        if self.function_return_not_null:
+            return_var = self.current_function_return_variable
+            declaration = f"    {return_var} {return_type};"
+            if decl_str:
+                decl_str = decl_str.replace('DECLARE\n', f'DECLARE\n{declaration}\n', 1)
+            else:
+                decl_str = f'DECLARE\n{declaration}\n'
+
+        volatility, reasons = self._classify_function_volatility(body_str, decl_str, params_str)
+        tag = choose_dollar_tag(f"{decl_str}{body_str}")
+        return (
+            f'-- [FUNCTION VOLATILITY: {volatility} ({", ".join(reasons)})]\n'
+            f'CREATE OR REPLACE FUNCTION {function_name}({params_str}) '
+            f'RETURNS {return_type} AS {tag}\n'
+            f'#variable_conflict use_variable\n'
+            f'{decl_str}{body_str}\n{tag} LANGUAGE plpgsql {volatility};'
+        )
+
+    @staticmethod
+    def _classify_function_volatility(body_str: str, decl_str: str = "", params_str: str = "") -> tuple[str, list[str]]:
+        """Choose the strongest safe PostgreSQL volatility for scalar PSQL."""
+        volatility, reasons = FirebirdToPostgresVisitor._classify_procedure_volatility(
+            body_str, decl_str, params_str
+        )
+        if volatility == 'VOLATILE':
+            return volatility, reasons
+
+        clean = FirebirdToPostgresVisitor._strip_sql_comments_and_strings(
+            f"{decl_str}\n{body_str}"
+        )
+        # A lookup can change between statements even when it has no side
+        # effects, so it is STABLE. A pure expression can be IMMUTABLE.
+        if re.search(r'\b(SELECT|FROM|JOIN|INSERT|UPDATE|DELETE|MERGE|PERFORM|EXECUTE|CALL)\b', clean, re.IGNORECASE):
+            return 'STABLE', reasons
+        return 'IMMUTABLE', ['read-only expression with no database lookup']
+
     def visitParameter(self, ctx: FirebirdParser.ParameterContext):
         param_name = _normalize_ident_case(ctx.parameter_name().getText())
         # Firebird allows datatype directly or TYPE OF
@@ -3194,8 +3389,23 @@ class FirebirdToPostgresVisitor(FirebirdParserVisitor):
 
         return False
 
+    def visitReturn_statement(self, ctx: FirebirdParser.Return_statementContext):
+        if not self.current_function_return_not_null or not ctx.expression():
+            return self.get_raw_text(ctx)
+        expression = self.get_raw_text(ctx.expression()).strip()
+        variable = self.current_function_return_variable
+        return (
+            f"{variable} := {expression};\n"
+            f"IF {variable} IS NULL THEN RAISE EXCEPTION "
+            f"'Function return value cannot be NULL'; END IF;\n"
+            f"RETURN {variable};"
+        )
+
     def visitStatement(self, ctx: FirebirdParser.StatementContext):
         child = ctx.getChild(0)
+
+        if isinstance(child, FirebirdParser.Return_statementContext):
+            return self.visit(child)
 
         if isinstance(child, (
                 FirebirdParser.BodyContext,

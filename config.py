@@ -12,6 +12,8 @@ DUMP_DIR: str = os.getenv('DUMP_DIR', 'dumps')
 
 
 class DumpFiles:
+    FUNCTIONS_FB:  str = 'firebird_functions_dump.sql'
+    FUNCTIONS_PG:  str = 'postgres_functions_dump.sql'
     TRIGGERS_FB:   str = 'firebird_triggers_dump.sql'
     TRIGGERS_PG:   str = 'postgres_triggers_dump.sql'
     PROCEDURES_FB: str = 'firebird_procedures_dump.sql'

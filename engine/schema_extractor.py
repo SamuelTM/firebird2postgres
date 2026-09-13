@@ -120,7 +120,7 @@ class SchemaExtractor:
     def __init__(self, fb_con):
         self.fb_con = fb_con
 
-    def extract_schema(self) -> list[Table]:
+    def extract_schema(self, function_map: dict[str, str] = None) -> list[Table]:
         """
         Extracts the full relational schema from Firebird system tables into a list of Table objects.
         """
@@ -134,16 +134,19 @@ class SchemaExtractor:
         for table_name in tables:
             table_obj = Table(table_name)
             table_obj.columns = self._extract_columns(
-                fb_cursor, table_name, relation_names, domain_map=domain_map, sequence_increments=seq_increments
+                fb_cursor, table_name, relation_names, domain_map=domain_map,
+                sequence_increments=seq_increments, function_map=function_map
             )
             table_obj.foreign_keys = self._extract_foreign_keys(fb_cursor, table_name)
             table_obj.unique_keys = self._extract_unique_keys(fb_cursor, table_name)
             col_symbols = {col.name.lower(): col.column_type for col in table_obj.columns}
             table_obj.indexes = self._extract_indexes(
-                fb_cursor, table_name, symbols=col_symbols, sequence_increments=seq_increments
+                fb_cursor, table_name, symbols=col_symbols, sequence_increments=seq_increments,
+                function_map=function_map
             )
             table_obj.check_constraints = self._extract_check_constraints(
-                fb_cursor, table_name, symbols=col_symbols, sequence_increments=seq_increments
+                fb_cursor, table_name, symbols=col_symbols, sequence_increments=seq_increments,
+                function_map=function_map
             )
             table_objs.append(table_obj)
 
@@ -192,7 +195,8 @@ class SchemaExtractor:
     @staticmethod
     def _extract_columns(cursor, table_name: str, relation_names: set[str],
                          domain_map: dict[str, str] = None,
-                         sequence_increments: dict[str, int] = None) -> list[Column]:
+                         sequence_increments: dict[str, int] = None,
+                         function_map: dict[str, str] = None) -> list[Column]:
         """
         Extracts all columns for a given table, resolving types and domain mappings.
         """
@@ -281,7 +285,9 @@ class SchemaExtractor:
             if computed_source:
                 try:
                     computed_source = FirebirdToPostgresVisitor.transpile_expression(
-                        computed_source, symbols=symbols, sequence_increments=sequence_increments
+                        computed_source, symbols=symbols,
+                        sequence_increments=sequence_increments,
+                        function_map=function_map
                     )
                 except Exception as e:
                     raise RuntimeError(
@@ -322,7 +328,9 @@ class SchemaExtractor:
             if default_value:
                 try:
                     default_value = FirebirdToPostgresVisitor.transpile_default_clause(
-                        default_value, symbols=symbols, sequence_increments=sequence_increments
+                        default_value, symbols=symbols,
+                        sequence_increments=sequence_increments,
+                        function_map=function_map
                     )
                 except Exception as e:
                     raise RuntimeError(
@@ -583,7 +591,8 @@ class SchemaExtractor:
 
     @staticmethod
     def _extract_indexes(cursor, table_name: str, symbols: dict[str, str] = None,
-                         sequence_increments: dict[str, int] = None) -> list[Index]:
+                         sequence_increments: dict[str, int] = None,
+                         function_map: dict[str, str] = None) -> list[Index]:
         """
         Extracts user-defined secondary indexes for a given table (excluding PK/UQ indexes),
         supporting both standard column-segment indexes and expression-based indexes (COMPUTED BY).
@@ -639,7 +648,9 @@ class SchemaExtractor:
             if expr_str:
                 try:
                     expr_str = FirebirdToPostgresVisitor.transpile_expression(
-                        expr_str, symbols=symbols, sequence_increments=sequence_increments
+                        expr_str, symbols=symbols,
+                        sequence_increments=sequence_increments,
+                        function_map=function_map
                     )
                 except Exception as e:
                     raise RuntimeError(
@@ -652,7 +663,9 @@ class SchemaExtractor:
             if cond_str:
                 try:
                     cond_str = FirebirdToPostgresVisitor.transpile_expression(
-                        cond_str, symbols=symbols, sequence_increments=sequence_increments
+                        cond_str, symbols=symbols,
+                        sequence_increments=sequence_increments,
+                        function_map=function_map
                     )
                 except Exception as e:
                     raise RuntimeError(
@@ -675,7 +688,8 @@ class SchemaExtractor:
 
     @staticmethod
     def _extract_check_constraints(cursor, table_name: str, symbols: dict[str, str] = None,
-                                   sequence_increments: dict[str, int] = None) -> list[CheckConstraint]:
+                                   sequence_increments: dict[str, int] = None,
+                                   function_map: dict[str, str] = None) -> list[CheckConstraint]:
         """
         Extracts table-level CHECK constraints from Firebird system catalog,
         transpiling their expressions to PostgreSQL.
@@ -714,7 +728,9 @@ class SchemaExtractor:
 
             try:
                 pg_expr = FirebirdToPostgresVisitor.transpile_expression(
-                    inner_expr, symbols=symbols, sequence_increments=sequence_increments
+                    inner_expr, symbols=symbols,
+                    sequence_increments=sequence_increments,
+                    function_map=function_map
                 )
             except Exception as e:
                 raise RuntimeError(

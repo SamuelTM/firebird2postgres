@@ -235,10 +235,18 @@ def _build_patterns(object_type: str = None) -> list[tuple]:
     ot = (object_type or '').upper()
     patterns = []
 
-    if not ot or ot in ('PROCEDURE', 'PROCEDURES', 'FUNCTION', 'FUNCTIONS'):
+    if not ot or ot in ('PROCEDURE', 'PROCEDURES'):
         patterns.append(
             ('PROCEDURE', re.compile(
                 r'\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:FUNCTION|PROCEDURE)\s+'
+                + QUALIFIED_NAME_PATTERN,
+                re.IGNORECASE
+            ))
+        )
+    if not ot or ot in ('FUNCTION', 'FUNCTIONS'):
+        patterns.append(
+            ('FUNCTION', re.compile(
+                r'\bCREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+'
                 + QUALIFIED_NAME_PATTERN,
                 re.IGNORECASE
             ))
@@ -510,4 +518,3 @@ class SqlRunner:
         self.pg_con.commit()
         logger.info(f"Successfully applied {success_count} statements from '{file_path}'.")
         return success_count
-
